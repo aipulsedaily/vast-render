@@ -56,6 +56,8 @@ Useful overrides, all `VASTRENDER_`-prefixed:
 | `MAX_FRAMES_PER_JOB` | `5000` | blast radius for a mistyped range, not a technical limit |
 | `SCENE_BATCH_MAX` | `25` | jobs served for one scene before re-evaluating globally |
 | `SCENE_STARVE_SEC` | `300` | **floor** for yielding to another scene whose oldest job has waited this long |
+| `SCENE_PRIO_BOOST_SEC` | `20` | seconds of head start per priority point in the scene choice (lower `prio` = more urgent) |
+| `SCENE_PRIO_BOOST_MAX_SEC` | `1800` | **the bound** — no scene is deferred more than this beyond its FIFO turn, whatever `prio` says |
 | `SCENE_SWITCH_PAYBACK` | `2.0` | multiple of the loaded scene's reload cost the wait must beat before preempting |
 | `SCENE_RELOAD_BASE_SEC` | `60` | assumed switch cost before one has been measured |
 | `SCENE_RELOAD_SEC_PER_GB` | `300` | …plus this per GB of scene |
@@ -479,6 +481,45 @@ wants the GPU.
 exclusion removed it reports the small scene served **NEVER**; with it, served
 at exactly the cap, after the big scene got a full batch. A bound with no test
 that fails when it is exceeded is a comment.
+
+#### Priority decides which scene loads next, not just job order within one
+
+`prio` (**lower is more urgent**, 100 is the default) has always ordered jobs
+inside `db.claim`. It did nothing for *which scene gets loaded*, which was
+`ORDER BY created ASC` — pure FIFO on submission time. So a `prio 10` job on a
+freshly submitted scene lost to a `prio 100` job on an older one for as long as
+that scene had work. Measured 2026-08-03: a 13.6 s render sat queued **41
+minutes** behind older scenes, with priority set the whole time.
+
+A half-working knob is worse than no knob, because agents reasonably believe it
+works and stop looking for the real reason their job is late.
+
+The mechanism is **aging, not ordering**:
+
+    effective_age = (now - created) + clamp((100 - prio) x BOOST, +/- CAP)
+
+and the scene holding the largest effective age is served next. Ordering by
+priority outright is unbounded — a steady trickle of urgent work would defer
+everything else forever, the same trap `SCENE_BATCH_MAX` fell into. Under aging
+the head start is fixed while a deferred scene's age grows without limit, so it
+always wins eventually.
+
+At `BOOST` = 20 s/point the default-to-urgent gap (100 → 10) is 1800 s, which
+saturates the clamp: **`prio 10` is maximum urgency and anything lower is
+identical to it.** The useful gradient is between 100 and 10 (prio 50 → 1000 s,
+prio 90 → 200 s); values above 100 deprioritise (prio 150 → −1000 s).
+
+**THE BOUND: no scene is ever deferred more than `SCENE_PRIO_BOOST_MAX_SEC`
+(1800 s) beyond its FIFO turn**, whatever an agent puts in `prio` — 0, −1000, a
+typo. `test_priority_cannot_starve_a_scene` is the positive control: with the
+clamp removed, a `prio -100000` competitor starves the neglected scene and both
+bound assertions fail.
+
+Both scene-selection queries share one expression (`db._EFF_AGE`), so the
+signal that triggers a switch and the choice of what to switch *to* can never
+disagree about who has waited longest. When they disagreed, a high-priority job
+could win the target query while never clearing the threshold that causes a
+switch at all — priority looking like it works and not working.
 
 #### Where the money actually went
 

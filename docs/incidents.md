@@ -5,6 +5,105 @@ thing it first looked like. Newest first.
 
 ---
 
+## 2026-08-03 — 32 minutes of `starting-worker`, and every guard against it was reading the wrong engine
+
+`./rq status` showed the farm stopped dead:
+
+    queue  {'canceled': 101, 'done': 1477, 'failed': 50, 'queued': 32}  depth=32
+    gpu    starting-worker  instance=46668588  up=2368.2s  idle=1574.7s
+
+Nothing `running`, `done` frozen at 1477, 32 jobs from four agents behind it.
+
+Everything that usually explains this was innocent. The instance was up and
+`ssh` answered in under a second. The worker process was alive
+(`pgrep -af /workspace/server.py` → pid 57692). The GPU was at **100% util,
+274 W, 16.6 GB VRAM** — not idle, not wedged, not booting. The broker was not
+failing to dispatch; it was correctly blocked inside `_switch_scene`, which
+holds the whole farm by design, waiting on `film9.blend` (4.71 GB).
+
+It was **slow, not stalled**, and it was slow doing something worth nothing:
+a throwaway 64x64 warm-up render that ran **1,440 seconds**. The job it was
+warming up for then rendered in **66.1 s**.
+
+### The tell was one null in progress.json
+
+    {"state": "idle", "pct": null, "phase": "Rendering 50 / 64 samples"}
+
+`pct: null`, and no `sample` key — so `_SAMPLE_RE` (`/Sample N \/ M/`) had not
+matched the very line that obviously contains a sample count. That regex is
+Cycles' format. **"Rendering N / M samples" is EEVEE's**, and the only engine
+id in `film9.blend` is `BLENDER_EEVEE`.
+
+`prewarm()` clamps a render it believes is Cycles:
+
+| guard | what it sets | on an EEVEE scene |
+|---|---|---|
+| sample clamp | `scene.cycles.samples = 1` | inert — EEVEE reads `scene.eevee.taa_render_samples`, **default 64** |
+| step ceiling | `scene.cycles.time_limit = 45` | inert — EEVEE has no `time_limit` |
+
+Both no-op'd silently, because `scene.cycles` exists on every scene regardless
+of engine, so neither assignment raises. The sweep rendered the scene's own 64
+TAA samples of a 4.7 GB, 28k-object scene, and **no guard in the function could
+stop it** — including the one whose comment called it "the backstop for
+whatever the next scene invents".
+
+`apply_spec` has always known this. Its `else:` branch sets
+`taa_render_samples` "because EEVEE ignores cycles.samples entirely". Prewarm
+never learned it. Two code paths, one fact, one of them wrong.
+
+### Why this was the second stall of the day, not the first
+
+The morning's fix for the same symptom blamed the compositor — a Render Layers
+node dragging in another scene at production settings — and added the
+`time_limit` backstop. That diagnosis was plausible (film9 does ship with
+compositing and sequencer on, and both are now correctly forced off) but it was
+not the cause, and the "backstop" it added could not reach the real one. The
+symptom returned within the hour **with the fix deployed**.
+
+### Two changes, because one of them is the general case
+
+* `prewarm()` now clamps `scene.eevee.taa_render_samples = 1` and restores it,
+  and the log line names `engine=` alongside *both* sample counts. The old line
+  said `samples=1` while the engine rendered 64 and nothing on it said which
+  number was being read.
+* `PREWARM_MAX_SCENE_BYTES` (default **1.0 GB**) skips the sweep outright on a
+  big .blend. This is the part that does not depend on guessing the engine.
+  Every in-render limit is engine-specific and therefore defeatable by the next
+  engine, and a render already in progress cannot be interrupted from Python at
+  all — so the only bound that always holds is the one applied *before* the
+  render starts. Above the threshold the sweep's cost is scene synchronisation
+  (geometry upload, shader compilation, shadow/light-grid build), which is
+  proportional to scene size and which no sample cap touches, because it
+  happens before sample 1.
+
+The threshold catches exactly the two scenes that have ever stalled an instance
+— `verify_world.blend` (4.17 GB) and `film9.blend` (4.71 GB) — and nothing
+under 200 MB has ever come close. What is given up is paid back at once: the
+first real job pays the sync instead, under a job timeout, reporting progress,
+and delivers a frame for it. The warm-up produced a 64x64 PNG that the
+`finally` deletes, and it held every agent's queue while it did.
+
+### The part that was pure loss
+
+Agent `ramp` cancelled its two `film9` jobs at 10:08 and 10:19, halfway through
+the stall. The broker had no way to notice: the dispatcher was blocked inside
+the scene switch. It finished the 32-minute switch, rendered `eae312b873dd`
+anyway at 10:28:40, logged it `done`, and wrote the result to a row whose state
+was already `canceled`. That is also why `done` sat at 1477 through a completed
+render — it was not a `recent()` windowing artefact this time.
+
+### What to check first, next time `starting-worker` looks stuck
+
+`starting-worker` plus a busy GPU is a **slow** switch, not a dead one. Read
+`/workspace/progress.json` before anything else: `state`, and whether `pct` is
+null. A null `pct` next to a phase string that plainly contains numbers means
+the parser and the engine disagree, and the engine is the thing to identify.
+
+    ssh … 'cat /workspace/progress.json; tail -5 /workspace/worker.log'
+    grep -a -o -m5 -E 'BLENDER_EEVEE[A-Z_]*|CYCLES' <scene>.blend | sort -u
+
+---
+
 ## 2026-07-28 — a perfect PNG with no picture in it, delivered and counted
 
 Job `0908e534b1d3` reported `done` in 33.217 s. Its output,
