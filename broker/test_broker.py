@@ -2905,6 +2905,27 @@ def test_a_refusal_is_never_retried() -> None:
               issubclass(app.JobRefused, RuntimeError)
               and not issubclass(RuntimeError, app.JobRefused), "")
 
+        # A missing .blend is the same kind of answer, reached before the
+        # worker is ever involved. It was retried three times: observed
+        # 2026-08-03, two reliefpvg jobs for a renamed blend each burned three
+        # dispatch passes restating "does not exist".
+        src = inspect.getsource(app.Broker.run_job)
+        scene_at = src.find("except scenes.SceneError")
+        generic_at = src.find("except Exception as exc:")
+        check("a missing scene is failed terminally, not retried three times",
+              scene_at != -1 and generic_at != -1 and scene_at < generic_at,
+              f"SceneError at {scene_at}, generic at {generic_at}")
+
+        # And the two hand-rolled not-found raises are the same class, or they
+        # would sail past the handler that was just added for them.
+        for fn in (app.Broker.run_still, app.Broker.run_sequence):
+            body = inspect.getsource(fn)
+            if "scene not found" in body:
+                check(f"{fn.__name__} raises SceneError for a missing scene",
+                      "raise scenes.SceneError(f\"scene not found" in body,
+                      "still a bare RuntimeError" if "raise RuntimeError(f\"scene not found"
+                      in body else "ok")
+
         # Inside a SEQUENCE a refusal must not be treated as a frame failure:
         # the same question is asked of every remaining frame and gets the same
         # answer, so it used to burn FRAME_FAIL_STREAK frames restating it.

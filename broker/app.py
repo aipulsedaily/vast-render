@@ -893,6 +893,20 @@ class Broker:
             self.db.fail_terminal(job_id, remote.diagnose(exc))
             log.error("job %s FAILED on DISK and will NOT be retried — %s",
                       job_id, remote.diagnose(exc))
+        except scenes.SceneError as exc:
+            # The .blend named by the job is not there — or is not a .blend, or
+            # is outside every configured scene root. A verdict about the
+            # request, like the ones below: the file will be equally missing on
+            # the second and third attempt, and only the agent that submitted
+            # it can put one there.
+            #
+            # Observed 2026-08-03: two reliefpvg jobs for a blend the agent had
+            # renamed each burned three dispatch passes restating
+            # "does not exist", on a queue where a dispatch pass can drag a
+            # scene switch behind it.
+            self.db.fail_terminal(job_id, remote.diagnose(exc))
+            log.error("job %s FAILED on its scene and will NOT be retried — %s",
+                      job_id, remote.diagnose(exc))
         except JobRefused as exc:
             # The worker looked at the request and said no. It will say no
             # again. Failing it once puts the answer in front of the agent that
@@ -996,7 +1010,7 @@ class Broker:
 
         scene = scenes.resolve_scene(job.get("scene"))
         if not scene.exists():
-            raise RuntimeError(f"scene not found: {scene}")
+            raise scenes.SceneError(f"scene not found: {scene}")
         digest = remote.scene_hash(scene)
         want_hash = job.get("spec_hash") or seq.spec_hash(spec, digest)
 
@@ -1161,7 +1175,7 @@ class Broker:
         # the scene root may have changed under a long-queued job.
         scene = scenes.resolve_scene(job.get("scene"))
         if not scene.exists():
-            raise RuntimeError(f"scene not found: {scene}")
+            raise scenes.SceneError(f"scene not found: {scene}")
 
         started = time.time()
         self.current_job = job_id
