@@ -31,7 +31,33 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
-from vastai import VastAI
+try:
+    from vastai import VastAI
+except ModuleNotFoundError:
+    # `vastai` lives in this project's venv, and the shebang above says
+    # `python3` — so running this file the obvious way (`./vastctl/vastctl.py`,
+    # or `python3 vastctl/vastctl.py status`) picks the SYSTEM interpreter and
+    # dies with a bare `ModuleNotFoundError: No module named 'vastai'`.
+    #
+    # That is a false alarm with real cost. During the 2026-08-03 queue stall it
+    # was read as "the instance-control path is broken, so nothing can query or
+    # restart the instance" — a plausible root cause for a worker that never
+    # comes up and never gets reaped. It was neither: the broker, which runs
+    # under the venv, was talking to vast.ai perfectly the whole time.
+    #
+    # Re-exec under the venv rather than just improving the error, because the
+    # command the operator typed is the command that should work — this file is
+    # the emergency tool, reached when the broker is what broke.
+    import os as _os
+    import sys as _sys
+    _venv = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                          ".venv", "bin", "python")
+    if _os.path.exists(_venv) and _os.path.realpath(_venv) != _os.path.realpath(_sys.executable):
+        _os.execv(_venv, [_venv, _os.path.abspath(__file__), *_sys.argv[1:]])
+    raise SystemExit(
+        f"vastctl needs the 'vastai' package, which lives in this project's "
+        f"venv. Run it as: {_venv} {_os.path.abspath(__file__)} <command>"
+    )
 
 # --- policy ---------------------------------------------------------------
 

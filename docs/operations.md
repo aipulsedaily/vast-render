@@ -55,7 +55,10 @@ Useful overrides, all `VASTRENDER_`-prefixed:
 | `SEQ_DIR` | `out/seq` | where rendered frame sequences land, one directory per `--name` |
 | `MAX_FRAMES_PER_JOB` | `5000` | blast radius for a mistyped range, not a technical limit |
 | `SCENE_BATCH_MAX` | `25` | jobs served for one scene before re-evaluating globally |
-| `SCENE_STARVE_SEC` | `300` | yield to another scene whose oldest job has waited this long |
+| `SCENE_STARVE_SEC` | `300` | **floor** for yielding to another scene whose oldest job has waited this long |
+| `SCENE_SWITCH_PAYBACK` | `2.0` | multiple of the loaded scene's reload cost the wait must beat before preempting |
+| `SCENE_RELOAD_BASE_SEC` | `60` | assumed switch cost before one has been measured |
+| `SCENE_RELOAD_SEC_PER_GB` | `300` | …plus this per GB of scene |
 | `ASSET_DIRS` | auto | `:`-separated dirs mirrored to the instance at their absolute paths |
 | `PROGRESS_INTERVAL` | `15.0` | seconds between progress polls off the instance |
 | `STALL_WARN_SEC` | `600` | warn (never kill) if the sample counter stops advancing |
@@ -407,11 +410,50 @@ a 296 MB upload. So the dispatcher batches:
 
 The two bounds are what stop draining from becoming starvation:
 `SCENE_BATCH_MAX` forces a global re-evaluation after N consecutive jobs, and
-`SCENE_STARVE_SEC` yields immediately if another scene has had a job waiting
-too long. The switch target is always the *oldest waiting job's* scene, so
-however long a batch runs, nothing is deferred forever. Fair-share between
-agents is unchanged — it still applies inside every claim, including
-scene-restricted ones.
+`SCENE_STARVE_SEC` yields if another scene has had a job waiting too long. The
+switch target is always the *oldest waiting job's* scene, so however long a
+batch runs, nothing is deferred forever. Fair-share between agents is
+unchanged — it still applies inside every claim, including scene-restricted
+ones.
+
+#### Preemption has to be worth what it costs
+
+`SCENE_STARVE_SEC` is a **floor**, not the whole threshold. The 57.6 s figure
+above is a 296 MB scene; the round-2 film scenes are 4.5 GB, and a switch to one
+was measured at **1425 s**. Against that, yielding at 300 s is not generous, it
+is self-defeating.
+
+Measured 2026-08-03, with five agents holding work against five scenes: *some*
+scene had always been waiting longer than 300 s, so the starvation test fired on
+every single dispatch and the dispatcher — whose entire purpose is to avoid a
+switch per job — did exactly that. Nine consecutive switches, each logged
+"after 1 job(s)". Caught in the act at 07:16, it spent **22.6 minutes** loading
+`film7.blend`, rendered **one 65 s frame**, dropped it for two 14 s renders on
+two 6 MB scenes, and started paying the 22.6 minutes again — with sixteen jobs
+still queued against the scene it had just given up. Roughly 90 % of a paid GPU
+went into scene switching.
+
+So the threshold scales with what the switch actually costs:
+
+    starve_threshold = max(SCENE_STARVE_SEC, SCENE_SWITCH_PAYBACK x reload_cost)
+
+`reload_cost` is measured per scene hash and estimated from size
+(`SCENE_RELOAD_BASE_SEC + SCENE_RELOAD_SEC_PER_GB x GB`) until it has been, so
+the *first* switch away from a big scene is already protected — otherwise the
+measurement only ever arrives after the mistake. The payback factor is 2
+because a switch is paid twice: once to leave and once to come back.
+
+Small scenes are unaffected — 2 x 120 s for a 0.2 GB scene is under the floor,
+so they interleave exactly as before. Only a scene that is genuinely expensive
+to reload earns patience, and `SCENE_BATCH_MAX` remains what bounds unfairness.
+
+Eviction learned the same lesson. The scene cache is LRU by last *use*, and a
+scene's stamp is written when it is **selected** — so a scene with jobs merely
+waiting carries the oldest possible timestamp and sorted ahead of idle scenes
+that had finished hours ago. Scenes with queued work are now evicted **last**
+(`Fleet.demanded_scenes`). That is an ordering, not a pin: "has queued work" can
+cover the whole cache, and an unevictable cache turns a policy ceiling into a
+refused job. Free space still outranks it.
 
 Scene switching is a worker **relaunch**, not `bpy.ops.wm.open_mainfile`. The
 dominant cost (prewarm) is identical, while the relaunch path is the hardened
@@ -898,6 +940,38 @@ A `.complete` marker is written last, after the .blend *and* every sibling. The
 cache check requires it, because a push that died between them leaves a
 perfectly valid .blend beside a half-copied cache tree — which Blender treats as
 no cache at all.
+
+### A render scene must carry no live rigid-body world at all
+
+The worker refuses a frame whose physics caches do not cover it, because
+Blender does not fail on a missing cache — it *simulates*, and a simulation
+reached by jumping to a frame does not continue the frame before it. That
+refusal is correct and stays. Observed 2026-08-03 on
+`render/breach/wit_static.blend`, which reached the farm carrying a
+`rigidbody_world` with nothing baked into it: frame 1 would have been simulated
+from rest rather than read.
+
+The general rule the refusal implies is stronger than "bake before you submit":
+
+> **A scene that can still simulate is a scene that can disagree with its own
+> bake.** By the time a blend is a render input, its simulation should not
+> exist — the geometry should be baked down and the `rigidbody_world` removed,
+> not merely cached.
+
+A cache is a *promise* that the sim and the bake agree, and every mechanism
+that can break the promise survives into the render: a cache that does not span
+the submitted range, a disk cache that was never ticked so the points live only
+in memory and do not travel, an object added to the world after the bake, a
+frame stepped to out of order. Each of those produces a plausible image that no
+single-frame inspection catches — which on a one-shot 4K film is the most
+expensive class of defect there is.
+
+Keeping the world and trusting `require_caches` makes the worker the last line
+of defence against a scene that should never have shipped. Shipping no
+simulation at all removes the question: there is nothing left that *could*
+re-simulate. `--no-require-caches` still exists for the case where the
+difference is genuinely acceptable, and the reply reports the problem either
+way.
 
 ### Seams
 

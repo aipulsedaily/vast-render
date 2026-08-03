@@ -477,12 +477,19 @@ class Fleet:
         not — never zero, because a zero here would tell the dispatcher that
         abandoning a 4.5 GB scene is free.
         """
+        digest = None
         if scene is None:
             scene = self.scene_path
+            # Already known for the loaded scene, and this runs on the dispatch
+            # loop: `scene_hash` re-reads the whole file whenever its memo misses
+            # on (mtime, size), and re-reading 4.5 GB to price a decision would
+            # cost more than the decision.
+            digest = self.scene_hash
         if scene is None:
             return 0.0
         with contextlib.suppress(OSError):
-            digest = remote.scene_hash(scene)
+            if digest is None:
+                digest = remote.scene_hash(scene)
             measured = self.switch_cost.get(digest)
             if measured is not None:
                 return measured
