@@ -5,6 +5,50 @@ thing it first looked like. Newest first.
 
 ---
 
+## 2026-08-03 — the stray inode that destroyed a healthy instance, and the fix that ate the evidence
+
+`mkdir -p /workspace/scenes/139698d62abee3bf` (relief_2light_A2.blend) failed
+three times in nine seconds with `File exists`. The deploy retry gave up,
+`_deploy` classified it a **host-level failure**, and instance 46668588 was
+destroyed: reachable, idle, 7 h uptime, 28 scenes and **5.46 GB of warm
+cache**. The replacement cost a 900 s rental wait, a 481 MB Blender push, a
+148 s deploy, an empty cache, and ~17 minutes of queue starvation.
+
+`mkdir -p` succeeds on a directory that already exists. It fails only when the
+path exists as something that is **not** one. So an EEXIST here is a corrupted
+entry in *the broker's own content-addressed cache* — it says nothing whatever
+about the host, and destroying the host cannot fix it. `rm -f` fixes it.
+
+### The first fix closed the outage and opened a worse hole
+
+    test -d $dir || rm -f $dir; mkdir -p $dir
+
+Correct, and **silent**. It removed the offending thing without ever looking at
+it, so what wrote a non-directory into a content-addressed cache path remained
+unknown — and every future recurrence would have destroyed its own evidence the
+same way. A stray inode stops existing the moment it is healed, so "capture it
+next time" is not something an operator can be asked to do afterwards.
+
+The heal now **describes before it removes** (`ls -ld`, `readlink -f`, the
+first bytes through `od`) and logs that at WARNING, in the same round trip, on
+a path already known to be wrong.
+
+### And the guard missed the one shape that best explains it
+
+`[ -e ]` **follows symlinks**, so it is false on a dangling one — while
+`mkdir -p` still refuses that path with EEXIST. A dangling symlink was
+therefore simultaneously invisible to the check and fatal to the deploy: the
+exact failure signature, and the heal skipped it. Found by writing the first
+test this code ever had, run against a real filesystem with a real shell; it
+failed on the symlink case immediately. The guard is now
+`{ [ -e ] || [ -L ]; } && [ ! -d ]`.
+
+Root cause of the original inode is **still unproven** — but a dangling symlink
+is now both a candidate and no longer able to cause the outage, and if anything
+else does it, the log will say what it was.
+
+---
+
 ## 2026-08-03 — 32 minutes of `starting-worker`, and every guard against it was reading the wrong engine
 
 `./rq status` showed the farm stopped dead:
