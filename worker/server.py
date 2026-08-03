@@ -277,6 +277,29 @@ MAX_PIXELS = 200_000_000   # 200 Mpx; --res 3840 2160 --zoom 7 is 406 Mpx
 MAX_REQUEST_BYTES = 1 << 20
 
 
+class Refused(ValueError):
+    """The request is wrong, and rendering it again will not make it right.
+
+    A verdict, not a failure. The broker retries a failed job because most
+    failures here are transport — a dropped forward, a reset connection, a
+    reaped tunnel — and those genuinely do succeed on the second try. A
+    rejection cannot: the same spec produces the same refusal, three times, and
+    on this farm each of those attempts drags a scene selection behind it.
+    Observed 2026-08-03, verbatim and three times per job:
+
+        job 2e8fa81b1973 requeued: 3840x2160 at zoom 8.0 is 531 Mpx ...
+        job 2e8fa81b1973 requeued: 3840x2160 at zoom 8.0 is 531 Mpx ...
+        job 2e8fa81b1973 failed:   3840x2160 at zoom 8.0 is 531 Mpx ...
+
+    Worse outside the broker: a client that resubmits on failure turns one bad
+    request into unbounded queue depth, and one agent accumulated 27 retry
+    processes against an already-contended queue before noticing.
+
+    Replies carrying this are marked `terminal`, and the broker fails them once.
+    Retry belongs to transport, never to a verdict.
+    """
+
+
 def capture_baseline(scene: bpy.types.Scene) -> None:
     BASELINE["max_bounces"] = scene.cycles.max_bounces
     BASELINE["exposure"] = scene.view_settings.exposure
@@ -473,20 +496,50 @@ def apply_spec(scene: bpy.types.Scene, spec: dict) -> None:
     width, height = spec["resolution"]
     zoom = float(spec["zoom"])
     if zoom <= 0:
-        raise ValueError(f"zoom must be > 0, got {zoom}")
+        raise Refused(f"zoom must be > 0, got {zoom}")
     if width <= 0 or height <= 0:
-        raise ValueError(f"resolution must be positive, got {width}x{height}")
-    px = int(width * zoom) * int(height * zoom)
-    if px > MAX_PIXELS:
-        raise ValueError(
-            f"{width}x{height} at zoom {zoom} is {px / 1e6:.0f} Mpx, over the "
-            f"{MAX_PIXELS / 1e6:.0f} Mpx limit"
-        )
-    scene.render.resolution_x = int(width * zoom)
-    scene.render.resolution_y = int(height * zoom)
-    scene.render.resolution_percentage = 100
+        raise Refused(f"resolution must be positive, got {width}x{height}")
 
     border = spec["border"]
+    if border:
+        min_x, max_x, min_y, max_y = border
+        if not all(0.0 <= v <= 1.0 for v in border):
+            raise Refused(f"border values must be within 0..1, got {border}")
+        if min_x >= max_x or min_y >= max_y:
+            raise Refused(
+                f"border must be (min_x, max_x, min_y, max_y) with min < max, "
+                f"got {border}"
+            )
+
+    # The cap exists to stop a job exhausting the GPU's memory, so it has to
+    # count the pixels that are actually RENDERED — and with
+    # `use_crop_to_border` Blender renders and returns the crop alone, not the
+    # frame it was cut from.
+    #
+    # Counting the full frame made high-density crops, which is what zoom is
+    # FOR, the one thing zoom could not do. Measured 2026-08-03: a 0.16 x 0.16
+    # border at zoom 8 on a 3840x2160 frame is 4915x2765 = 13.6 Mpx of real
+    # work, and it was refused as "531 Mpx, over the 200 Mpx limit" — the size
+    # of a frame nobody asked to render. Three agents hit it; one worked around
+    # it with a local crop rather than get a 13 Mpx render out of a 5090.
+    full_w, full_h = int(width * zoom), int(height * zoom)
+    if border:
+        min_x, max_x, min_y, max_y = border
+        px_w = max(1, int(full_w * (max_x - min_x)))
+        px_h = max(1, int(full_h * (max_y - min_y)))
+    else:
+        px_w, px_h = full_w, full_h
+    px = px_w * px_h
+    if px > MAX_PIXELS:
+        crop = (f" cropped to {px_w}x{px_h}" if border else "")
+        raise Refused(
+            f"{width}x{height} at zoom {zoom}{crop} is {px / 1e6:.0f} Mpx, over "
+            f"the {MAX_PIXELS / 1e6:.0f} Mpx limit"
+        )
+    scene.render.resolution_x = full_w
+    scene.render.resolution_y = full_h
+    scene.render.resolution_percentage = 100
+
     if border:
         min_x, max_x, min_y, max_y = border
         scene.render.use_border = True
@@ -822,7 +875,9 @@ def handle(spec: dict, out_dir: str) -> dict:
     caches = cache_report(scene)
     problems = cache_problems(caches, frame) if caches else []
     if problems and spec["require_caches"]:
-        raise RuntimeError(
+        # A verdict about the scene, not a failure of this attempt: the same
+        # blend at the same frame has no cache on the second try either.
+        raise Refused(
             f"frame {frame} refused: physics caches do not cover it, so Blender "
             f"would SIMULATE rather than read them and this frame would not "
             f"continue the previous one — "
@@ -999,7 +1054,8 @@ def serve(port: int, out_dir: str, host: str = "127.0.0.1", progress_path: str =
                     f"sha={reply.get('png', {}).get('sha256', '')[:12]}")
             except Exception as exc:
                 traceback.print_exc()
-                reply = {"ok": False, "job_id": spec.get("job_id"), "error": str(exc)}
+                reply = {"ok": False, "job_id": spec.get("job_id"),
+                         "error": str(exc), "terminal": isinstance(exc, Refused)}
 
             conn.sendall(json.dumps(reply).encode() + b"\n")
         except Exception as exc:

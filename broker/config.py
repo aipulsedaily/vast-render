@@ -152,6 +152,43 @@ DISK_SAMPLE_SEC = _env("DISK_SAMPLE_SEC", 300.0)
 SCENE_BATCH_MAX = _env("SCENE_BATCH_MAX", 25)
 SCENE_STARVE_SEC = _env("SCENE_STARVE_SEC", 300.0)
 
+# SCENE_STARVE_SEC is a FLOOR, not the whole threshold. It was written when a
+# scene switch meant "worker restart plus prewarm, 40-60 s", and against that
+# cost 300 s is a generous margin. It is not the cost of every switch.
+#
+# Measured on this farm 2026-08-03, switching between round-2 scenes:
+#
+#     breach/wit_static.blend   0.003 GB     63 s
+#     wavefix/pw_*.blend        0.20  GB    ~100 s
+#     spx5.blend                0.68  GB     222 s
+#     film6b.blend              4.51  GB    1425 s        <- 24 minutes
+#
+# With five agents queuing work against five different scenes, *some* scene has
+# always been waiting longer than 300 s, so the starvation test fired on every
+# single dispatch and the policy degenerated into exactly the job-by-job
+# switching `next_job` exists to prevent — 9 consecutive switches, "after 1
+# job(s)" every time, one 13 s render bought with 100 s of scene push. It was
+# about to abandon a 4.53 GB scene holding SIXTEEN queued jobs to serve one
+# 3 MB scene holding one, at ~24 minutes a round trip.
+#
+# So preemption has to clear the cost of the preemption. A switch is paid
+# TWICE — once to leave the loaded scene and once to come back to it — hence
+# the factor. Below the floor the old behaviour is unchanged: for a 0.2 GB
+# scene 2 x 120 s is under 300 s, so small scenes still interleave freely, and
+# only a scene that is genuinely expensive to reload earns patience.
+#
+# This bounds nothing on its own and is not meant to: SCENE_BATCH_MAX is what
+# stops a busy scene deferring the others forever, and it is untouched.
+SCENE_SWITCH_PAYBACK = _env("SCENE_SWITCH_PAYBACK", 2.0)
+
+# What reloading a scene costs when it has never been measured — the first
+# switch away from a big scene must already be protected, or the measurement
+# only ever arrives after the mistake. Fitted to the four measurements above
+# (60 + 300/GB gives 61 s, 120 s, 264 s, 1413 s against 63/100/222/1425), and
+# the slope is the same 300 s/GB the worker readiness budget already uses.
+SCENE_RELOAD_BASE_SEC = _env("SCENE_RELOAD_BASE_SEC", 60.0)
+SCENE_RELOAD_SEC_PER_GB = _env("SCENE_RELOAD_SEC_PER_GB", 300.0)
+
 # How long a just-drained scene is given to produce more work before the
 # dispatcher pays to switch away from it.
 #

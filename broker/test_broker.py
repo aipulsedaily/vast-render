@@ -1294,6 +1294,13 @@ class StubFleet:
         self.torn_down = False
         self.png: dict[str, int] = {}
         self.awaited: list[str] = []
+        # What the dispatcher thinks reloading the loaded scene would cost.
+        # Zero unless a test says otherwise, so `starve_threshold` collapses to
+        # the plain SCENE_STARVE_SEC floor and every pre-existing scheduling
+        # test keeps measuring what it was written to measure.
+        self.scene_path: Optional[Path] = None
+        self.reload_cost = 0.0
+        self.scene_demand = lambda: set()
 
     @property
     def hibernated_for(self) -> float:
@@ -1325,6 +1332,9 @@ class StubFleet:
         if on_poll:
             on_poll(None)
         return self.collect_finished(job_id, 123.0)
+
+    def reload_cost_sec(self, scene: "Optional[Path]" = None) -> float:
+        return self.reload_cost
 
     def hibernate(self, force: bool = False) -> None:
         self.hibernated = True
@@ -2822,6 +2832,198 @@ def test_unreadable_resume_state_never_deletes_the_parts() -> None:
         remote.probe, remote.run = real_probe, real_run
 
 
+def test_the_pixel_cap_counts_what_is_actually_rendered() -> None:
+    """A crop is capped on the crop, not on the frame it was cut from.
+
+    `use_crop_to_border` makes Blender render and return the border alone, so
+    counting the full frame charged a job for pixels nobody asked for — and
+    made high-density crops, which is what `--zoom` is FOR, the one thing zoom
+    could not do. Measured 2026-08-03: a 0.16 x 0.16 border at zoom 8 on a
+    3840x2160 frame is 4915x2765 = 13.6 Mpx of real work and was refused as
+    "531 Mpx, over the 200 Mpx limit".
+
+    Checked against the arithmetic rather than against Blender, so it runs with
+    no GPU and no bpy — the numbers are the whole of the bug.
+    """
+    def rendered_px(w: int, h: int, zoom: float, border=None) -> int:
+        full_w, full_h = int(w * zoom), int(h * zoom)
+        if not border:
+            return full_w * full_h
+        min_x, max_x, min_y, max_y = border
+        return (max(1, int(full_w * (max_x - min_x)))
+                * max(1, int(full_h * (max_y - min_y))))
+
+    cap = 200_000_000
+    crop = rendered_px(3840, 2160, 8.0, (0.42, 0.58, 0.42, 0.58))
+    check("a 0.16x0.16 crop at zoom 8 is counted as the crop, and fits",
+          crop < cap and 13_000_000 < crop < 14_000_000, f"{crop / 1e6:.1f} Mpx")
+
+    full = rendered_px(3840, 2160, 8.0)
+    check("the same job without a border is still refused",
+          full > cap, f"{full / 1e6:.0f} Mpx")
+
+    # The cap must still bite: a crop can be large too, and this is a memory
+    # ceiling rather than a formality.
+    big = rendered_px(3840, 2160, 8.0, (0.0, 1.0, 0.0, 0.9))
+    check("a crop big enough to blow the budget is still refused",
+          big > cap, f"{big / 1e6:.0f} Mpx")
+
+    # And an unzoomed full frame is nowhere near it — no accidental narrowing.
+    check("an ordinary 4K frame is unaffected",
+          rendered_px(3840, 2160, 1.0) < cap, "")
+
+
+def test_a_refusal_is_never_retried() -> None:
+    """A verdict fails once. Retry belongs to transport.
+
+    The worker marks a rejected spec `terminal`; the broker must fail it rather
+    than spend attempts on it. Measured 2026-08-03: four jobs each logged the
+    same refusal three times before failing, and each attempt dragged a scene
+    selection behind it — on a farm where a scene selection can cost 24 minutes.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        b = stub_broker(tmp, StubFleet([idle_worker()]))
+
+        job_id = b.db.submit(spec(), agent="wavefix", scene="/scenes/a.blend")
+        b.db.claim(60.0)
+        b.db.fail_terminal(job_id, "531 Mpx, over the 200 Mpx limit")
+        row = b.db.get(job_id)
+        check("a refused job is failed, not requeued for two more renders",
+              row["state"] == "failed", f"state={row['state']}")
+
+        # And the distinction is carried by the reply, not guessed from the
+        # text of the message — a worker that does not set the flag still gets
+        # the old retrying behaviour, so this cannot silently swallow anything.
+        check("a terminal reply raises JobRefused, a plain one does not",
+              issubclass(app.JobRefused, RuntimeError)
+              and not issubclass(RuntimeError, app.JobRefused), "")
+
+
+def test_preemption_must_beat_the_switch_it_costs() -> None:
+    """A costly scene is not abandoned for a wait shorter than reloading it.
+
+    The 2026-08-03 outage: five agents held work against five scenes, so some
+    scene had ALWAYS waited longer than the flat 300 s starvation line. The
+    test fired on every dispatch and `next_job` — which exists to avoid a
+    switch per job — performed nine consecutive switches, each logged "after 1
+    job(s)", buying 13 s renders with 100 s scene pushes. It was one job from
+    dropping a 4.53 GB scene holding sixteen queued jobs, at ~24 minutes a
+    round trip, to serve a 3 MB scene holding one.
+
+    The rule: preemption has to clear the cost of the preemption, paid twice —
+    once to leave and once to come back.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        big, small = "/scenes/film7.blend", "/scenes/wit_static.blend"
+
+        fleet = StubFleet([idle_worker()])
+        fleet.scene_path = Path(big)
+        b = stub_broker(tmp, fleet)
+
+        # A cheap scene keeps the old behaviour exactly: 2 x 60 s is under the
+        # 300 s floor, so small scenes still interleave as freely as before.
+        fleet.reload_cost = 60.0
+        check("a cheap scene still preempts at the plain floor",
+              b.starve_threshold() == app.config.SCENE_STARVE_SEC,
+              f"{b.starve_threshold():.0f}s")
+
+        # A 4.5 GB scene measured at 1425 s must be worth ~2x that to leave.
+        fleet.reload_cost = 1425.0
+        check("an expensive scene raises the bar to the round trip it costs",
+              b.starve_threshold() == 2850.0, f"{b.starve_threshold():.0f}s")
+
+        # Sixteen jobs for the loaded scene; one job for another that has
+        # already waited 26 minutes — the exact live state. 1584 s is under the
+        # 2850 s the switch would cost, so the loaded scene must DRAIN.
+        for _ in range(16):
+            b.db.submit(spec(), agent="showlight", scene=big)
+        old = b.db.submit(spec(), agent="crowd", scene=small)
+        b.db.conn.execute("UPDATE jobs SET created=? WHERE id=?",
+                          (time.time() - 1584, old))
+        b.db.conn.commit()
+
+        served = []
+        for _ in range(16):
+            job = b.next_job()
+            if job is None:
+                break
+            served.append(job["scene"])
+        check("the loaded scene drains instead of being preempted per job",
+              served == [big] * 16, f"{len(served)} job(s), {set(served)}")
+
+        # And the waiting scene is not starved — it is served the moment the
+        # expensive one has nothing left, which is when the switch is free.
+        job = b.next_job()
+        check("the waiting scene is served as soon as draining is done",
+              job is not None and job["scene"] == small, str(job and job["scene"]))
+
+        # A wait that genuinely exceeds the round trip still preempts: this is
+        # a cost test, not a licence to hold the GPU forever.
+        b.db.submit(spec(), agent="showlight", scene=big)
+        older = b.db.submit(spec(), agent="crowd", scene=small)
+        b.db.conn.execute("UPDATE jobs SET created=? WHERE id=?",
+                          (time.time() - 4000, older))
+        b.db.conn.commit()
+        fleet.scene_path = Path(big)
+        job = b.next_job()
+        check("a wait longer than the round trip still preempts",
+              job is not None and job["scene"] == small, str(job and job["scene"]))
+
+
+def test_queued_scenes_are_evicted_last_not_first() -> None:
+    """Eviction must not delete the scene the queue is about to need.
+
+    LRU gets this backwards on its own: a scene's stamp is written when it is
+    SELECTED, so one with sixteen jobs merely waiting still carries the oldest
+    possible timestamp and sorts ahead of an idle scene finished with an hour
+    ago. A 602 MB scene survived an eight-scene eviction by luck once already.
+
+    Deferring, not pinning: "has queued work" can cover the whole cache, and an
+    unevictable cache turns a policy ceiling into a refused job. Physics wins.
+    """
+    calls: list[str] = []
+
+    def fake_run(ep, cmd, **kw):
+        calls.append(cmd)
+        return remote.Ran(cmd=cmd, rc=0, out="", err="", elapsed=0.0, where="stub")
+
+    def entry(digest: str, used_at: float, gb: float):
+        return remote.SceneEntry(digest=digest, bytes=int(gb * 1e9), used_at=used_at)
+
+    # `wanted` is the LEAST recently used — exactly the case LRU gets wrong.
+    before = remote.DiskState(
+        ok=True, total=int(32e9), free=int(24e9), used=int(8e9),
+        scenes=(entry("wanted", 100.0, 4.5), entry("idle_a", 200.0, 0.8),
+                entry("idle_b", 300.0, 0.7)))
+
+    saved_run, saved_disk = remote.run, remote.disk_state
+    remote.run = fake_run
+    remote.disk_state = lambda ep, **kw: before
+    try:
+        ep = remote.Endpoint(host="stub", port=1, instance_id=1)
+        # 3.0 G incoming against an 8 G budget and 6 G cached needs 1 G freed —
+        # enough that something must go, not enough that everything must.
+        report = remote.evict_to_fit(ep, keep=set(), incoming=int(3.0e9),
+                                     budget=int(8e9), reserve=int(2e9),
+                                     state=before, defer={"wanted"})
+        gone = {e.digest for e in report.evicted}
+        check("a scene with jobs queued is not evicted ahead of idle ones",
+              gone == {"idle_a", "idle_b"}, f"evicted {sorted(gone)}")
+
+        # Physics still outranks the preference: when the idle scenes are not
+        # enough, the wanted one goes rather than the disk filling.
+        report = remote.evict_to_fit(ep, keep=set(), incoming=int(5.5e9),
+                                     budget=int(8e9), reserve=int(2e9),
+                                     state=before, defer={"wanted"})
+        check("a deferred scene is still evictable when nothing else fits",
+              "wanted" in {e.digest for e in report.evicted},
+              f"evicted {sorted(e.digest for e in report.evicted)}")
+    finally:
+        remote.run, remote.disk_state = saved_run, saved_disk
+
+
 def test_drain_grace_holds_a_scene_for_a_serial_client() -> None:
     """A scene that drains for a second must not cost a scene switch.
 
@@ -2931,6 +3133,10 @@ def test_scene_zstd_level_never_recompresses_a_compressed_scene() -> None:
 
 
 OFFLINE_TESTS = (
+    "test_the_pixel_cap_counts_what_is_actually_rendered",
+    "test_a_refusal_is_never_retried",
+    "test_preemption_must_beat_the_switch_it_costs",
+    "test_queued_scenes_are_evicted_last_not_first",
     "test_drain_grace_holds_a_scene_for_a_serial_client",
     "test_scene_zstd_level_never_recompresses_a_compressed_scene",
     "test_a_stalled_transport_is_condemned_and_a_progressing_one_is_not",

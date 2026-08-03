@@ -79,12 +79,30 @@ class BlankOutput(RuntimeError):
     """
 
 
+class JobRefused(RuntimeError):
+    """The worker rejected the request itself, and will reject it again.
+
+    Sibling of `BlankOutput`, and terminal for the same reason: it is a verdict
+    about the job, not a failed attempt at it. The worker raises
+    `server.Refused` for a spec it will not honour — an over-budget pixel
+    count, a border that is not a rectangle, a frame whose physics caches would
+    be simulated rather than read — and marks the reply `terminal`.
+
+    Retrying a verdict cannot converge. Measured 2026-08-03: four separate jobs
+    each logged the identical refusal three times before failing, and each of
+    those attempts pulled a scene switch in behind it. Retry is for transport.
+    """
+
+
 class Broker:
     def __init__(self) -> None:
         config.ensure_dirs()
         self.db = DB(config.DB_PATH, default_scene=str(config.SCENE))
         self.fleet = Fleet()
         self.fleet.on_teardown = self.bank_spend
+        # The fleet decides what to evict; only the broker knows what is still
+        # wanted. Injected rather than given the fleet a queue of its own.
+        self.fleet.scene_demand = self.demanded_scene_hashes
         self.running = True
         self.paused: Optional[str] = None
         self.last_work = time.time()
@@ -279,8 +297,9 @@ class Broker:
         would idle a second and ask again — so waiting here would add latency
         to buy nothing. Return immediately and let it.
 
-        **Fairness still outranks it.** A scene crossing SCENE_STARVE_SEC while
-        we wait ends the wait, so this cannot become a new way to starve one.
+        **Fairness still outranks it.** A scene crossing `starve_threshold()`
+        while we wait ends the wait, so this cannot become a new way to starve
+        one.
 
         **It polls.** An active client is served in one poll interval, not in
         the whole grace, so the full cost is paid only when the scene is
@@ -306,7 +325,7 @@ class Broker:
                 # The competition drained too — whatever we do next costs
                 # nothing now, so stop holding the dispatcher here.
                 return None
-            if waiting > config.SCENE_STARVE_SEC:
+            if waiting > self.starve_threshold():
                 return None
             job = self.db.claim(lease, scene=current)
             if job is not None:
@@ -314,6 +333,54 @@ class Broker:
                          "switch was paid for", scenes.label(Path(current)),
                          time.time() - began)
                 return job
+
+    def demanded_scene_hashes(self) -> set[str]:
+        """Content hashes of every scene with a job still waiting on it.
+
+        Feeds eviction ordering, so a scene the queue is about to need is not
+        deleted ahead of one nothing wants. Hashing is memoised on (mtime,
+        size), so this costs a `stat` per distinct scene, not a re-read.
+
+        Anything that cannot be hashed — a scene deleted or renamed since its
+        job was queued — is simply left out. The job will fail on its own terms
+        when it is dispatched; a missing file must not break eviction, which is
+        what stands between a long batch and a full disk.
+        """
+        out: set[str] = set()
+        for path in self.db.depth_by_scene():
+            if not path:
+                continue
+            with contextlib.suppress(OSError, ValueError):
+                out.add(remote.scene_hash(Path(path)))
+        return out
+
+    def starve_threshold(self) -> float:
+        """How long another scene must wait before preempting the loaded one.
+
+        `config.SCENE_STARVE_SEC` is the FLOOR, not the answer. Preemption is
+        only worth buying when the wait it relieves exceeds the wait it
+        creates, and a switch is paid twice — once to leave the loaded scene
+        and once to come back to it — so the threshold has to scale with what
+        reloading that scene actually costs.
+
+        Measured 2026-08-03, and this is the incident that produced the
+        method: five agents held work against five scenes, so *some* scene had
+        always waited longer than the flat 300 s. The starvation test therefore
+        fired on every single dispatch, and `next_job` — whose entire purpose
+        is to avoid a scene switch per job — performed nine consecutive
+        switches logging "after 1 job(s)" each time, buying 13 s renders with
+        100 s scene pushes. It was one job away from abandoning a 4.53 GB
+        scene holding SIXTEEN queued jobs, at roughly 24 minutes a round trip,
+        to serve a 3 MB scene holding one.
+
+        Small scenes are unaffected: 2 x 120 s for a 0.2 GB scene is under the
+        floor, so they still interleave exactly as before. Only a scene that is
+        genuinely expensive to reload earns patience — and `SCENE_BATCH_MAX`,
+        untouched, remains what actually bounds unfairness.
+        """
+        floor = float(config.SCENE_STARVE_SEC)
+        cost = self.fleet.reload_cost_sec()
+        return max(floor, float(config.SCENE_SWITCH_PAYBACK) * cost)
 
     def next_job(self) -> Optional[dict]:
         """Pick the next job, batching by scene without starving any scene.
@@ -330,7 +397,8 @@ class Broker:
           * drain while jobs exist for the currently loaded scene,
           * unless SCENE_BATCH_MAX jobs have been served consecutively,
           * or some other scene has had a job waiting longer than
-            SCENE_STARVE_SEC.
+            `starve_threshold()` — SCENE_STARVE_SEC, raised to cover the cost
+            of the switch it is about to trigger.
 
         The switch target is always the oldest waiting job's scene, which is
         what bounds unfairness between scenes: however long a batch runs, the
@@ -343,7 +411,8 @@ class Broker:
 
         if current is not None:
             waiting = self.db.oldest_waiting_age(exclude_scene=current)
-            starving = waiting is not None and waiting > config.SCENE_STARVE_SEC
+            threshold = self.starve_threshold()
+            starving = waiting is not None and waiting > threshold
             capped = self.scene_batch >= config.SCENE_BATCH_MAX
             drained = False
             if not starving and not capped:
@@ -363,7 +432,8 @@ class Broker:
                 # the first live switch told — 9 jobs served against a cap of 25.
                 drained = True
             if starving:
-                reason = f"another scene has waited {waiting:.0f}s"
+                reason = (f"another scene has waited {waiting:.0f}s, over the "
+                          f"{threshold:.0f}s this switch has to beat")
             elif capped:
                 reason = f"batch cap {config.SCENE_BATCH_MAX} reached"
             else:
@@ -607,7 +677,13 @@ class Broker:
                     f"really is gone. {self.fleet.worker_postmortem()}"
                 ) from None
         if not reply.get("ok"):
-            raise RuntimeError(reply.get("error", "worker reported failure"))
+            why = reply.get("error", "worker reported failure")
+            # A refusal on the merits, not a failed attempt. Retrying it buys
+            # the identical answer three times and drags a scene selection
+            # behind each one. See worker.server.Refused.
+            if reply.get("terminal"):
+                raise JobRefused(why)
+            raise RuntimeError(why)
         return reply
 
     def collect(self, reply: dict, local: Path) -> tuple[int, dict]:
@@ -753,6 +829,12 @@ class Broker:
             self.db.fail_terminal(job_id, remote.diagnose(exc))
             log.error("job %s FAILED on DISK and will NOT be retried — %s",
                       job_id, remote.diagnose(exc))
+        except JobRefused as exc:
+            # The worker looked at the request and said no. It will say no
+            # again. Failing it once puts the answer in front of the agent that
+            # has to change the request, which is the only thing that can.
+            self.db.fail_terminal(job_id, str(exc))
+            log.error("job %s REFUSED and will NOT be retried — %s", job_id, exc)
         except BlankOutput as exc:
             # Not retried, and it does not matter what the instance is doing:
             # the render finished, the file arrived, it verified, and there is

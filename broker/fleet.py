@@ -33,7 +33,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from vastai import VastAI
 
@@ -184,6 +184,16 @@ class Fleet:
         # Asset directories already mirrored onto *this* instance, so switching
         # back and forth between scenes does not re-push them every time.
         self.mirrored_assets: set[Path] = set()
+        # Measured seconds to make each scene live, by content hash. Feeds
+        # `reload_cost_sec`, which is how the dispatcher knows whether leaving
+        # a scene costs more than the wait it would relieve. Keyed by hash, so
+        # a reassembled .blend is re-measured rather than judged by its
+        # predecessor's timing.
+        self.switch_cost: dict[str, float] = {}
+        # Which scenes have work queued against them, injected by the Broker —
+        # the fleet owns no queue and must not grow one. Returns scene hashes.
+        # Used to order eviction, never to forbid it: see protected_scenes.
+        self.scene_demand: Callable[[], set[str]] = lambda: set()
         self.last_ready: bool = False
         self.status: str = "down"
         self.stopped_at: Optional[float] = None
@@ -438,6 +448,47 @@ class Fleet:
         if self.scene_hash:
             keep.add(self.scene_hash)
         return keep
+
+    def demanded_scenes(self) -> set[str]:
+        """Scene hashes with jobs still waiting on them — evict these LAST.
+
+        Deliberately NOT part of `protected_scenes`. A hard pin is the wrong
+        instrument: with five agents queuing against five scenes, "has queued
+        work" can cover the whole cache, and an unevictable cache turns a
+        policy ceiling into `DiskFull` — a refused job where the old code
+        merely paid for a re-push. Physics must always win over intent.
+
+        What was actually wrong is subtler than "it can be evicted": it was
+        evicted **first**. Eviction is LRU by last use, and a scene nobody has
+        selected yet has by definition never been touched, so a 4.5 GB scene
+        with sixteen jobs queued sorted *ahead* of an idle scene finished with
+        hours ago. Ordering demand last fixes that without forbidding anything:
+        a scene with work waiting is evicted only when evicting everything
+        idle was not enough.
+        """
+        with contextlib.suppress(Exception):
+            return set(self.scene_demand())
+        return set()
+
+    def reload_cost_sec(self, scene: Optional[Path] = None) -> float:
+        """Seconds to make `scene` (default: the loaded one) live again.
+
+        Measured where we have measured it, estimated from size where we have
+        not — never zero, because a zero here would tell the dispatcher that
+        abandoning a 4.5 GB scene is free.
+        """
+        if scene is None:
+            scene = self.scene_path
+        if scene is None:
+            return 0.0
+        with contextlib.suppress(OSError):
+            digest = remote.scene_hash(scene)
+            measured = self.switch_cost.get(digest)
+            if measured is not None:
+                return measured
+            gb = scene.stat().st_size / 1e9
+            return config.SCENE_RELOAD_BASE_SEC + config.SCENE_RELOAD_SEC_PER_GB * gb
+        return float(config.SCENE_RELOAD_BASE_SEC)
 
     def mark_scene_used(self, digest: str, min_interval: float = 120.0) -> None:
         """Stamp a cached scene as just-used, so the LRU order is by USE.
@@ -937,8 +988,12 @@ class Fleet:
             self.scene_path = scene
             self.last_ready = True
             self.status = "ready"
+            cost = time.time() - began
+            # What it cost to get here is what it will cost to come back. The
+            # dispatcher reads this to decide whether leaving is affordable.
+            self.switch_cost[self.scene_hash] = cost
             log.info("scene switch to %s complete in %.1fs (no redeploy)",
-                     scenes.label(scene), time.time() - began)
+                     scenes.label(scene), cost)
             return True
         except remote.DiskFull:
             # Not a switch failure. Falling through to the deploy path would
@@ -1868,6 +1923,10 @@ class Fleet:
         # alone. Retrying it, or replacing the hardware for it, buys the same
         # disk and the same answer.
         keep = {digest} | self.protected_scenes()
+        # Soft protection for scenes that still have jobs waiting on them:
+        # evicted only after every idle scene, never instead of one. See
+        # `demanded_scenes` for why this is an ordering and not a pin.
+        defer = self.demanded_scenes() - keep
         reserve = int(config.DISK_RESERVE_GB * 1e9)
         state = remote.disk_state(ep)
         self.disk = state
@@ -1879,7 +1938,7 @@ class Fleet:
                   if state.ok else int(config.SCENE_CACHE_GB * 1e9))
         incoming = size + self._sibling_bytes(scene)
         report = remote.evict_to_fit(ep, keep, incoming=incoming, budget=budget,
-                                     reserve=reserve, state=state)
+                                     reserve=reserve, state=state, defer=defer)
         self.disk = report.after
         self._disk_sampled = time.time()
         log.info("scene cache preflight for %s (%.2f GB incoming): %s",

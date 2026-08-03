@@ -1025,7 +1025,8 @@ def effective_budget(state: DiskState, configured: int, reserve: int) -> int:
 
 
 def evict_to_fit(ep: Endpoint, keep: set[str], *, incoming: int, budget: int,
-                 reserve: int, state: Optional[DiskState] = None) -> Eviction:
+                 reserve: int, state: Optional[DiskState] = None,
+                 defer: Optional[set[str]] = None) -> Eviction:
     """Make room for `incoming` bytes of scene, LRU-first. Verified, not assumed.
 
     Two constraints, and they are deliberately not the same kind of thing:
@@ -1047,6 +1048,15 @@ def evict_to_fit(ep: Endpoint, keep: set[str], *, incoming: int, budget: int,
     every time a job selects that scene — not creation time. A scene uploaded
     once and used all day must outlive one uploaded an hour ago and never
     touched since.
+
+    `defer` is evicted LAST — scenes with jobs still queued against them. LRU
+    alone gets this exactly backwards: a scene's stamp is written when it is
+    *selected*, so one with work merely waiting still carries the oldest
+    possible timestamp and sorts ahead of an idle scene that finished an hour
+    ago. That is how a 4.5 GB scene holding sixteen queued jobs became the
+    first thing thrown away. Deferring is an ordering, not a pin: if evicting
+    every idle scene is not enough, these still go, and free space still
+    outranks every preference expressed here.
 
     The eviction is re-measured afterwards. `rm -rf` runs with check=False (a
     missing directory is not an error), so "we sent the removals" is not
@@ -1072,8 +1082,9 @@ def evict_to_fit(ep: Endpoint, keep: set[str], *, incoming: int, budget: int,
     need_space = max(0, incoming + reserve - before.free)
     need = max(need_policy, need_space)
 
-    candidates = [s for s in sorted(before.scenes, key=lambda s: s.used_at)
-                  if s.digest not in keep]
+    wanted = defer or set()
+    candidates = sorted((s for s in before.scenes if s.digest not in keep),
+                        key=lambda s: (s.digest in wanted, s.used_at))
     evicted: list[SceneEntry] = []
     freed = 0
     for entry in candidates:
