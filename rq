@@ -47,7 +47,24 @@ def call(method: str, path: str, payload: Optional[dict] = None, timeout: float 
             return {"error": body, "status": exc.code}
     except urllib.error.URLError as exc:
         print(f"cannot reach broker at {BASE}: {exc.reason}", file=sys.stderr)
-        print("start it with:  .venv/bin/python -m broker.app", file=sys.stderr)
+        # Connection refused is most often a RESTART WINDOW, not a dead farm:
+        # `brokerd.sh stop` SIGKILLs the broker and the next `start` is seconds
+        # behind it, so port 8760 is closed for that gap. Queued jobs live in
+        # SQLite and every 'running' row is reclaimed, so the cure is usually
+        # to wait and re-ask. Say that BEFORE offering to start one.
+        print("  the broker may just be restarting — queued jobs survive in "
+              "SQLite; wait a few seconds and retry", file=sys.stderr)
+        print("  check:  scripts/brokerd.sh status", file=sys.stderr)
+        # NEVER suggest a bare `python -m broker.app` here. That is the exact
+        # anti-pattern documented in README/brokerd.sh: run from an agent's
+        # background task it becomes that task's process, and whatever reaps
+        # the task reaps the broker — mid-render, no traceback, no teardown,
+        # and a rented GPU with nobody managing it. Two multi-hour batches
+        # were lost that way. brokerd.sh setsids it out of reach and is also
+        # the only thing that can report HOW the broker died.
+        print("  start:  scripts/brokerd.sh start <scene.blend>   "
+              "(detaches + supervises; do not run broker.app directly)",
+              file=sys.stderr)
         sys.exit(2)
 
 
@@ -718,6 +735,19 @@ def cmd_status(a: argparse.Namespace) -> int:
     print(f"gpu      {fleet.get('status')}  instance={fleet.get('instance_id')} "
           f"${fleet.get('dph')}/hr  up={fleet.get('uptime_sec')}s  "
           f"spend=${fleet.get('spend_usd')}")
+    # WHERE THE MONEY WENT. Loading a scene is paid GPU time that renders
+    # nothing, and on 2026-08-03 this instance spent more of its life loading
+    # scenes than rendering with them — a 4.5 GB scene costs ~22 minutes on
+    # every eviction, and the dispatcher was paying that per JOB. Nobody knew
+    # until it was measured by hand, because nothing displayed it. This is the
+    # one number that says whether the scheduler is behaving.
+    load, render = fleet.get("load_sec") or 0.0, fleet.get("render_sec") or 0.0
+    if load or render:
+        total = load + render
+        pct = (100.0 * load / total) if total else 0.0
+        flag = "   <- more time loading than rendering" if load > render else ""
+        print(f"time     load {load:.0f}s ({pct:.0f}%)  render {render:.0f}s  "
+              f"on this instance{flag}")
     # A push in flight, so a slow one can be told from a wedged one. Without
     # this, `uploading-scene` was the whole story for the 510 s a 4.22 GB scene
     # took, and the only honest reading of it was "possibly hung".

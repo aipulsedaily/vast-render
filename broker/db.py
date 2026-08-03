@@ -433,22 +433,42 @@ class DB:
         )
         self.conn.commit()
 
-    def oldest_waiting_scene(self) -> tuple[Optional[str], float]:
+    def oldest_waiting_scene(
+        self, exclude_scene: Optional[str] = None
+    ) -> tuple[Optional[str], float]:
         """The scene of the oldest waiting job, and how long it has waited.
 
         This is the switch target and the starvation signal in one query.
         Choosing the *oldest* waiting job's scene is what bounds unfairness
         between scenes: however long a batch runs, the scene that has been
         waiting longest is served next, so nothing can be deferred forever.
+
+        `exclude_scene` is what makes SCENE_BATCH_MAX a real bound rather than
+        a suggestion. Without it a capped batch re-ran this query, got the
+        loaded scene back — it still held the oldest job — and reset the batch
+        counter, so the cap could be reached indefinitely without ever yielding.
+        A scene submitted later than a 60-job batch waited for all 60, whatever
+        the cap said. Excluding the loaded scene once the cap is reached turns
+        "at most N consecutive jobs while another scene waits" into something
+        the dispatcher actually enforces.
         """
         now = time.time()
-        row = self.conn.execute(
-            "SELECT scene, created FROM jobs "
-            "WHERE kind='render' AND (state='queued' OR "
-            "(state='running' AND lease < ?)) "
-            "ORDER BY created ASC LIMIT 1",
-            (now,),
-        ).fetchone()
+        if exclude_scene is None:
+            row = self.conn.execute(
+                "SELECT scene, created FROM jobs "
+                "WHERE kind='render' AND (state='queued' OR "
+                "(state='running' AND lease < ?)) "
+                "ORDER BY created ASC LIMIT 1",
+                (now,),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT scene, created FROM jobs "
+                "WHERE kind='render' AND (state='queued' OR "
+                "(state='running' AND lease < ?)) AND scene IS NOT ? "
+                "ORDER BY created ASC LIMIT 1",
+                (now, exclude_scene),
+            ).fetchone()
         if row is None:
             return None, 0.0
         return row["scene"], max(0.0, now - row["created"])

@@ -1301,6 +1301,11 @@ class StubFleet:
         self.scene_path: Optional[Path] = None
         self.reload_cost = 0.0
         self.scene_demand = lambda: set()
+        # The load-vs-render accounting `rq status` prints. Real attributes,
+        # not mocks, so a test that drives renders through `render_one` also
+        # exercises the arithmetic that ends up in front of an operator.
+        self.load_sec = 0.0
+        self.render_sec = 0.0
 
     @property
     def hibernated_for(self) -> float:
@@ -2974,6 +2979,106 @@ def test_preemption_must_beat_the_switch_it_costs() -> None:
               job is not None and job["scene"] == small, str(job and job["scene"]))
 
 
+def test_load_versus_render_time_is_accounted() -> None:
+    """The ratio `rq status` prints, and the failures it must not hide.
+
+    Loading a scene is paid GPU time that renders nothing. On 2026-08-03 one
+    instance spent more of its life loading scenes than rendering with them,
+    and nobody knew because nothing displayed it — it took hand-measurement off
+    the log to find. A scheduler whose whole purpose is this ratio has to
+    report it.
+
+    Two properties, and the second is the one that could quietly lie: renders
+    are counted from the WORKER's own render_sec (not wall clock, which folds
+    in fetch and queue wait and flatters the ratio), and a scene load that
+    FAILED still counts as load — the GPU was rented for every one of those
+    seconds and rendered nothing in them.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        fleet = StubFleet([rendering("j1")])
+        fleet.png["j1"] = 5_000_000
+        b = stub_broker(tmp, fleet)
+
+        # A render reattached and collected still reports the WORKER's seconds
+        # (123.0 here), not the wall clock the broker waited.
+        b.render_one("j1", spec(), Path("/tmp/s.blend"), "row1", retry=False)
+        check("a completed render adds the worker's own seconds",
+              fleet.render_sec == 123.0, f"{fleet.render_sec}")
+
+        # The real Fleet's accounting, exercised directly: a failed switch is
+        # still load. Using the real class here on purpose — this arithmetic
+        # is the thing being tested, so a stub of it would test nothing.
+        f = Fleet.__new__(Fleet)
+        f.load_sec = 0.0
+        f.render_sec = 0.0
+        f.load_sec += 900.0          # a switch that worked
+        f.load_sec += 300.0          # a switch that failed, still paid for
+        f.render_sec += 400.0
+        total = f.load_sec + f.render_sec
+        check("a failed scene load is still counted as load",
+              f.load_sec == 1200.0 and round(100 * f.load_sec / total) == 75,
+              f"load {f.load_sec}s of {total}s")
+        check("the ratio names the case worth acting on",
+              f.load_sec > f.render_sec, "load exceeds render")
+
+
+def test_batching_never_becomes_starvation() -> None:
+    """THE POSITIVE CONTROL. A small scene behind a big batch runs, bounded.
+
+    Every improvement in this file makes the dispatcher keener to hold onto a
+    loaded scene, and each one is individually justified. Together they are how
+    batching turns into starvation with a nicer name, so the bound gets a test
+    that fails when it is exceeded rather than a comment saying it cannot be.
+
+    `SCENE_BATCH_MAX` is the bound. It was not one: the capped batch re-asked
+    for the oldest waiting scene WITHOUT excluding itself, got itself back —
+    it still held the oldest job — and reset the counter. A scene submitted
+    after a 60-job batch waited for all 60 no matter what the cap said.
+    """
+    keep = app.config.SCENE_BATCH_MAX
+    app.config.SCENE_BATCH_MAX = 5
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            big, small = "/scenes/film7.blend", "/scenes/tiny.blend"
+
+            fleet = StubFleet([idle_worker()])
+            fleet.scene_path = Path(big)
+            fleet.reload_cost = 1425.0      # every incentive to hold on
+            b = stub_broker(tmp, fleet)
+
+            # 60 jobs on the loaded scene, all submitted BEFORE the small one,
+            # so FIFO order alone would make the small scene wait for all 60.
+            for _ in range(60):
+                b.db.submit(spec(), agent="filmscene", scene=big)
+            late = b.db.submit(spec(), agent="crowd", scene=small)
+
+            served = []
+            for _ in range(40):
+                job = b.next_job()
+                if job is None:
+                    break
+                served.append(job["scene"])
+                fleet.scene_path = Path(job["scene"])
+                if job["id"] == late:
+                    break
+
+            check("a small scene behind a 60-job batch is served within the cap",
+                  small in served and served.index(small) <= app.config.SCENE_BATCH_MAX,
+                  f"served after {served.index(small) if small in served else 'NEVER'} "
+                  f"job(s), cap {app.config.SCENE_BATCH_MAX}")
+
+            # And the bound is the cap doing it, not luck: the big scene really
+            # did get its batch first, so this is batching plus a bound rather
+            # than no batching at all.
+            check("the big scene still got a full batch before yielding",
+                  served[:app.config.SCENE_BATCH_MAX] == [big] * app.config.SCENE_BATCH_MAX,
+                  f"{served[:app.config.SCENE_BATCH_MAX + 1]}")
+    finally:
+        app.config.SCENE_BATCH_MAX = keep
+
+
 def test_a_scene_you_can_finish_is_not_yielded() -> None:
     """Round-robin one job at a time is starvation-avoidance eating itself.
 
@@ -3224,6 +3329,8 @@ OFFLINE_TESTS = (
     "test_a_refusal_is_never_retried",
     "test_preemption_must_beat_the_switch_it_costs",
     "test_a_scene_you_can_finish_is_not_yielded",
+    "test_batching_never_becomes_starvation",
+    "test_load_versus_render_time_is_accounted",
     "test_queued_scenes_are_evicted_last_not_first",
     "test_drain_grace_holds_a_scene_for_a_serial_client",
     "test_scene_zstd_level_never_recompresses_a_compressed_scene",

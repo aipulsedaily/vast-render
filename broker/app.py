@@ -445,6 +445,7 @@ class Broker:
         """
         lease = config.JOB_LEASE_SEC
         current = str(self.fleet.scene_path) if self.fleet.scene_path else None
+        capped_yield = False
 
         if current is not None:
             waiting = self.db.oldest_waiting_age(exclude_scene=current)
@@ -456,6 +457,12 @@ class Broker:
             if finish is not None:
                 starving = False
             capped = self.scene_batch >= config.SCENE_BATCH_MAX
+            # The cap outranks the batching preference. `cheaper_to_finish` can
+            # keep a scene loaded indefinitely otherwise: a scene fed steadily
+            # by an active client is always "nearly finished", and always would
+            # have been. The cap is the thing that says how long "nearly" is
+            # allowed to last.
+            capped_yield = capped
             drained = False
             if not starving and not capped:
                 job = self.db.claim(lease, scene=current)
@@ -488,7 +495,15 @@ class Broker:
         # answer is the scene already loaded, that starts a *fresh* batch rather
         # than leaving the cap permanently exceeded, which would degrade this
         # into job-by-job dispatch and reintroduce a scene switch per job.
-        target, _ = self.db.oldest_waiting_scene()
+        # A capped batch must actually yield. Re-asking without excluding the
+        # loaded scene handed it straight back whenever it still held the
+        # oldest job, and reset the counter — so the cap was reachable forever
+        # and bounded nothing. It only falls back to the unrestricted question
+        # when nothing else wants the GPU, where yielding would idle it.
+        target, _ = self.db.oldest_waiting_scene(
+            exclude_scene=current if capped_yield else None)
+        if target is None and capped_yield:
+            target, _ = self.db.oldest_waiting_scene()
         job = self.db.claim(lease, scene=target)
         if job is None:
             return None
@@ -718,6 +733,13 @@ class Broker:
                     f"instance is not rendering this job either, so the worker "
                     f"really is gone. {self.fleet.worker_postmortem()}"
                 ) from None
+        if reply.get("ok"):
+            # The other half of the load-vs-render ratio. Taken from the
+            # worker's own number, so it is time the GPU spent on pixels — not
+            # wall clock, which would silently fold the fetch and the queue
+            # wait into "rendering" and make the ratio look healthy.
+            with contextlib.suppress(TypeError, ValueError):
+                self.fleet.render_sec += float(reply.get("render_sec") or 0.0)
         if not reply.get("ok"):
             why = reply.get("error", "worker reported failure")
             # A refusal on the merits, not a failed attempt. Retrying it buys

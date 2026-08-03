@@ -190,6 +190,13 @@ class Fleet:
         # a reassembled .blend is re-measured rather than judged by its
         # predecessor's timing.
         self.switch_cost: dict[str, float] = {}
+        # Where this instance's paid seconds actually went. The scheduler's
+        # whole job is the ratio between these two, and until it was measured
+        # by hand nobody knew it: over one instance's life more money went to
+        # LOADING scenes than to rendering them. A number nobody can see is a
+        # number nobody defends, so `rq status` prints it.
+        self.load_sec: float = 0.0
+        self.render_sec: float = 0.0
         # Which scenes have work queued against them, injected by the Broker —
         # the fleet owns no queue and must not grow one. Returns scene hashes.
         # Used to order eviction, never to forbid it: see protected_scenes.
@@ -335,6 +342,8 @@ class Fleet:
             "disk_usd": round(self.disk_spend, 4),
             "spend_usd": round(self.spend + self.disk_spend, 4),
             "scene_hash": self.scene_hash,
+            "load_sec": round(self.load_sec, 1),
+            "render_sec": round(self.render_sec, 1),
             "endpoint": f"{self.ep.host}:{self.ep.port}" if self.ep else None,
             "disk": self.disk_report(),
             "transfer": self.transfer_report(),
@@ -771,6 +780,12 @@ class Fleet:
         self.gpu_seconds = 0.0
         self.scene_hash = None
         self.scene_path = None
+        # Per-instance, like gpu_seconds: a new box has a cold scene cache and
+        # its own load-vs-render story. Carrying the old one across would hide
+        # exactly the cold start an operator is looking for.
+        self.load_sec = 0.0
+        self.render_sec = 0.0
+        self.switch_cost = {}
         self.mirrored_assets = set()
         self.last_ready = False
         self.may_hold_render = False
@@ -999,6 +1014,7 @@ class Fleet:
             # What it cost to get here is what it will cost to come back. The
             # dispatcher reads this to decide whether leaving is affordable.
             self.switch_cost[self.scene_hash] = cost
+            self.load_sec += cost
             log.info("scene switch to %s complete in %.1fs (no redeploy)",
                      scenes.label(scene), cost)
             return True
@@ -1009,6 +1025,11 @@ class Fleet:
             # broken. The disk is full; say so once.
             raise
         except Exception as exc:
+            # Counted even though it failed. The GPU was rented for every one
+            # of those seconds and rendered nothing in them; a load-vs-render
+            # ratio that quietly drops the failures flatters exactly the case
+            # an operator most needs to see.
+            self.load_sec += time.time() - began
             log.warning("scene switch to %s failed after %.1fs: %s",
                         scenes.label(scene), time.time() - began, remote.diagnose(exc))
             return False
@@ -2187,6 +2208,7 @@ class Fleet:
         # 07:46 on 2026-08-03: film7 deployed in 922 s against an estimate of
         # 1419 s.
         self.switch_cost[digest] = time.time() - began
+        self.load_sec += time.time() - began
         log.info("worker ready — instance %s serving %s (hash %s) in %.1fs",
                  self.instance_id, scenes.label(scene), digest, time.time() - began)
 
