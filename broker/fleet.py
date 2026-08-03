@@ -2029,6 +2029,7 @@ class Fleet:
     def _deploy(self, scene: Path) -> None:
         assert self.ep
         ep = self.ep
+        began = time.time()
         # Nothing on this instance is trustworthy until the deploy completes. A
         # deploy that fails halfway must not leave last_ready True, or the next
         # ensure_ready hands out an endpoint whose worker is still holding the
@@ -2179,8 +2180,15 @@ class Fleet:
         self.scene_path = scene
         self.last_ready = True
         self.status = "ready"
-        log.info("worker ready — instance %s serving %s (hash %s)",
-                 self.instance_id, scenes.label(scene), digest)
+        # Same measurement `_switch_scene` records, and it has to be recorded
+        # here too: a broker restart reaches its first scene through _deploy,
+        # so without this the dispatcher priced its FIRST scene — the one it
+        # just spent the most time on — off the size estimate alone. Measured
+        # 07:46 on 2026-08-03: film7 deployed in 922 s against an estimate of
+        # 1419 s.
+        self.switch_cost[digest] = time.time() - began
+        log.info("worker ready — instance %s serving %s (hash %s) in %.1fs",
+                 self.instance_id, scenes.label(scene), digest, time.time() - began)
 
     # --- tear down -------------------------------------------------------
 
