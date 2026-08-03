@@ -3158,6 +3158,70 @@ def test_a_slow_link_is_a_health_signal() -> None:
               not fleet2.condemned, f"condemned={fleet2.condemned}")
 
 
+def test_the_slow_link_signal_is_actually_wired_to_a_fetch() -> None:
+    """The seam: a real fetch must PRODUCE the sample the verdict is made of.
+
+    `test_a_slow_link_is_a_health_signal` proves the arithmetic on the old
+    box's recorded numbers, and it proves `check_download_health` acts on a
+    verdict handed to it. Both halves passed while nothing connected them —
+    `collect` could stop calling `note_fetch`, or pass it the wrong pair, and
+    every one of those checks would still be green with the signal permanently
+    silent. That is the exact shape of the defect this whole feature exists to
+    fix: a check that cannot fail on the condition that matters.
+
+    So this asserts the wiring. `collect` must feed the size the fetch actually
+    returned, and the wall time that fetch actually took — not a constant, not
+    the render time, not the size the worker claimed.
+
+    Verified live on 2026-08-03 against instance 46700730 as well: two
+    genuinely throttled fetches over the real SSH link (1,050,000 B at 40.6 and
+    43.9 KB/s) produced two real samples and fired the verdict — "download is
+    43.9 KB/s over 2 real fetch(es) ... an 8 MB frame would take 3.0 min to
+    fetch" — while that same box's real measured rate (2,028 KB/s median) was
+    correctly left alone.
+    """
+    from . import seq
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        good = _png(tmp / "src.png")
+        payload = good.read_bytes()
+        want_sha = seq.sha256_of(good)
+        # Long enough to be unambiguously distinguishable from zero, short
+        # enough that the suite does not notice.
+        fetch_delay = 0.25
+
+        def slow_fetch(ep, remote_path, local, attempts=4):
+            time.sleep(fetch_delay)
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_bytes(payload)
+            return len(payload)
+
+        real_fetch, real_run = remote.fetch_file, remote.run
+        remote.fetch_file, remote.run = slow_fetch, lambda *a, **k: ""
+        try:
+            fleet = StubFleet([idle_worker()])
+            b = stub_broker(tmp, fleet)
+            reply = {"path": "/workspace/out/j.png",
+                     "png": {"width": 4, "height": 3, "sha256": want_sha}}
+            b.collect(dict(reply), tmp / "out" / "j.png")
+
+            check("a fetch through collect records exactly one sample",
+                  len(fleet.fetch_samples) == 1,
+                  f"{len(fleet.fetch_samples)} sample(s)")
+            # StubFleet.note_fetch stores bytes/seconds, so the recorded rate
+            # pins BOTH arguments at once: the size the fetch returned and the
+            # time it really took. A hardcoded 0, a missing call, or the
+            # worker's claimed size all land outside this band.
+            rate = fleet.fetch_samples[0] if fleet.fetch_samples else 0
+            expected = len(payload) / fetch_delay
+            check("the sample carries the real size over the real elapsed time",
+                  expected * 0.4 <= rate <= expected * 1.1,
+                  f"{rate:.0f} B/s, expected about {expected:.0f} B/s")
+        finally:
+            remote.fetch_file, remote.run = real_fetch, real_run
+
+
 def test_priority_reaches_the_scene_choice() -> None:
     """`prio` has to decide which SCENE loads next, not just job order in one.
 
@@ -3576,6 +3640,7 @@ OFFLINE_TESTS = (
     "test_preemption_must_beat_the_switch_it_costs",
     "test_a_scene_you_can_finish_is_not_yielded",
     "test_a_slow_link_is_a_health_signal",
+    "test_the_slow_link_signal_is_actually_wired_to_a_fetch",
     "test_priority_reaches_the_scene_choice",
     "test_priority_cannot_starve_a_scene",
     "test_batching_never_becomes_starvation",
