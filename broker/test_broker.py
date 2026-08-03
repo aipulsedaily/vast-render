@@ -3704,7 +3704,141 @@ def test_scene_zstd_level_never_recompresses_a_compressed_scene() -> None:
               level == config.SCENE_ZSTD_LEVEL, f"-{level} ({why})")
 
 
+def test_a_dns_outage_never_condemns_the_hardware() -> None:
+    """A CONTROL-PLANE FAILURE MUST NOT CONDEMN HARDWARE.
+
+    2026-08-03, verbatim from state/broker.log. The whole `vast.ai` zone went
+    NXDOMAIN and this broker's own API calls died for 30 minutes:
+
+        14:44:55 Failed to resolve 'console.vast.ai' ([Errno -2] ...)
+        15:15:24 (same, last occurrence)
+
+    Machine 56717 was rented at 15:18:50 — AFTER our resolver recovered — and
+    vast reported the instance:
+
+        actual=offline, intended=running, cur_state=running, machine=56717,
+        msg=) Could not resolve host: cloud.vast.ai
+
+    That is the HOST's resolver still holding the negative cache entry, which
+    outlives the outage by the zone's SOA minimum. `classify()` mapped
+    actual=offline straight to `bad`, `bad` raised provisioning=False, and
+    provisioning=False banned the machine for 24 h. Nothing was wrong with it.
+
+    The hazard is not one lost box: a fleet-wide DNS event walks this path once
+    per rental and would blacklist every host it touched, leaving the broker
+    with no market to rent from and a `bad_hosts.json` full of good hardware.
+    """
+    # Same route fleet.py uses: vastctl lives beside the package, not in it.
+    from .fleet import vastctl as vc                            # noqa: PLC0415
+
+    # --- 1. the classifier itself ---
+    check("a host that cannot resolve cloud.vast.ai is a control-plane fault",
+          vc.control_plane_fault(") Could not resolve host: cloud.vast.ai"), "")
+    check("so is the glibc phrasing",
+          vc.control_plane_fault("Temporary failure in name resolution"), "")
+    check("a full host disk is NOT a control-plane fault — that is real",
+          not vc.control_plane_fault("no space left on device"), "")
+    check("nor is an empty message, which proves nothing either way",
+          not vc.control_plane_fault(""), "")
+    # The registry's near-identical wording must keep its own meaning; classify()
+    # already calls that `loading` for reasons a previous incident paid for.
+    check("`failed to resolve reference` is the REGISTRY, not DNS",
+          not vc.control_plane_fault(
+              'failed to resolve reference "docker.io/nvidia/cuda:12.8.0"'), "")
+
+    # --- 2. end to end through wait_ready, on the exact 56717 payload ---
+    offline_dns = {
+        "id": 46710272, "actual_status": "offline", "intended_status": "running",
+        "cur_state": "running", "machine_id": 56717,
+        "status_msg": ") Could not resolve host: cloud.vast.ai",
+        "ports": {}, "public_ipaddr": "", "label": vc.LABEL_PREFIX + "x",
+    }
+
+    class Client:
+        def __init__(self, raw): self.raw = raw
+        def show_instance(self, _id): return self.raw
+
+    def notreachable_from(raw):
+        try:
+            vc.wait_ready(Client(raw), 46710272, timeout=0.01)
+        except vc.NotReachable as exc:
+            return exc
+        return None
+
+    dns = notreachable_from(offline_dns)
+    check("an offline+DNS instance still FAILS FAST — do not sit out 900 s",
+          dns is not None and dns.provisioning is False,
+          f"provisioning={getattr(dns, 'provisioning', '?')}")
+    check("...but the host is NOT blamed for it",
+          dns is not None and dns.host_at_fault is False,
+          f"host_at_fault={getattr(dns, 'host_at_fault', '?')}")
+    check("and the message says so, so no operator repeats the post-mortem",
+          dns is not None and "CONTROL-PLANE FAULT" in str(dns), str(dns)[:120])
+
+    # The control case, which must be untouched: offline for a reason that IS
+    # the host. Break this and the fix has disarmed the blacklist entirely.
+    real = notreachable_from({**offline_dns, "machine_id": 99999,
+                              "status_msg": "no space left on device"})
+    check("a genuinely broken host is still blamed",
+          real is not None and real.host_at_fault is True,
+          f"host_at_fault={getattr(real, 'host_at_fault', '?')}")
+    check("and an old-style NotReachable still defaults blame to !provisioning",
+          vc.NotReachable(1, "p", "d", 1.0, provisioning=False).host_at_fault
+          and not vc.NotReachable(1, "p", "d", 1.0,
+                                  provisioning=True).host_at_fault, "")
+
+    # --- 3. the consumer: what actually writes the 24 h ban ---
+    from . import fleet as fleet_mod                            # noqa: PLC0415
+
+    def rent_against(raw):
+        f = Fleet.__new__(Fleet)
+        f.client = Client(raw)
+        f.bad_offers, f.bad_machines = set(), set()
+        f.instance_id = f.started_at = None
+        f.status = "down"
+        f.destroyed = []
+        f._destroy_confirmed = lambda i, why: f.destroyed.append(i)
+        real_vc = fleet_mod.vastctl
+
+        class Stub:
+            MAX_OFFER_ATTEMPTS = real_vc.MAX_OFFER_ATTEMPTS
+            READY_TIMEOUT = real_vc.READY_TIMEOUT
+            NotReachable = real_vc.NotReachable
+            guard_credit = staticmethod(lambda c: 50.0)
+            build_query = staticmethod(lambda **kw: "")
+            search_offers = staticmethod(lambda c, **kw: [{
+                "id": 46067200, "machine_id": int(raw["machine_id"]),
+                "dph_total": 0.31, "reliability2": 0.99, "_est": 2.87,
+                "inet_up": 652, "direct_port_count": 99}])
+            create = staticmethod(lambda *a, **kw: 46710272)
+            wait_ready = staticmethod(
+                lambda c, i, **kw: real_vc.wait_ready(c, i, timeout=0.01))
+        fleet_mod.vastctl = Stub
+        try:
+            try:
+                f._rent()
+            except Exception:
+                pass                    # every offer failing is the point
+        finally:
+            fleet_mod.vastctl = real_vc
+        return f
+
+    dns_fleet = rent_against(offline_dns)
+    check("A DNS OUTAGE CONDEMNS NO HARDWARE",
+          dns_fleet.bad_machines == set(), str(dns_fleet.bad_machines))
+    check("...though the offer is still condemned, so we do not re-buy it",
+          46067200 in dns_fleet.bad_offers, str(dns_fleet.bad_offers))
+    check("...and the instance is still destroyed, so nothing keeps billing",
+          dns_fleet.destroyed == [46710272], str(dns_fleet.destroyed))
+
+    host_fleet = rent_against({**offline_dns, "machine_id": 99999,
+                               "status_msg": "no space left on device"})
+    check("a host that is actually broken is STILL blacklisted",
+          host_fleet.bad_machines == {99999}, str(host_fleet.bad_machines))
+
+
 OFFLINE_TESTS = (
+    "test_a_dns_outage_never_condemns_the_hardware",
     "test_the_pixel_cap_counts_what_is_actually_rendered",
     "test_a_refusal_is_never_retried",
     "test_preemption_must_beat_the_switch_it_costs",

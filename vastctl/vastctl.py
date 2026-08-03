@@ -143,6 +143,54 @@ TERMINAL_MSG_PATTERNS = (
     "invalid reference format",    # our image string is malformed — ours, not theirs
 )
 
+# `status_msg` contents that prove the HOST COULD NOT REACH VAST'S OWN CONTROL
+# PLANE. Matched lowercased, as substrings.
+#
+# These are the mirror image of TERMINAL_MSG_PATTERNS and they exist because of
+# a real 24 h ban on good hardware. On 2026-08-03 the whole `vast.ai` DNS zone
+# went NXDOMAIN for ~30 minutes — this broker's own API calls died with
+# `Failed to resolve 'console.vast.ai'` from 14:44:55 to 15:15:24. Machine
+# 56717 was rented at 15:18:50, once our resolver had recovered, and vast
+# reported the instance:
+#
+#     actual=offline, intended=running, cur_state=running, machine=56717,
+#     msg=) Could not resolve host: cloud.vast.ai
+#
+# The host was fine. Its resolver was still holding the negative cache entry —
+# NXDOMAIN is cached for the zone's SOA minimum, which routinely outlives the
+# outage that caused it, so hosts keep failing for minutes after the control
+# plane is well. `actual == "offline"` classified that `bad`, which raises with
+# provisioning=False, which blacklisted machine 56717 for 24 hours.
+#
+# A CONTROL-PLANE FAILURE MUST NOT CONDEMN HARDWARE. There is nothing wrong
+# with a machine that cannot resolve a name we could not resolve either, and a
+# fleet-wide DNS event would otherwise walk the blacklist through every host it
+# touched — condemning the entire fleet for one resolver's bad afternoon.
+CONTROL_PLANE_MSG_PATTERNS = (
+    "could not resolve host",             # curl, on the host side
+    "temporary failure in name resolution",
+    "name or service not known",
+    "no address associated with hostname",
+    "could not resolve",                  # wget/apt phrasing
+    "servfail",
+    "nxdomain",
+)
+
+
+def control_plane_fault(msg: str) -> bool:
+    """Is this status message a name-resolution failure rather than a verdict?
+
+    Deliberately NOT applied to `failed to resolve reference` — that is the
+    docker REGISTRY phrasing, it is about an image and not about DNS, and
+    `Instance.classify` already treats it as `loading` for its own well-earned
+    reasons. Matching it here would be harmless but would blur two distinct
+    lessons, and the next person to read this list deserves to see only one.
+    """
+    low = (msg or "").lower()
+    if "resolve reference" in low:
+        return False
+    return any(p in low for p in CONTROL_PLANE_MSG_PATTERNS)
+
 
 class VastError(RuntimeError):
     pass
@@ -157,13 +205,30 @@ class NotReachable(VastError):
     offline, or published no SSH endpoint at all. Only the second says anything
     about the *host*; retrying the first on a different offer is the correct
     move either way, but blacklisting a machine for being slow once is not.
+
+    Also carries `host_at_fault`, which is what the 24 h machine ban should
+    actually key off. It defaults to `not provisioning`, so every existing call
+    site keeps its exact behaviour, but the two are NOT the same question:
+
+        provisioning  — is this instance still making forward progress?
+        host_at_fault — is this machine to blame for it stopping?
+
+    Conflating them cost machine 56717 a 24 h ban during the 2026-08-03 vast.ai
+    DNS outage. It had stopped progressing (so `provisioning=False`, correctly —
+    do not sit out a 900 s timeout on it) but it was not at fault: it could not
+    resolve `cloud.vast.ai` because that zone was NXDOMAIN. Failing fast and
+    assigning blame are separate decisions and now have separate flags.
     """
 
     def __init__(self, instance_id: int, phase: str, detail: str,
-                 elapsed: float, provisioning: bool) -> None:
+                 elapsed: float, provisioning: bool,
+                 host_at_fault: Optional[bool] = None) -> None:
+        if host_at_fault is None:
+            host_at_fault = not provisioning
         super().__init__(
             f"instance {instance_id} unreachable after {elapsed:.0f}s in phase "
-            f"'{phase}' ({'still provisioning' if provisioning else 'not progressing'}): "
+            f"'{phase}' ({'still provisioning' if provisioning else 'not progressing'})"
+            f"{'' if host_at_fault else ' [CONTROL-PLANE FAULT — host not blamed]'}: "
             f"{detail or 'no status message from vast.ai'}"
         )
         self.instance_id = instance_id
@@ -171,6 +236,7 @@ class NotReachable(VastError):
         self.detail = detail
         self.elapsed = elapsed
         self.provisioning = provisioning
+        self.host_at_fault = host_at_fault
 
 
 # --- offers ---------------------------------------------------------------
@@ -571,10 +637,19 @@ def wait_ready(client: VastAI, instance_id: int, timeout: float = READY_TIMEOUT)
         if state == "running":
             break
         if state in ("bad", "gone"):
-            # The host said no. Nothing to wait for, and this one *is* about the
-            # machine — worth not renting again this session.
-            raise NotReachable(instance_id, f"classify={state}", inst.status_detail,
-                               time.time() - started, provisioning=False)
+            # The host said no. Nothing to wait for — fail fast either way.
+            #
+            # But WHY it said no decides whether the machine is condemned. An
+            # `actual=offline` whose status_msg is a name-resolution failure is
+            # the host telling us it cannot reach vast.ai, which during a zone
+            # outage is true of every host alive and is not hardware's fault.
+            # See CONTROL_PLANE_MSG_PATTERNS for the incident this comes from.
+            raise NotReachable(
+                instance_id, f"classify={state}", inst.status_detail,
+                time.time() - started, provisioning=False,
+                host_at_fault=not control_plane_fault(
+                    inst.raw.get("status_msg") or ""),
+            )
         if state == "cold" and nudges < COLD_START_NUDGES:
             # `cold` here means vast created the container and then parked it:
             # actual=created, intended=stopped, with status_msg reporting the
@@ -606,11 +681,17 @@ def wait_ready(client: VastAI, instance_id: int, timeout: float = READY_TIMEOUT)
         # vast never acted. The image loaded, so the machine did its part —
         # blacklisting it for 24 h would throw away good hardware for a
         # control-plane failure. Condemn the offer, keep the machine.
+        #
+        # And a host that spent the whole timeout unable to resolve a vast.ai
+        # name is in the same position for the same reason: it is not the
+        # hardware that is broken. Same guard as the fast-fail path above.
         provisioning = last.classify() in ("loading", "cold")
         raise NotReachable(
             instance_id, "waiting for running",
             f"{last.status_detail}; transitions: {' -> '.join(seen) or 'none observed'}",
             time.time() - started, provisioning=provisioning,
+            host_at_fault=(not provisioning
+                           and not control_plane_fault(last.raw.get("status_msg") or "")),
         )
 
     assert inst is not None

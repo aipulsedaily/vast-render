@@ -1964,6 +1964,13 @@ class Fleet:
                 inst = vastctl.wait_ready(self.client, instance_id)
             except Exception as exc:
                 provisioning = getattr(exc, "provisioning", False)
+                # Blame is its OWN question — see NotReachable. Defaults to
+                # `not provisioning`, so nothing here changes except the case
+                # this exists for: a host that stopped progressing because it
+                # could not resolve a vast.ai name. That is a control-plane
+                # failure, it is true of every host during a zone outage, and
+                # it must not cost hardware a 24 h ban.
+                host_at_fault = getattr(exc, "host_at_fault", not provisioning)
                 log.error(
                     "instance %s (offer %s, machine %s) never became reachable — "
                     "destroying it and trying the next offer. %s",
@@ -1973,10 +1980,23 @@ class Fleet:
                 # immediately re-rent it, but only blame the whole machine when
                 # the host actually reported a problem.
                 self.bad_offers.add(offer_id)
-                if not provisioning and machine_id:
+                if host_at_fault and machine_id:
                     self.bad_machines.add(machine_id)
                     log.warning("machine %s blacklisted for this session (host-level "
                                 "failure, not slow provisioning)", machine_id)
+                elif not provisioning and machine_id:
+                    # Stopped dead, but demonstrably not its own fault. Say so
+                    # loudly: this is the line whose absence let a DNS outage
+                    # look identical to broken hardware for 40 minutes.
+                    log.warning(
+                        "machine %s NOT blacklisted despite failing to come up: "
+                        "vast.ai's own status message is a name-resolution "
+                        "failure, so this host could not reach the control "
+                        "plane — which during a vast.ai DNS event is true of "
+                        "every host and says nothing about this one. Condemning "
+                        "the offer only. Detail: %s",
+                        machine_id, getattr(exc, "detail", "") or "?",
+                    )
                 failures.append(f"offer {offer_id}: {remote.diagnose(exc)}")
                 self._destroy_confirmed(instance_id, "never became reachable")
                 self.instance_id = None
