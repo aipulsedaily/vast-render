@@ -783,6 +783,16 @@ def cmd_status(a: argparse.Namespace) -> int:
     # every eviction, and the dispatcher was paying that per JOB. Nobody knew
     # until it was measured by hand, because nothing displayed it. This is the
     # one number that says whether the scheduler is behaving.
+    # Download throughput, the signal that did not exist. An instance measured
+    # at 14 KB/s down on 2026-08-03 rendered perfectly and could not return the
+    # frames — and passed every health check, because they all count failures
+    # and a slow link never fails.
+    kbps, n = fleet.get("fetch_kbps"), fleet.get("fetch_samples") or 0
+    if kbps is not None:
+        warn = "   <- TOO SLOW to return frames" if kbps < 200 else ""
+        print(f"fetch    {kbps:.0f} KB/s down (median of {n} real fetch(es)){warn}")
+    elif n:
+        print(f"fetch    {n} sample(s), not enough to judge yet")
     load, render = fleet.get("load_sec") or 0.0, fleet.get("render_sec") or 0.0
     if load or render:
         total = load + render

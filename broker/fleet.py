@@ -197,6 +197,10 @@ class Fleet:
         # number nobody defends, so `rq status` prints it.
         self.load_sec: float = 0.0
         self.render_sec: float = 0.0
+        # Observed download rates (bytes/sec) from REAL fetches. See
+        # `note_fetch` — this is the signal that did not exist when an instance
+        # delivering 14 KB/s passed every health check the broker had.
+        self.fetch_samples: list[float] = []
         # Which scenes have work queued against them, injected by the Broker —
         # the fleet owns no queue and must not grow one. Returns scene hashes.
         # Used to order eviction, never to forbid it: see protected_scenes.
@@ -344,6 +348,9 @@ class Fleet:
             "scene_hash": self.scene_hash,
             "load_sec": round(self.load_sec, 1),
             "render_sec": round(self.render_sec, 1),
+            "fetch_kbps": (round(self.fetch_bps / 1000.0, 1)
+                           if self.fetch_bps is not None else None),
+            "fetch_samples": len(self.fetch_samples),
             "endpoint": f"{self.ep.host}:{self.ep.port}" if self.ep else None,
             "disk": self.disk_report(),
             "transfer": self.transfer_report(),
@@ -478,6 +485,74 @@ class Fleet:
         with contextlib.suppress(Exception):
             return set(self.scene_demand())
         return set()
+
+    # --- download throughput --------------------------------------------
+
+    def note_fetch(self, nbytes: int, seconds: float) -> None:
+        """Record one real fetch's throughput.
+
+        Fed from the fetches the broker already performs, so the measurement is
+        free and is of the traffic that actually matters — returning frames —
+        rather than of a synthetic probe that would cost bandwidth and get
+        switched off.
+
+        Small transfers are ignored: at 265 ms RTT a 100 KB file is nearly all
+        handshake and reports a rate that measures latency, not bandwidth.
+        """
+        if nbytes < config.FETCH_SAMPLE_MIN_BYTES or seconds <= 0:
+            return
+        self.fetch_samples.append(nbytes / seconds)
+        del self.fetch_samples[:-int(config.FETCH_SAMPLE_WINDOW)]
+
+    @property
+    def fetch_bps(self) -> Optional[float]:
+        """Median observed download rate, or None until it is worth believing.
+
+        Median rather than mean: one frame fetched while a scene push shares
+        the link is not evidence about the link.
+        """
+        if len(self.fetch_samples) < int(config.FETCH_MIN_SAMPLES):
+            return None
+        ordered = sorted(self.fetch_samples)
+        return ordered[len(ordered) // 2]
+
+    def download_too_slow(self) -> Optional[str]:
+        """Why this instance cannot return results, or None if it can.
+
+        The gap this closes: every other transport check counts FAILURES, and a
+        link that delivers slowly never fails. It never times out, never stalls
+        a round, never spends the transport budget — so it looks healthy
+        forever while nothing arrives.
+        """
+        bps = self.fetch_bps
+        if bps is None or bps >= config.FETCH_MIN_KBPS * 1000.0:
+            return None
+        return (
+            f"download is {bps / 1000.0:.1f} KB/s over "
+            f"{len(self.fetch_samples)} real fetch(es), under the "
+            f"{config.FETCH_MIN_KBPS:.0f} KB/s floor — this instance renders "
+            f"fine and cannot return the results. An 8 MB frame would take "
+            f"{8e6 / bps / 60.0:.1f} min to fetch."
+        )
+
+    def condemn_slow_link(self, why: str) -> None:
+        """Blacklist the OFFER for a link that cannot deliver, and destroy.
+
+        The offer, deliberately **not** the machine. A transport wipeout —
+        every push dead across three rounds — proves a host's link and earns a
+        machine ban. This is one container's measured path over one rental, and
+        banning a machine for 24 h on that is heavier than the evidence
+        supports. Condemning the offer is enough to move the next rent
+        elsewhere, which is the whole objective.
+        """
+        offer_id = getattr(self, "offer_id", 0)
+        if offer_id:
+            self.bad_offers.add(offer_id)
+            log.error("offer %s blacklisted — %s", offer_id, why)
+        log.error("instance %s destroyed for an unusable DOWNLOAD path: %s. "
+                  "It passed every other health check; none of them can see "
+                  "slow, only failed.", self.instance_id, why)
+        self.teardown("download too slow")
 
     def reload_cost_sec(self, scene: Optional[Path] = None) -> float:
         """Seconds to make `scene` (default: the loaded one) live again.
@@ -786,6 +861,10 @@ class Fleet:
         self.load_sec = 0.0
         self.render_sec = 0.0
         self.switch_cost = {}
+        # A new box has its own link. Carrying the old one's samples across
+        # would either condemn a healthy replacement on its predecessor's
+        # numbers or, worse, hide a bad one behind them.
+        self.fetch_samples = []
         self.mirrored_assets = set()
         self.last_ready = False
         self.may_hold_render = False

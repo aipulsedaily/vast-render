@@ -228,6 +228,44 @@ SCENE_PRIO_BOOST_MAX_SEC = _env("SCENE_PRIO_BOOST_MAX_SEC", 1800.0)
 # The `prio` a job gets when nobody says otherwise; the zero point of the boost.
 DEFAULT_PRIO = _env("DEFAULT_PRIO", 100)
 
+# --- download throughput, the health signal that did not exist ------------
+#
+# Every transport check in this broker counts FAILURES: a reset, a timeout, a
+# round that delivered no new bytes. None of them can see *slow*. A link that
+# delivers is never a failure, never a stalled round, never a transport
+# budget — so an instance that cannot return results still passes every probe,
+# reports `ready`, and bills.
+#
+# Measured 2026-08-03 on instance 46695656 (192.0.2.12), three independent
+# ways — a multiplexed fetch, a dedicated no-mux fetch that ruled out our own
+# ControlMaster, and a raw `dd` in each direction:
+#
+#     RTT        265 ms      (these hosts normally run ~69 ms)
+#     upload     731 KB/s
+#     DOWNLOAD    14 KB/s    <- 52x asymmetric, the wrong way round
+#
+# A 7.5 MB PNG took over six minutes to fetch against a 16 s render. The farm
+# is download-heavy — every frame must come back — so this box was unusable
+# while looking perfectly healthy. It went unnoticed for 68% of a rental.
+#
+# So throughput is a first-class signal now, sampled from the fetches the
+# broker already performs. No synthetic probe: a health check that costs
+# bandwidth is one that gets disabled.
+FETCH_MIN_KBPS = _env("FETCH_MIN_KBPS", 200.0)
+
+# Only fetches at least this big are sampled. At 265 ms RTT a small file is
+# nearly all handshake, so tiny transfers report a "rate" that measures
+# latency, not bandwidth — the same reason a 3 MB scene push logs 0.4 MB/s on
+# a link that does 5 MB/s. Sampling them would condemn healthy hosts.
+FETCH_SAMPLE_MIN_BYTES = _env("FETCH_SAMPLE_MIN_BYTES", 1_000_000)
+
+# Consecutive qualifying samples before a verdict, and how many are kept. Two,
+# because one slow fetch is a hiccup and this ends in a destroyed instance —
+# but only two, because the whole point is catching it in the first minute
+# rather than after 68% of a rental.
+FETCH_MIN_SAMPLES = _env("FETCH_MIN_SAMPLES", 2)
+FETCH_SAMPLE_WINDOW = _env("FETCH_SAMPLE_WINDOW", 8)
+
 # What reloading a scene costs when it has never been measured — the first
 # switch away from a big scene must already be protected, or the measurement
 # only ever arrives after the mistake. Fitted to the four measurements above

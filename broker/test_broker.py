@@ -1307,6 +1307,12 @@ class StubFleet:
         # exercises the arithmetic that ends up in front of an operator.
         self.load_sec = 0.0
         self.render_sec = 0.0
+        # Download-throughput health. Real attributes with the real defaults —
+        # a healthy stub link, so every existing test keeps testing what it was
+        # written to test rather than tripping the new replace-the-box path.
+        self.fetch_samples: list[float] = []
+        self.slow_link: Optional[str] = None
+        self.condemned: list[str] = []
 
     @property
     def hibernated_for(self) -> float:
@@ -1341,6 +1347,16 @@ class StubFleet:
 
     def reload_cost_sec(self, scene: "Optional[Path]" = None) -> float:
         return self.reload_cost
+
+    def note_fetch(self, nbytes: int, seconds: float) -> None:
+        self.fetch_samples.append(nbytes / seconds if seconds > 0 else 0.0)
+
+    def download_too_slow(self) -> "Optional[str]":
+        return self.slow_link
+
+    def condemn_slow_link(self, why: str) -> None:
+        self.condemned.append(why)
+        self.torn_down = True
 
     def hibernate(self, force: bool = False) -> None:
         self.hibernated = True
@@ -3057,6 +3073,91 @@ def test_load_versus_render_time_is_accounted() -> None:
               f.load_sec > f.render_sec, "load exceeds render")
 
 
+def test_a_slow_link_is_a_health_signal() -> None:
+    """A check that counts failures cannot see slow. This one can.
+
+    2026-08-03, instance 46695656 (192.0.2.12): 265 ms RTT, 731 KB/s up,
+    **14 KB/s down** — verified three ways, including a no-mux fetch that ruled
+    out our own ControlMaster. It rendered a frame in 16 s and needed six
+    minutes to hand it back. Every transport check passed, because every one of
+    them counts resets, timeouts and rounds that moved no bytes, and a link that
+    delivers slowly produces none of those. It billed for 68% of a rental.
+
+    The threshold condemns the OFFER, never the machine: one container's
+    measured path over one rental does not justify a 24 h ban on a host.
+    """
+    f = Fleet.__new__(Fleet)
+    f.fetch_samples = []
+
+    # The real numbers. A 7.5 MB PNG at the measured rate.
+    f.note_fetch(7_524_253, 6 * 60 + 8)
+    check("one sample is not yet a verdict — a hiccup must not destroy a box",
+          f.download_too_slow() is None, f"{len(f.fetch_samples)} sample(s)")
+
+    f.note_fetch(7_524_253, 5 * 60 + 40)
+    why = f.download_too_slow()
+    check("two slow fetches condemn the link, naming the cost",
+          why is not None and "KB/s" in why and "min to fetch" in why,
+          (why or "")[:88])
+
+    # A healthy box: 7.5 MB in about two seconds, the normal case on this farm.
+    g = Fleet.__new__(Fleet)
+    g.fetch_samples = []
+    for _ in range(4):
+        g.note_fetch(7_524_253, 2.0)
+    check("a healthy link is never condemned",
+          g.download_too_slow() is None,
+          f"{(g.fetch_bps or 0) / 1000:.0f} KB/s")
+
+    # Small transfers are latency, not bandwidth. At 265 ms RTT a 100 KB file
+    # reports a terrible "rate" on a link that is fine — sampling them would
+    # condemn healthy hosts, which is worse than the bug being fixed.
+    h = Fleet.__new__(Fleet)
+    h.fetch_samples = []
+    for _ in range(5):
+        h.note_fetch(100_000, 3.0)          # 33 KB/s, but meaningless
+    check("transfers too small to measure bandwidth are ignored",
+          not h.fetch_samples and h.download_too_slow() is None,
+          f"{len(h.fetch_samples)} sample(s) kept")
+
+    # Median, not mean: one fetch sharing the link with a scene push is not
+    # evidence about the link.
+    m = Fleet.__new__(Fleet)
+    m.fetch_samples = []
+    for _ in range(4):
+        m.note_fetch(8_000_000, 2.0)        # 4 MB/s, healthy
+    m.note_fetch(8_000_000, 400.0)          # one outlier at 20 KB/s
+    check("a single outlier cannot condemn a healthy link",
+          m.download_too_slow() is None, f"{(m.fetch_bps or 0) / 1000:.0f} KB/s median")
+
+    # And the broker ACTS on it — between jobs, never mid-render, because the
+    # verdict ends in a destroyed instance.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        fleet = StubFleet([idle_worker()])
+        b = stub_broker(tmp, fleet)
+
+        b.check_download_health()
+        check("a healthy link is left alone by the dispatcher",
+              not fleet.condemned and not fleet.torn_down, "")
+
+        fleet.slow_link = "download is 14.0 KB/s over 2 real fetch(es)"
+        b.check_download_health()
+        check("a condemned link replaces the instance",
+              fleet.condemned == [fleet.slow_link] and fleet.torn_down,
+              f"condemned={fleet.condemned}")
+
+        # A paused broker is already winding down; it must not also be racing
+        # to rent a replacement.
+        fleet2 = StubFleet([idle_worker()])
+        fleet2.slow_link = "download is 14.0 KB/s"
+        b2 = stub_broker(tmp / "paused", fleet2) if (tmp / "paused").mkdir() is None else None
+        b2.paused = "over budget"
+        b2.check_download_health()
+        check("a paused broker does not replace hardware",
+              not fleet2.condemned, f"condemned={fleet2.condemned}")
+
+
 def test_priority_reaches_the_scene_choice() -> None:
     """`prio` has to decide which SCENE loads next, not just job order in one.
 
@@ -3474,6 +3575,7 @@ OFFLINE_TESTS = (
     "test_a_refusal_is_never_retried",
     "test_preemption_must_beat_the_switch_it_costs",
     "test_a_scene_you_can_finish_is_not_yielded",
+    "test_a_slow_link_is_a_health_signal",
     "test_priority_reaches_the_scene_choice",
     "test_priority_cannot_starve_a_scene",
     "test_batching_never_becomes_starvation",

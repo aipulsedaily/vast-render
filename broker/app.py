@@ -780,7 +780,12 @@ class Broker:
         disk and every later frame fails on write.
         """
         assert self.fleet.ep
+        fetch_began = time.time()
         size = remote.fetch_file(self.fleet.ep, reply["path"], local)
+        # Throughput, sampled from the transfer that was happening anyway. The
+        # broker had no measure of download speed at all, and a link too slow
+        # to return frames never trips a check that counts failures.
+        self.fleet.note_fetch(size, time.time() - fetch_began)
 
         want = reply.get("png") or {}
         info = seq.inspect_png(local)
@@ -986,6 +991,38 @@ class Broker:
             self._stall_warned.pop(job_id, None)
             if pinned:
                 self.fleet.unpin_scene(pinned)
+            # Asked here, between jobs, and never mid-render: the verdict ends
+            # in a destroyed instance, so it must not be reachable while the
+            # GPU is holding a frame. The pin is already released, so nothing
+            # this job needs is lost either way.
+            self.check_download_health()
+
+    def check_download_health(self) -> None:
+        """Replace an instance that renders fine and cannot return the results.
+
+        The gap this closes is the shape of every defect found on 2026-08-03: a
+        check that cannot fail on the condition that matters. Transport health
+        was measured entirely in FAILURES — resets, timeouts, rounds that moved
+        no bytes — and a link that delivers slowly produces none of them. It
+        never times out. It never stalls. It spends no transport budget. So an
+        instance measured at 14 KB/s down passed every probe, reported `ready`,
+        and billed for 68% of a rental before anyone looked.
+
+        Only the offer is condemned; see `Fleet.condemn_slow_link` for why the
+        machine is deliberately left alone.
+        """
+        if not self.fleet.instance_id or self.paused:
+            return
+        why = self.fleet.download_too_slow()
+        if not why:
+            return
+        try:
+            self.fleet.condemn_slow_link(why)
+        except Exception as exc:
+            # A replacement that cannot be carried out is not a reason to take
+            # the broker down; the next pass will ask again.
+            log.error("could not replace the slow-link instance: %s",
+                      remote.diagnose(exc))
 
     def run_sequence(self, job: dict) -> None:
         """Render a contiguous frame range, one frame at a time, resuming.
