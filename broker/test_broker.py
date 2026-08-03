@@ -2960,8 +2960,10 @@ def test_preemption_must_beat_the_switch_it_costs() -> None:
               job is not None and job["scene"] == small, str(job and job["scene"]))
 
         # A wait that genuinely exceeds the round trip still preempts: this is
-        # a cost test, not a licence to hold the GPU forever.
-        b.db.submit(spec(), agent="showlight", scene=big)
+        # a cost test, not a licence to hold the GPU forever. Many jobs queued,
+        # so finishing is NOT the cheaper option.
+        for _ in range(400):
+            b.db.submit(spec(), agent="showlight", scene=big)
         older = b.db.submit(spec(), agent="crowd", scene=small)
         b.db.conn.execute("UPDATE jobs SET created=? WHERE id=?",
                           (time.time() - 4000, older))
@@ -2970,6 +2972,74 @@ def test_preemption_must_beat_the_switch_it_costs() -> None:
         job = b.next_job()
         check("a wait longer than the round trip still preempts",
               job is not None and job["scene"] == small, str(job and job["scene"]))
+
+
+def test_a_scene_you_can_finish_is_not_yielded() -> None:
+    """Round-robin one job at a time is starvation-avoidance eating itself.
+
+    `starve_threshold` compares a WAIT against a COST. In a contended queue
+    every scene eventually waits longer than any switch costs, so every scene
+    reads as starving, the comparison stops discriminating, and the dispatcher
+    trades the worker back and forth a job at a time — the exact behaviour it
+    exists to prevent, reached from the other side.
+
+    Measured 2026-08-03 with the threshold fix already live: two 292 MB scenes,
+    7 and 6 jobs queued, both waiting ~2400 s, alternating every job. 07:51:29
+    to 07:52:23 is 54 s to switch scenes and render one 6.1 s frame.
+
+    So when the loaded scene can be finished in less time than leaving and
+    returning would cost, finish it.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        a, other = "/scenes/probe_lit.blend", "/scenes/verify_exposure.blend"
+
+        fleet = StubFleet([idle_worker()])
+        fleet.scene_path = Path(a)
+        fleet.reload_cost = 90.0          # round trip 180 s
+        b = stub_broker(tmp, fleet)
+
+        # Seed a mean render time: 6 s stills, like the measured pair.
+        for _ in range(3):
+            jid = b.db.submit(spec(), agent="showlight", scene=a)
+            b.db.claim(60.0)
+            b.db.finish(jid, str(tmp / "x.png"), 6.0, size=1000)
+
+        # 7 jobs x 6 s = 42 s to drain, against a 180 s round trip. Both
+        # competing jobs have waited far past the 300 s floor.
+        for _ in range(7):
+            b.db.submit(spec(), agent="showlight", scene=a)
+        old = b.db.submit(spec(), agent="showlight", scene=other)
+        b.db.conn.execute("UPDATE jobs SET created=? WHERE id=?",
+                          (time.time() - 2400, old))
+        b.db.conn.commit()
+
+        served = []
+        for _ in range(7):
+            job = b.next_job()
+            if job is None:
+                break
+            served.append(job["scene"])
+            fleet.scene_path = Path(job["scene"])
+        check("a scene finishable inside the round trip is drained, not traded",
+              served == [a] * 7, f"{len(served)} job(s), {set(served)}")
+
+        job = b.next_job()
+        check("and the waiting scene is served the moment it is done",
+              job is not None and job["scene"] == other, str(job and job["scene"]))
+
+        # The escape hatch stays open: work too big to finish inside the round
+        # trip must still yield, or this becomes the starvation it replaced.
+        fleet.scene_path = Path(a)
+        for _ in range(200):
+            b.db.submit(spec(), agent="showlight", scene=a)
+        older = b.db.submit(spec(), agent="crowd", scene=other)
+        b.db.conn.execute("UPDATE jobs SET created=? WHERE id=?",
+                          (time.time() - 3000, older))
+        b.db.conn.commit()
+        job = b.next_job()
+        check("a scene too big to finish inside the round trip still yields",
+              job is not None and job["scene"] == other, str(job and job["scene"]))
 
 
 def test_queued_scenes_are_evicted_last_not_first() -> None:
@@ -3153,6 +3223,7 @@ OFFLINE_TESTS = (
     "test_the_pixel_cap_counts_what_is_actually_rendered",
     "test_a_refusal_is_never_retried",
     "test_preemption_must_beat_the_switch_it_costs",
+    "test_a_scene_you_can_finish_is_not_yielded",
     "test_queued_scenes_are_evicted_last_not_first",
     "test_drain_grace_holds_a_scene_for_a_serial_client",
     "test_scene_zstd_level_never_recompresses_a_compressed_scene",

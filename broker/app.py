@@ -382,6 +382,43 @@ class Broker:
         cost = self.fleet.reload_cost_sec()
         return max(floor, float(config.SCENE_SWITCH_PAYBACK) * cost)
 
+    def cheaper_to_finish(self, current: Optional[str]) -> Optional[float]:
+        """Seconds to drain the loaded scene, if that beats leaving and coming
+        back. None when preempting is the better trade.
+
+        The other half of the rule, and the half `starve_threshold` cannot
+        express. That threshold compares a WAIT against a COST — and once every
+        scene in a contended queue has waited far longer than any switch costs,
+        every scene is "starving", the comparison stops discriminating, and the
+        dispatcher round-robins one job at a time. Exactly the behaviour it
+        exists to prevent, reached from the other direction.
+
+        Measured 2026-08-03, after the threshold fix was already live: two
+        292 MB scenes with 7 and 6 jobs queued, both waiting ~2400 s, traded the
+        worker back and forth a job at a time — 07:51:29 to 07:52:23 is 54 s to
+        switch scenes and render one 6.1 s frame. 89 % overhead, just a smaller
+        multiple of it than the 4.5 GB case.
+
+        So ask the question the wait cannot answer: **how much work is actually
+        on each side?** If the loaded scene can be finished in less time than
+        leaving it and coming back would cost, finishing it is better for
+        everyone — the waiting scene is served a few seconds later and is spared
+        paying for the return trip at all.
+
+        Bounded by the same things as before: `SCENE_BATCH_MAX` still caps a
+        batch, and the estimate is finite, so this delays a switch, never
+        cancels one.
+        """
+        if not current:
+            return None
+        queued = self.db.depth_by_scene().get(current, 0)
+        if queued <= 0:
+            return None
+        per = self.db.mean_render_sec() or config.SCENE_RELOAD_BASE_SEC
+        drain = queued * float(per)
+        round_trip = float(config.SCENE_SWITCH_PAYBACK) * self.fleet.reload_cost_sec()
+        return drain if drain <= round_trip else None
+
     def next_job(self) -> Optional[dict]:
         """Pick the next job, batching by scene without starving any scene.
 
@@ -413,6 +450,11 @@ class Broker:
             waiting = self.db.oldest_waiting_age(exclude_scene=current)
             threshold = self.starve_threshold()
             starving = waiting is not None and waiting > threshold
+            # ...unless finishing here is quicker than the round trip, in which
+            # case yielding costs the waiting scene more than it saves it.
+            finish = self.cheaper_to_finish(current) if starving else None
+            if finish is not None:
+                starving = False
             capped = self.scene_batch >= config.SCENE_BATCH_MAX
             drained = False
             if not starving and not capped:
