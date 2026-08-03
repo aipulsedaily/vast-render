@@ -569,6 +569,25 @@ one that gets switched off.
 
     fetch    14 KB/s down (median of 2 real fetch(es))   <- TOO SLOW to return frames
 
+##### RTT is not the signal. Do not condemn a box on latency.
+
+The table above lists 265 ms next to 14 KB/s, and it would be easy to read the
+latency as part of the signature. It is not, and the same day proved it:
+instance 46705078 measured **264 ms RTT — and 1.3–2.6 MB/s down**, roughly 100x
+the condemned box, over both a multiplexed and a no-mux fetch. It pushed the
+481 MB Blender bundle at 4.04 MB/s and rendered normally.
+
+Latency and bandwidth are independent here, and only one of them decides
+whether frames come back. **Measure bytes per second before replacing
+anything** — a fast round trip is not health, and a slow one is not a defect.
+
+The positive control for the signal itself is
+`test_the_slow_link_signal_is_actually_wired_to_a_fetch`, which pins the seam
+that no other check covered: a real fetch has to *produce* the sample the
+verdict is made of. It was also driven live against a throttled SSH transfer
+(1,050,000 B at ~40 KB/s → verdict fired; the same box's real 2,028 KB/s →
+silent), so the check has now failed on demand rather than never having failed.
+
 #### Where the money actually went
 
 `rq status` prints a `time` line: load seconds versus render seconds for the
