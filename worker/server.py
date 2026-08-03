@@ -715,15 +715,111 @@ def render_to(path: str) -> None:
 # sweep finishes inside a couple of seconds and never reaches the bound.
 PREWARM_BUDGET_SEC = float(os.environ.get("WORKER_PREWARM_BUDGET", "180"))
 
+# A hard ceiling on ONE warm-up render, handed to Cycles itself.
+#
+# PREWARM_BUDGET_SEC alone cannot bound the sweep, because it is only consulted
+# *between* steps: a single step that runs forever is never interrupted by it.
+# On 2026-08-03 that is exactly what happened. `film9.blend` (4.4 GB, one camera
+# named ONER) produced a two-step plan in which BOTH steps were the active
+# camera's mandatory pair, so the budget check — `i >= mandatory` — was false for
+# every step in the plan and the sweep was, for that scene, completely unbounded.
+# Step 1 was still running 25 minutes later with the GPU pinned at 100%, the
+# broker's readiness probe counting down a 3213 s budget it was going to lose,
+# and 29 queued jobs from four agents behind it, because a scene switch holds the
+# whole farm.
+#
+# It was slow rather than hung, and the reason it was slow is the second half of
+# this fix: the warm-up render is supposed to cost nothing (64x64, 1 sample), but
+# the worker log showed Cycles reporting "Rendering 25 / 64 samples" — the
+# scene's own sample count, at the scene's own resolution. Post-processing was
+# doing it. A .blend whose compositor or sequencer pulls in a Render Layers /
+# Scene input renders THAT scene at ITS settings, and `scene.cycles.samples = 1`
+# on the scene being warmed does not reach it. So the sweep was paying full
+# 4K production cost per step for a throwaway 64x64 PNG.
+#
+# Both halves are fixed below. This constant is the backstop for whatever the
+# next scene invents: Cycles' own `time_limit` stops the render from inside, so
+# a warm-up step cannot exceed it no matter what the .blend does.
+#
+# ---------------------------------------------------------------------------
+# 2026-08-03, LATER THE SAME DAY: the paragraph above is wrong about `film9`,
+# and it was wrong in the one way that let the identical stall happen again
+# with the fix already deployed. The broker sat in `starting-worker` for 26
+# minutes on the very next film9 switch, GPU pinned at 100%, 32 jobs from four
+# agents behind it, while `/workspace/progress.json` read:
+#
+#     {"state": "idle", "pct": null, "phase": "Rendering 50 / 64 samples"}
+#
+# Note `pct: null` and no `sample` key: `_SAMPLE_RE` (/Sample N \/ M/) did not
+# match, because that line is **not Cycles**. "Rendering N / M samples" is
+# EEVEE's status string, and `film9.blend` is an EEVEE scene — the only engine
+# id in the file is BLENDER_EEVEE. So on that scene:
+#
+#   * `scene.cycles.samples = 1` set a property no engine was reading. EEVEE's
+#     sample count is `scene.eevee.taa_render_samples`, which defaults to 64 —
+#     exactly the 64 in the log. `apply_spec` has always known this (see the
+#     `else:` branch that sets taa_render_samples "because EEVEE ignores
+#     cycles.samples entirely"); prewarm never learned it.
+#   * `scene.cycles.time_limit = 45` — the "backstop for whatever the next
+#     scene invents" — was likewise inert. EEVEE has no time_limit. The one
+#     bound that was supposed to hold no matter what bounded nothing at all.
+#
+# So the warm-up rendered 64 full TAA samples of a 4.7 GB, 28k-object scene for
+# a throwaway 64x64 PNG, and no guard in the function could stop it.
+#
+# The engine-specific clamp is fixed in `prewarm` below. This constant gets a
+# companion, because the deeper lesson is that *every* in-render bound is
+# engine-specific and therefore defeatable by the next engine: a warm-up render
+# already in progress cannot be interrupted from Python at all. The only bound
+# that cannot be defeated is the one applied *before* the render starts.
+PREWARM_STEP_LIMIT_SEC = float(os.environ.get("WORKER_PREWARM_STEP_LIMIT", "45"))
+
+# Skip the warm-up sweep entirely on a .blend this big.
+#
+# Prewarm is an optimisation: it moves a fixed per-camera cost off the first
+# job. It is only ever worth doing when it is cheap, and on this farm "cheap"
+# and "small" have been the same thing every time — the two scenes that have
+# ever stalled an instance are `verify_world.blend` (4.17 GB) and
+# `film9.blend` (4.71 GB), and nothing under 200 MB has ever come close.
+#
+# Above the threshold the trade inverts. The sweep's cost is scene
+# synchronisation — geometry upload, shader compilation, BVH or light-grid
+# build — which is proportional to scene size and which NO in-render limit
+# reaches, because it happens before the first sample. `time_limit` caps
+# sampling; `taa_render_samples` caps sampling; the sync is unbounded by
+# construction. A scene big enough for sync to dominate is therefore a scene
+# where the warm-up render cannot be bounded from inside at all, and the only
+# safe answer is not to start one.
+#
+# What is given up is small and is paid back immediately: the first real job on
+# that scene pays the sync cost instead. That job has a timeout, reports
+# progress, and produces a frame someone asked for. The warm-up produced a
+# 64x64 PNG that is deleted in the `finally`, and it held the entire farm —
+# every agent, every queued job — while it did, because a scene switch is
+# exclusive. A slow first frame is a cost; a scene switch that never completes
+# is an outage.
+PREWARM_MAX_SCENE_BYTES = float(os.environ.get("WORKER_PREWARM_MAX_SCENE_GB", "1.0")) * 1e9
+
 
 def _prewarm_plan(scene, cams: list[str]) -> list[tuple[str, bool]]:
     """(camera, use_dof) steps, cheapest ordering first.
 
     Two properties, in priority order:
 
-    **The scene's own active camera is covered first, in both DOF states.**
-    It is the one the next job is most likely to ask for, and it is the only
-    part of the sweep that runs even when the budget is already blown.
+    **The scene's own active camera is covered first, in the DOF state the
+    .blend itself is in.** It is the one the next job is most likely to ask
+    for, and step 1 is the only part of the sweep that always runs, so step 1
+    is the one that has to be worth running.
+
+    That second half used to be wrong in a way that only mattered once the
+    sweep became bounded. The order was hardcoded `(False, True)`, so on a
+    scene whose camera has DOF **on** — which every animation job inherits by
+    default, since `use_dof: null` means "use the scene's own" — the first and
+    most expensive warm-up render compiled the *no-DOF* kernel feature set,
+    which the first real job then immediately invalidated by turning DOF back
+    on. On a small scene that is a wasted second. On `film9.blend` (4.7 GB) the
+    single mandatory step is minutes long, and spending it on the feature set
+    the scene demonstrably does not use is spending it on nothing.
 
     **Everything after it is grouped by DOF, not by camera.** DOF on/off is a
     different Cycles *kernel feature set*: flipping it resets the session and
@@ -742,12 +838,19 @@ def _prewarm_plan(scene, cams: list[str]) -> list[tuple[str, bool]]:
         return [(name, d) for d in dofs]
 
     plan: list[tuple[str, bool]] = []
+    # Read from the datablock rather than from BASELINE: this runs before the
+    # sweep has touched anything, so the datablock still holds what the artist
+    # saved, and it stays correct if this is ever called outside serve().
+    first_dof = False
+    if active and bpy.data.objects[active].data.type != "ORTHO":
+        first_dof = bool(bpy.data.objects[active].data.dof.use_dof)
     if active:
-        plan += steps(active, (False, True))
+        plan += steps(active, (first_dof, not first_dof))
     rest = [c for c in ordered if c != active]
-    # Start at True to continue from where the active camera's pair ended, so
-    # the whole tail costs one feature-set flip rather than one per camera.
-    for dof in (True, False):
+    # Continue from whichever state the active camera's pair ended on, so the
+    # whole tail costs one feature-set flip rather than one per camera.
+    tail_first = first_dof if len(plan) < 2 else (not first_dof)
+    for dof in (tail_first, not tail_first):
         for name in rest:
             step = steps(name, (dof,))
             if step and step[0] not in plan:
@@ -764,62 +867,167 @@ def prewarm(out_dir: str) -> dict:
     feature set. Cameras are discovered from the scene rather than configured,
     so this stays correct no matter what the agents build.
 
-    Bounded by PREWARM_BUDGET_SEC. A skipped camera is not a broken one: it
-    pays its own first-use cost inside the first job that asks for it, which
-    is a slow frame — where an unbounded sweep is an instance that never comes
-    up at all. Whatever is skipped is named in the log, so a slow first frame
-    on camera X has an explanation sitting right above it.
+    Bounded four ways, because each of the first three was defeated in turn:
+
+      * PREWARM_MAX_SCENE_BYTES skips the sweep outright on a big .blend.
+        This is the only bound that does not depend on identifying the engine,
+        and therefore the only one that always holds — a render already in
+        progress cannot be interrupted from Python, so anything decided after
+        `render_to` is called is a hope rather than a limit;
+      * PREWARM_BUDGET_SEC caps the whole sweep, checked *between* steps;
+      * exactly one step is exempt from it, so a step that runs long cannot
+        take the rest of the plan with it (see `mandatory` below);
+      * PREWARM_STEP_LIMIT_SEC caps a single step from inside Cycles, the
+        sample count is clamped for *both* engines (`cycles.samples` and
+        `eevee.taa_render_samples` — they are separate properties and setting
+        the wrong one raises nothing), and post-processing is off while the
+        sweep runs, so no .blend can turn a 64x64 throwaway into a production
+        frame.
+
+    A skipped camera is not a broken one: it pays its own first-use cost inside
+    the first job that asks for it, which is a slow frame — where an unbounded
+    sweep is an instance that never comes up at all. Whatever is skipped is
+    named in the log, so a slow first frame on camera X has an explanation
+    sitting right above it.
     """
     scene = bpy.context.scene
+    engine = scene.render.engine
+
+    # The one bound that no engine can defeat, applied before any render
+    # starts. See PREWARM_MAX_SCENE_BYTES.
+    try:
+        blend_bytes = os.path.getsize(bpy.data.filepath) if bpy.data.filepath else 0
+    except OSError:
+        blend_bytes = 0
+    if blend_bytes > PREWARM_MAX_SCENE_BYTES:
+        log(f"prewarm: SKIPPED — {os.path.basename(bpy.data.filepath)} is "
+            f"{blend_bytes / 1e9:.2f} GB, over the {PREWARM_MAX_SCENE_BYTES / 1e9:.2f} GB "
+            f"ceiling. On a scene this big the warm-up cost is scene synchronisation, "
+            f"which no in-render limit can bound, and a sweep that overruns holds the "
+            f"whole farm because a scene switch is exclusive. The first real job pays "
+            f"the sync cost instead — it has a timeout and it delivers a frame.")
+        return {}
+
     cams = [o.name for o in bpy.data.objects if o.type == "CAMERA"]
     plan = _prewarm_plan(scene, cams)
     active = scene.camera.name if scene.camera is not None else None
     log(f"prewarm: {len(cams)} cameras {cams} — active={active}, "
-        f"{len(plan)} step(s), budget {PREWARM_BUDGET_SEC:.0f}s")
+        f"{len(plan)} step(s), engine={engine}, budget {PREWARM_BUDGET_SEC:.0f}s")
 
     saved = (scene.render.resolution_x, scene.render.resolution_y, scene.cycles.samples)
     saved_cam = scene.camera
+    # Everything below is restored in the `finally`. It is a wider set than it
+    # looks like it needs to be, and every member earns its place:
+    #
+    #   resolution_percentage — 64x64 at 25% is 16x16, at 400% is 256x256. The
+    #     sweep sets absolute pixels, so it must own the multiplier too.
+    #   use_compositing / use_sequencer — the two ways a throwaway render turns
+    #     into a production one. A compositor Render Layers node or a VSE Scene
+    #     strip renders ANOTHER scene, at that scene's resolution and sample
+    #     count, and nothing set on this scene applies to it. This is what cost
+    #     film9.blend 25+ minutes on step 1 of 2. Warm-up wants the OptiX
+    #     pipeline for the camera; it has never wanted the post pipeline.
+    #   time_limit — Cycles' own wall-clock stop, the backstop for whatever the
+    #     next .blend invents. 0.0 means "no limit", which is the value almost
+    #     every scene ships with, so it must be restored rather than assumed.
+    saved_pct = scene.render.resolution_percentage
+    saved_comp = scene.render.use_compositing
+    saved_seq = scene.render.use_sequencer
+    saved_limit = float(getattr(scene.cycles, "time_limit", 0.0))
+    # EEVEE's sample count is a different property on a different struct, and
+    # it is the one that actually governs an EEVEE scene. Setting only
+    # `cycles.samples` on `film9.blend` left the sweep rendering the scene's
+    # own 64 TAA samples — see the note above PREWARM_STEP_LIMIT_SEC. Saved
+    # unconditionally: `scene.eevee` exists on every scene regardless of engine,
+    # so restoring it costs nothing and forgetting to would hand the next
+    # EEVEE job a 1-sample render.
+    saved_taa = int(getattr(scene.eevee, "taa_render_samples", 0)) if hasattr(scene, "eevee") else 0
+
     scene.render.resolution_x = scene.render.resolution_y = 64
+    scene.render.resolution_percentage = 100
     scene.cycles.samples = 1
+    scene.render.use_compositing = False
+    scene.render.use_sequencer = False
+    try:
+        scene.cycles.time_limit = PREWARM_STEP_LIMIT_SEC
+    except AttributeError:      # not Cycles, or a build without time_limit
+        pass
+    try:
+        scene.eevee.taa_render_samples = 1
+    except AttributeError:      # a build without EEVEE
+        pass
     scrap = os.path.join(out_dir, ".prewarm.png")
 
-    # The active camera's own pair is mandatory: a worker that pre-warmed
-    # nothing at all would hand the entire sync cost to the first job while
-    # still having spent the time deciding not to.
-    mandatory = sum(1 for name, _ in plan if name == active) if active else 0
+    # Exactly ONE step is mandatory — the first, which is the active camera
+    # without DOF. A worker that pre-warmed nothing at all would hand the entire
+    # sync cost to the first job while still having spent the time deciding not
+    # to, so the sweep always does something. But this used to be the active
+    # camera's whole *pair*, and on a single-camera scene the pair IS the plan:
+    # `i >= mandatory` was then false at every index and the budget bounded
+    # nothing. The scene that is most expensive to warm — one huge camera — was
+    # the one case with no bound at all. One step, always; everything after it,
+    # including the active camera's DOF variant, is subject to the budget.
+    mandatory = 1 if plan else 0
 
     timings: dict = {}
     began = time.time()
     skipped: list[str] = []
-    for i, (name, dof) in enumerate(plan):
-        spent = time.time() - began
-        if i >= mandatory and spent >= PREWARM_BUDGET_SEC:
-            skipped = [f"{n}{'+dof' if d else ''}" for n, d in plan[i:]]
-            log(f"prewarm: stopping after {i}/{len(plan)} step(s) — {spent:.0f}s spent "
-                f"of a {PREWARM_BUDGET_SEC:.0f}s budget. This scene costs "
-                f"{spent / max(i, 1):.1f}s per warm-up render, so the full sweep would "
-                f"take ~{spent / max(i, 1) * len(plan) / 60:.0f} min and the readiness "
-                f"probe would condemn a healthy instance. Not warmed: {skipped}. "
-                f"Those cameras pay their first-use cost inside their first job.")
-            break
-        cam = bpy.data.objects[name]
-        if cam.data.type != "ORTHO":
-            cam.data.dof.use_dof = dof
-        scene.camera = cam
-        t0 = time.time()
-        render_to(scrap)
-        timings[f"{name}{'+dof' if dof else ''}"] = round(time.time() - t0, 2)
-
-    scene.render.resolution_x, scene.render.resolution_y, scene.cycles.samples = saved
-    # Leaving the scene pointed at whichever camera the sweep happened to end on
-    # would silently change what `camera: null` means to the first job.
-    scene.camera = saved_cam
-    # This loop leaves every camera with use_dof=False. Harmless while every job
-    # states use_dof explicitly; a correctness bug the moment one says "use the
-    # scene's own", which animation jobs do by default. Put them back.
-    restore_baseline_dof()
-    if os.path.exists(scrap):
-        os.remove(scrap)
+    try:
+        # The engine is named here because its absence is what made the
+        # 2026-08-03 stall take an SSH session and a hex dump of the .blend to
+        # explain: the log said "samples=1" while EEVEE rendered 64, and
+        # nothing on this line said which of the two numbers the engine read.
+        log(f"prewarm: rendering at {scene.render.resolution_x}x"
+            f"{scene.render.resolution_y}@{scene.render.resolution_percentage}%, "
+            f"engine={engine}, cycles.samples={scene.cycles.samples}, "
+            f"eevee.taa_render_samples={getattr(scene.eevee, 'taa_render_samples', '-')}, "
+            f"time_limit={getattr(scene.cycles, 'time_limit', 0.0):.0f}s, "
+            f"compositing={saved_comp}->off sequencer={saved_seq}->off "
+            f"(scene {scene.name!r})")
+        for i, (name, dof) in enumerate(plan):
+            spent = time.time() - began
+            if i >= mandatory and spent >= PREWARM_BUDGET_SEC:
+                skipped = [f"{n}{'+dof' if d else ''}" for n, d in plan[i:]]
+                log(f"prewarm: stopping after {i}/{len(plan)} step(s) — {spent:.0f}s spent "
+                    f"of a {PREWARM_BUDGET_SEC:.0f}s budget. This scene costs "
+                    f"{spent / max(i, 1):.1f}s per warm-up render, so the full sweep would "
+                    f"take ~{spent / max(i, 1) * len(plan) / 60:.0f} min and the readiness "
+                    f"probe would condemn a healthy instance. Not warmed: {skipped}. "
+                    f"Those cameras pay their first-use cost inside their first job.")
+                break
+            cam = bpy.data.objects[name]
+            if cam.data.type != "ORTHO":
+                cam.data.dof.use_dof = dof
+            scene.camera = cam
+            t0 = time.time()
+            render_to(scrap)
+            timings[f"{name}{'+dof' if dof else ''}"] = round(time.time() - t0, 2)
+    finally:
+        # In a `finally` because a warm-up that raises must not leave the scene
+        # rendering every subsequent job at 64x64 and 1 sample. That failure
+        # delivers frames — wrong ones, silently, which is the worst class of
+        # bug this farm can ship.
+        scene.render.resolution_x, scene.render.resolution_y, scene.cycles.samples = saved
+        scene.render.resolution_percentage = saved_pct
+        scene.render.use_compositing = saved_comp
+        scene.render.use_sequencer = saved_seq
+        try:
+            scene.cycles.time_limit = saved_limit
+        except AttributeError:
+            pass
+        try:
+            scene.eevee.taa_render_samples = saved_taa
+        except AttributeError:
+            pass
+        # Leaving the scene pointed at whichever camera the sweep happened to end
+        # on would silently change what `camera: null` means to the first job.
+        scene.camera = saved_cam
+        # This loop leaves every camera with use_dof=False. Harmless while every
+        # job states use_dof explicitly; a correctness bug the moment one says
+        # "use the scene's own", which animation jobs do by default. Put them back.
+        restore_baseline_dof()
+        if os.path.exists(scrap):
+            os.remove(scrap)
     log(f"prewarm done in {time.time() - began:.1f}s: {timings}"
         + (f" (skipped {len(skipped)})" if skipped else ""))
     return timings

@@ -91,6 +91,11 @@ POLL_INTERVAL = 10.0          # matches vast-cli's own wait_for_instance
 # host that reports an error or goes offline, which is the case that actually
 # indicts the hardware.
 READY_TIMEOUT = 900.0
+
+# How many times wait_ready may ask vast to start an instance it created but
+# parked in `stopped`. Bounded so that a vast which ignores start_instance
+# still falls through to READY_TIMEOUT rather than spinning forever.
+COLD_START_NUDGES = 3
 SSH_PROBE_TIMEOUT = 180.0
 # How long to keep waiting for the *direct* port mapping once the instance is
 # running, before accepting the proxy relay. The relay measured 6.9 Mbps against
@@ -552,6 +557,7 @@ def wait_ready(client: VastAI, instance_id: int, timeout: float = READY_TIMEOUT)
     deadline = started + timeout
     inst: Optional[Instance] = None
     seen: list[str] = []
+    nudges = 0
 
     while time.time() < deadline:
         raw = client.show_instance(instance_id)
@@ -569,13 +575,38 @@ def wait_ready(client: VastAI, instance_id: int, timeout: float = READY_TIMEOUT)
             # machine — worth not renting again this session.
             raise NotReachable(instance_id, f"classify={state}", inst.status_detail,
                                time.time() - started, provisioning=False)
+        if state == "cold" and nudges < COLD_START_NUDGES:
+            # `cold` here means vast created the container and then parked it:
+            # actual=created, intended=stopped, with status_msg reporting the
+            # image loaded *successfully*. Nothing is pulling, nothing is
+            # broken, and nothing will ever move it — `cancel_unavail=True` on
+            # create is supposed to prevent this, but instance 46695656 on
+            # 2026-08-03 sat exactly there while the queue starved.
+            #
+            # The old loop had no arm for `cold`: not running, not bad, not
+            # gone, so it slept out all 900 s and then raised with
+            # provisioning=False, which condemns a *healthy* host and re-rents.
+            # The instance only ever needed starting, so ask — bounded, because
+            # a vast that ignores start_instance is a real failure mode (see
+            # the resume path in fleet.py) and must still reach the timeout.
+            nudges += 1
+            try:
+                client.start_instance(instance_id)
+                seen.append(f"start_instance#{nudges} @{time.time() - started:.0f}s")
+            except Exception as exc:  # noqa: BLE001 - report, never mask the wait
+                seen.append(f"start_instance#{nudges} failed: {exc}")
         time.sleep(POLL_INTERVAL)
     else:
         last = Instance(client.show_instance(instance_id) or {})
         # "loading" at the deadline means the image pull or onstart is still
         # grinding: slow, not dead. The caller destroys either way (an instance
         # we cannot reach still bills) but only the dead case indicts the host.
-        provisioning = last.classify() == "loading"
+        #
+        # "cold" belongs with it: we asked to start COLD_START_NUDGES times and
+        # vast never acted. The image loaded, so the machine did its part —
+        # blacklisting it for 24 h would throw away good hardware for a
+        # control-plane failure. Condemn the offer, keep the machine.
+        provisioning = last.classify() in ("loading", "cold")
         raise NotReachable(
             instance_id, "waiting for running",
             f"{last.status_detail}; transitions: {' -> '.join(seen) or 'none observed'}",
