@@ -77,8 +77,33 @@ supervise() {
     fi
     echo $$ >&9
 
-    # Pass the signal on rather than dying out from under the broker.
-    trap 'say WARNING "supervisor asked to stop — leaving broker ${CHILD_PID:-none} alone"; exit 0' TERM INT
+    # Stop supervising — and kill the broker on the way out, saying so.
+    #
+    # This used to log "leaving broker N alone", which is not what happens and
+    # never could be. The broker runs with PR_SET_PDEATHSIG=SIGKILL (set because
+    # supervise() exports VASTRENDER_SUPERVISED=1 — see
+    # broker/diagnostics.py:parent_death_signal), so the kernel SIGKILLs it the
+    # instant this process exits. It is not left alone; it is already dead, and
+    # being SIGKILLed it cannot log a word about it. The result was a log that
+    # reads, to whoever investigates next, as "the supervisor politely stepped
+    # aside and then the broker vanished for no reason" — in the one script
+    # whose stated job is to report HOW the broker died. On 2026-08-03 that cost
+    # an incident escalation: a deliberate `brokerd.sh stop` at 08:05:16 was
+    # reported up the chain as an unexplained crash in the 4.5 GB upload path.
+    #
+    # So do it here, explicitly, and name it. Same signal, same outcome, same
+    # rented instance left up for the next broker to adopt — the only thing that
+    # changes is that the death is now on the record.
+    on_stop() {
+        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+            say WARNING "supervisor asked to stop — SIGKILLing broker $CHILD_PID (PR_SET_PDEATHSIG would do this the moment this process exits, so it cannot be left running). -9 not -15: no shutdown path runs, so the rented instance stays up for the next broker to adopt."
+            kill -9 "$CHILD_PID" 2>/dev/null
+        else
+            say WARNING "supervisor asked to stop — no broker was running"
+        fi
+        exit 0
+    }
+    trap on_stop TERM INT
 
     say INFO "supervisor up (pid $$, scene ${scene:-default})"
 
@@ -187,6 +212,13 @@ status)
     ;;
 
 stop)
+    # Note the broker BEFORE signalling the supervisor. Afterwards there is
+    # nothing left to see: the supervisor's TERM handler kills it (and failing
+    # that PR_SET_PDEATHSIG does), so `our_broker` comes back empty and a stop
+    # that killed a live broker used to be indistinguishable, on stdout, from a
+    # stop that found nothing running. Whoever runs this is entitled to know a
+    # render was just cut short.
+    was="$(our_broker)"
     # Stop supervising FIRST, or the supervisor faithfully restarts the broker
     # we are about to kill.
     p="$(sup_pid)"
@@ -197,8 +229,9 @@ stop)
         # with KEEP_ON_EXIT off that destroys the instance; -9 leaves the GPU
         # and the warm worker for the next broker to adopt.
         kill -9 $b 2>/dev/null
-        echo "broker killed ($b) — instance left running for the next broker"
     fi
+    [ -n "$was$b" ] && echo "broker killed (${b:-$was}) — any render in flight is\
+ cut; queued jobs survive in SQLite; instance left running for the next broker"
     echo "brokerd stopped${p:+ (was pid $p)}"
     ;;
 

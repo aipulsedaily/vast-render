@@ -29,43 +29,85 @@ from typing import Any, Optional
 BASE = os.environ.get("VASTRENDER_URL", "http://127.0.0.1:8760")
 AGENT = os.environ.get("VASTRENDER_AGENT", os.environ.get("USER", "anon"))
 
+# How long to keep re-offering a request that was REFUSED — see call(). 0
+# restores the old fail-immediately behaviour; the bound exists so a genuinely
+# dead broker is still an error rather than a hang.
+CONNECT_RETRY_S = float(os.environ.get("VASTRENDER_CONNECT_RETRY_S", "60"))
+
 
 def call(method: str, path: str, payload: Optional[dict] = None, timeout: float = 400) -> Any:
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(
-        BASE + path, data=data, method=method,
-        headers={"Content-Type": "application/json"} if data else {},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read() or b"{}")
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode()[:400]
+    deadline = time.monotonic() + CONNECT_RETRY_S
+    waited = False
+    while True:
+        # Rebuilt per attempt: OpenerDirector mutates a Request as it opens it.
+        req = urllib.request.Request(
+            BASE + path, data=data, method=method,
+            headers={"Content-Type": "application/json"} if data else {},
+        )
         try:
-            return {"error": json.loads(body), "status": exc.code}
-        except json.JSONDecodeError:
-            return {"error": body, "status": exc.code}
-    except urllib.error.URLError as exc:
-        print(f"cannot reach broker at {BASE}: {exc.reason}", file=sys.stderr)
-        # Connection refused is most often a RESTART WINDOW, not a dead farm:
-        # `brokerd.sh stop` SIGKILLs the broker and the next `start` is seconds
-        # behind it, so port 8760 is closed for that gap. Queued jobs live in
-        # SQLite and every 'running' row is reclaimed, so the cure is usually
-        # to wait and re-ask. Say that BEFORE offering to start one.
-        print("  the broker may just be restarting — queued jobs survive in "
-              "SQLite; wait a few seconds and retry", file=sys.stderr)
-        print("  check:  scripts/brokerd.sh status", file=sys.stderr)
-        # NEVER suggest a bare `python -m broker.app` here. That is the exact
-        # anti-pattern documented in README/brokerd.sh: run from an agent's
-        # background task it becomes that task's process, and whatever reaps
-        # the task reaps the broker — mid-render, no traceback, no teardown,
-        # and a rented GPU with nobody managing it. Two multi-hour batches
-        # were lost that way. brokerd.sh setsids it out of reach and is also
-        # the only thing that can report HOW the broker died.
-        print("  start:  scripts/brokerd.sh start <scene.blend>   "
-              "(detaches + supervises; do not run broker.app directly)",
-              file=sys.stderr)
-        sys.exit(2)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if waited:
+                    print("  broker is back — request went through",
+                          file=sys.stderr)
+                return json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode()[:400]
+            try:
+                return {"error": json.loads(body), "status": exc.code}
+            except json.JSONDecodeError:
+                return {"error": body, "status": exc.code}
+        except urllib.error.URLError as exc:
+            # Kept in a plain local: Python unbinds the `as` name at the end of
+            # the except block, so the failure message below cannot use `exc`.
+            reason = exc.reason
+            # A RESTART WINDOW is not a dead farm, and "refused" is the one
+            # network failure it is provably safe to re-offer.
+            #
+            # `brokerd.sh stop` kills the broker and the next `start` is seconds
+            # behind it, so port 8760 is closed for that gap — measured at 8 s
+            # on 2026-08-03 (stop 08:05:16, new broker listening 08:05:24). A
+            # background submit loop crossing that gap lost *every* job it tried
+            # to queue, one per iteration, to the sys.exit(2) below. The jobs
+            # were never submitted at all; the advice printed here scrolled past
+            # in a log nobody was reading.
+            #
+            # Safe because ECONNREFUSED comes from connect(2) with nothing
+            # listening: the request bytes never reached a broker, so no job can
+            # have been half-created and a retry cannot double-queue a frame.
+            # That is why this is keyed on the errno rather than on URLError at
+            # large — a *timeout* may well have delivered a POST /render whose
+            # reply was lost, and re-offering that would render it twice. Those
+            # still fail immediately, exactly as before.
+            if isinstance(reason, ConnectionRefusedError) and \
+                    time.monotonic() < deadline:
+                if not waited:
+                    print(f"broker at {BASE} is not listening — it is probably "
+                          f"restarting; retrying for up to {CONNECT_RETRY_S:.0f}s "
+                          f"(nothing was submitted, so this cannot double-queue)",
+                          file=sys.stderr)
+                    waited = True
+                time.sleep(2)
+                continue
+            break
+
+    print(f"cannot reach broker at {BASE}: {reason}", file=sys.stderr)
+    # Queued jobs live in SQLite and every 'running' row is reclaimed, so the
+    # cure is usually to wait and re-ask. Say that BEFORE offering to start one.
+    print("  the broker may just be restarting — queued jobs survive in "
+          "SQLite; wait a few seconds and retry", file=sys.stderr)
+    print("  check:  scripts/brokerd.sh status", file=sys.stderr)
+    # NEVER suggest a bare `python -m broker.app` here. That is the exact
+    # anti-pattern documented in README/brokerd.sh: run from an agent's
+    # background task it becomes that task's process, and whatever reaps
+    # the task reaps the broker — mid-render, no traceback, no teardown,
+    # and a rented GPU with nobody managing it. Two multi-hour batches
+    # were lost that way. brokerd.sh setsids it out of reach and is also
+    # the only thing that can report HOW the broker died.
+    print("  start:  scripts/brokerd.sh start <scene.blend>   "
+          "(detaches + supervises; do not run broker.app directly)",
+          file=sys.stderr)
+    sys.exit(2)
 
 
 def resolve_dof(a: argparse.Namespace, default_scene: bool) -> Optional[bool]:
@@ -881,7 +923,7 @@ def main() -> int:
                    help="which frame to render; omit for the scene's current frame")
     r.add_argument("--wait", action="store_true", help="block until the render finishes")
     r.add_argument("-o", "--out", help="save the PNG here when done (implies --wait)")
-    r.set_defaults(func=cmd_render)
+    r.set_defaults(func=cmd_render, out_implies_wait=True)
 
     x = sub.add_parser("exec", help="run a Blender script on the rented box's CPUs "
                                     "(builds and gates, not renders)")
@@ -965,7 +1007,8 @@ def main() -> int:
 
     g = sub.add_parser("get", help="download a finished render")
     g.add_argument("job_id")
-    g.add_argument("-o", "--out")
+    g.add_argument("-o", "--out",
+                   help="save the PNG here if it is ready; does NOT imply --wait")
     g.add_argument("--wait", action="store_true",
                    help="block until the job finishes instead of exiting 3")
     g.add_argument("--timeout", type=float, default=0,
@@ -984,7 +1027,18 @@ def main() -> int:
     sub.add_parser("resume", help="clear a pause").set_defaults(func=cmd_resume)
 
     a = p.parse_args()
-    if getattr(a, "out", None):
+    # `-o` means "put the file here". Only `rq render` also documents it as
+    # meaning "and block until it exists", so only `rq render` opts in.
+    #
+    # This used to be unconditional, and `rq get` also has a `-o`. That turned
+    # every `rq get <id> -o out.png` into a blocking poll — against a queued job,
+    # a permanent one — in direct contradiction of the flag `get` advertises
+    # right next to it ("--wait: block until the job finishes instead of exiting
+    # 3") and of its own docstring's exit codes. Measured on 2026-08-03: a
+    # collector loop hung 25 minutes on its first iteration and never downloaded
+    # anything, including for jobs that had already finished. A poll that
+    # silently becomes a block is indistinguishable from "no results yet".
+    if getattr(a, "out", None) and getattr(a, "out_implies_wait", False):
         a.wait = True
     return a.func(a)
 
