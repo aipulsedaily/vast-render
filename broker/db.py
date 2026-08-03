@@ -22,6 +22,24 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from . import config
+
+# How long a job has EFFECTIVELY been waiting: its real age plus the head start
+# its priority buys, clamped both ways. Shared by the two queries that choose
+# which scene runs next, so the switch target and the starvation signal can
+# never disagree about who is waiting longest — they used to be two hand-copied
+# `ORDER BY created ASC` clauses.
+#
+# Bound-carrying: because the boost is clamped and the age is not, a deferred
+# scene always wins eventually. See config.SCENE_PRIO_BOOST_MAX_SEC.
+_EFF_AGE = ("((? - created) + MIN(MAX((? - prio) * ?, -?), ?))")
+
+
+def _eff_args(now: float) -> tuple:
+    """The five bind values `_EFF_AGE` needs, in order."""
+    return (now, config.DEFAULT_PRIO, config.SCENE_PRIO_BOOST_SEC,
+            config.SCENE_PRIO_BOOST_MAX_SEC, config.SCENE_PRIO_BOOST_MAX_SEC)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id          TEXT PRIMARY KEY,
@@ -438,10 +456,18 @@ class DB:
     ) -> tuple[Optional[str], float]:
         """The scene of the oldest waiting job, and how long it has waited.
 
-        This is the switch target and the starvation signal in one query.
-        Choosing the *oldest* waiting job's scene is what bounds unfairness
-        between scenes: however long a batch runs, the scene that has been
-        waiting longest is served next, so nothing can be deferred forever.
+        "Oldest" is EFFECTIVE age — real wait plus the head start `prio` buys.
+        Priority used to stop dead at the scene boundary: it ordered jobs
+        inside `claim` and did nothing for which scene got loaded, which was
+        pure FIFO on `created`. A `prio 10` job on a fresh scene therefore lost
+        to a `prio 100` job on an older one for as long as that scene had work
+        — measured 2026-08-03, a 13.6 s render queued 41 minutes behind.
+
+        Choosing the largest effective age is what bounds unfairness between
+        scenes: however long a batch runs, the scene waiting longest is served
+        next, and because the priority head start is CLAMPED while age is not,
+        a deferred scene always wins eventually. See
+        config.SCENE_PRIO_BOOST_MAX_SEC for the bound that makes that true.
 
         `exclude_scene` is what makes SCENE_BATCH_MAX a real bound rather than
         a suggestion. Without it a capped batch re-ran this query, got the
@@ -455,40 +481,50 @@ class DB:
         now = time.time()
         if exclude_scene is None:
             row = self.conn.execute(
-                "SELECT scene, created FROM jobs "
+                f"SELECT scene, created, {_EFF_AGE} eff FROM jobs "
                 "WHERE kind='render' AND (state='queued' OR "
                 "(state='running' AND lease < ?)) "
-                "ORDER BY created ASC LIMIT 1",
-                (now,),
+                "ORDER BY eff DESC, created ASC LIMIT 1",
+                (*_eff_args(now), now),
             ).fetchone()
         else:
             row = self.conn.execute(
-                "SELECT scene, created FROM jobs "
+                f"SELECT scene, created, {_EFF_AGE} eff FROM jobs "
                 "WHERE kind='render' AND (state='queued' OR "
                 "(state='running' AND lease < ?)) AND scene IS NOT ? "
-                "ORDER BY created ASC LIMIT 1",
-                (now, exclude_scene),
+                "ORDER BY eff DESC, created ASC LIMIT 1",
+                (*_eff_args(now), now, exclude_scene),
             ).fetchone()
         if row is None:
             return None, 0.0
         return row["scene"], max(0.0, now - row["created"])
 
     def oldest_waiting_age(self, exclude_scene: Optional[str]) -> Optional[float]:
-        """Seconds the oldest job wanting a *different* scene has waited."""
+        """EFFECTIVE seconds the oldest job wanting a *different* scene has waited.
+
+        Effective, not raw, and the same expression `oldest_waiting_scene` uses
+        — so the decision to switch and the choice of what to switch TO always
+        agree about who has waited longest. When they disagreed, a high-priority
+        job could win the target query while never clearing the threshold that
+        triggers a switch at all, which is `prio` looking like it works and not
+        working.
+        """
         now = time.time()
         if exclude_scene is None:
             row = self.conn.execute(
-                "SELECT created FROM jobs WHERE kind='render' AND (state='queued' OR "
-                "(state='running' AND lease < ?)) AND scene IS NOT NULL "
-                "ORDER BY created ASC LIMIT 1", (now,),
+                f"SELECT {_EFF_AGE} eff FROM jobs WHERE kind='render' AND "
+                "(state='queued' OR (state='running' AND lease < ?)) "
+                "AND scene IS NOT NULL ORDER BY eff DESC LIMIT 1",
+                (*_eff_args(now), now),
             ).fetchone()
         else:
             row = self.conn.execute(
-                "SELECT created FROM jobs WHERE kind='render' AND (state='queued' OR "
-                "(state='running' AND lease < ?)) AND scene IS NOT ? "
-                "ORDER BY created ASC LIMIT 1", (now, exclude_scene),
+                f"SELECT {_EFF_AGE} eff FROM jobs WHERE kind='render' AND "
+                "(state='queued' OR (state='running' AND lease < ?)) "
+                "AND scene IS NOT ? ORDER BY eff DESC LIMIT 1",
+                (*_eff_args(now), now, exclude_scene),
             ).fetchone()
-        return None if row is None else max(0.0, now - row["created"])
+        return None if row is None else max(0.0, row["eff"])
 
     def depth_by_scene(self) -> dict[str, int]:
         """Waiting jobs per scene, for `rq status`. Key "" is the default scene."""

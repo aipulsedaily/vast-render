@@ -181,6 +181,53 @@ SCENE_STARVE_SEC = _env("SCENE_STARVE_SEC", 300.0)
 # stops a busy scene deferring the others forever, and it is untouched.
 SCENE_SWITCH_PAYBACK = _env("SCENE_SWITCH_PAYBACK", 2.0)
 
+# --- priority, and the fact that it stopped at the scene boundary ----------
+#
+# `prio` (LOWER is more urgent; 100 is the default) has always ordered jobs
+# inside `db.claim`. It did nothing at all for which SCENE gets loaded next —
+# that was `ORDER BY created ASC`, pure FIFO on submission time. So a `prio 10`
+# job on a freshly submitted scene lost to a `prio 100` job on an older one,
+# for as long as the older scene kept work. Measured 2026-08-03: a 13.6 s
+# render sat queued 41 minutes behind older scenes with priority set.
+#
+# A half-working knob is worse than no knob, because agents reasonably believe
+# it works and stop looking for the real reason their job is late.
+#
+# The fix is AGING, not ordering: priority buys a head start in seconds, and a
+# scene's own wait keeps growing regardless. So the comparison is
+#
+#     effective_age = (now - created) + clamp((100 - prio) * BOOST, ±CAP)
+#
+# and the scene holding the largest effective age is served next.
+#
+# Aging is chosen over `ORDER BY prio, created` precisely because ordering by
+# priority is unbounded: a steady trickle of urgent work would defer everything
+# else forever, which is the trap SCENE_BATCH_MAX already fell into once.
+# Under aging a deferred scene's age climbs without limit while the head start
+# is fixed, so it always wins eventually.
+#
+# BOOST is per priority POINT, and its scale was set by the case it has to
+# fix. At 10 s/point the default-to-urgent gap (100 -> 10, 90 points) is only
+# 900 s, so the reported job — 41 minutes behind older scenes — would still
+# have waited 26 minutes. That is not a working knob either.
+#
+# At 20 s/point the same gap is 1800 s, which saturates the clamp below. So
+# **`prio 10` is maximum urgency, and anything lower is identical to it**;
+# the useful gradient lives between 100 and 10 (prio 50 -> 1000 s, prio 90 ->
+# 200 s), and values above 100 deprioritise (prio 150 -> -1000 s).
+SCENE_PRIO_BOOST_SEC = _env("SCENE_PRIO_BOOST_SEC", 20.0)
+
+# THE BOUND, and the reason priority cannot become a new way to starve.
+#
+# The head start is clamped, so no matter what an agent puts in `prio` — 0,
+# -1000, a typo — **no scene is ever deferred more than this many seconds
+# beyond its FIFO turn.** That is a stated, testable bound rather than a hope,
+# and `test_priority_cannot_starve_a_scene` fails if it is exceeded.
+SCENE_PRIO_BOOST_MAX_SEC = _env("SCENE_PRIO_BOOST_MAX_SEC", 1800.0)
+
+# The `prio` a job gets when nobody says otherwise; the zero point of the boost.
+DEFAULT_PRIO = _env("DEFAULT_PRIO", 100)
+
 # What reloading a scene costs when it has never been measured — the first
 # switch away from a big scene must already be protected, or the measurement
 # only ever arrives after the mistake. Fitted to the four measurements above

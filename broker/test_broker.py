@@ -3057,6 +3057,117 @@ def test_load_versus_render_time_is_accounted() -> None:
               f.load_sec > f.render_sec, "load exceeds render")
 
 
+def test_priority_reaches_the_scene_choice() -> None:
+    """`prio` has to decide which SCENE loads next, not just job order in one.
+
+    It ordered jobs inside `claim` and stopped dead at the scene boundary,
+    where selection was `ORDER BY created ASC` — pure FIFO on submission. A
+    `prio 10` job on a fresh scene therefore lost to a `prio 100` job on an
+    older one for as long as that scene had work. Measured 2026-08-03: a 13.6 s
+    render sat queued **41 minutes** behind older scenes with priority set.
+
+    Agents had been setting `prio` and believing it worked. A half-working knob
+    is worse than none, because it stops people looking for the real reason.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        old, urgent = "/scenes/old.blend", "/scenes/urgent.blend"
+        b = stub_broker(tmp, StubFleet([idle_worker()]))
+
+        # The old scene's job was submitted 20 minutes earlier at default
+        # priority. The urgent one just landed at prio 10.
+        stale = b.db.submit(spec(), agent="filmscene", scene=old, prio=100)
+        b.db.conn.execute("UPDATE jobs SET created=? WHERE id=?",
+                          (time.time() - 1200, stale))
+        b.db.conn.commit()
+        b.db.submit(spec(), agent="crowd", scene=urgent, prio=10)
+
+        target, _ = b.db.oldest_waiting_scene()
+        check("a prio 10 job on a fresh scene beats a 20-min-old default one",
+              target == urgent, f"chose {target}")
+
+        # Same jobs, same ages, no priority: FIFO must still hold. Priority is
+        # the only thing that changed the answer above.
+        #
+        # Its own directory, because `stub_broker` always opens `busy.db` under
+        # the path it is given — reusing `tmp` would have this control reading
+        # the rows the case above just inserted, and it would then "pass" by
+        # seeing the prio 10 job. Caught by this check failing.
+        tmp2 = tmp / "fifo"
+        tmp2.mkdir()
+        b2 = stub_broker(tmp2, StubFleet([idle_worker()]))
+        s2 = b2.db.submit(spec(), agent="filmscene", scene=old, prio=100)
+        b2.db.conn.execute("UPDATE jobs SET created=? WHERE id=?",
+                           (time.time() - 1200, s2))
+        b2.db.conn.commit()
+        b2.db.submit(spec(), agent="crowd", scene=urgent, prio=100)
+        target, _ = b2.db.oldest_waiting_scene()
+        check("without priority the older scene still wins (plain FIFO)",
+              target == old, f"chose {target}")
+
+        # And the switch trigger sees the same number as the switch target. If
+        # they disagree, a high-priority job wins the target query while never
+        # clearing the threshold that causes a switch at all.
+        eff = b.db.oldest_waiting_age(exclude_scene=old)
+        check("the starvation signal counts the same head start",
+              eff is not None and eff > 800,
+              f"effective age {eff:.0f}s (raw age is ~0)")
+
+
+def test_priority_cannot_starve_a_scene() -> None:
+    """THE BOUND ON PRIORITY. A low-priority scene runs, whatever arrives.
+
+    Ordering by priority is unbounded — a steady trickle of urgent work defers
+    everything else forever. That is exactly the trap `SCENE_BATCH_MAX` fell
+    into, so priority gets the same treatment: a stated bound, and a test that
+    FAILS when it is exceeded rather than a comment claiming it cannot be.
+
+    The mechanism is aging, not ordering. Priority buys a fixed head start in
+    seconds; the deferred scene's own age grows without limit, so it always
+    wins eventually. `SCENE_PRIO_BOOST_MAX_SEC` clamps the head start, which
+    makes the bound independent of what agents actually put in `prio` — 0,
+    -1000, or a typo.
+
+    **No scene is ever deferred more than SCENE_PRIO_BOOST_MAX_SEC beyond its
+    FIFO turn.**
+    """
+    cap = app.config.SCENE_PRIO_BOOST_MAX_SEC
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        poor, rich = "/scenes/poor.blend", "/scenes/rich.blend"
+        b = stub_broker(tmp, StubFleet([idle_worker()]))
+
+        # A neglected default-priority job, and an absurd priority alongside it.
+        poor_job = b.db.submit(spec(), agent="quiet", scene=poor, prio=100)
+        b.db.submit(spec(), agent="loud", scene=rich, prio=-100_000)
+
+        # Just inside the bound: the extreme priority still wins.
+        b.db.conn.execute("UPDATE jobs SET created=? WHERE id=?",
+                          (time.time() - (cap - 120), poor_job))
+        b.db.conn.commit()
+        target, _ = b.db.oldest_waiting_scene()
+        check("inside the bound, high priority is served first",
+              target == rich, f"chose {target}")
+
+        # Past the bound: the neglected scene MUST win, however extreme the
+        # priority it is up against. This is the assertion that fails if the
+        # clamp is removed or priority is made an ordering.
+        b.db.conn.execute("UPDATE jobs SET created=? WHERE id=?",
+                          (time.time() - (cap + 300), poor_job))
+        b.db.conn.commit()
+        target, _ = b.db.oldest_waiting_scene()
+        check("past the bound, a neglected scene beats ANY priority",
+              target == poor, f"chose {target} with a -100000 prio competitor")
+
+        # And the bound holds against a continuous stream, not one competitor —
+        # a fresh urgent job every pass is the shape that starves an ordering.
+        for _ in range(25):
+            b.db.submit(spec(), agent="loud", scene=rich, prio=-100_000)
+        target, _ = b.db.oldest_waiting_scene()
+        check("a stream of urgent work still cannot hold the scene off",
+              target == poor, f"chose {target} against 26 urgent jobs")
+
+
 def test_batching_never_becomes_starvation() -> None:
     """THE POSITIVE CONTROL. A small scene behind a big batch runs, bounded.
 
@@ -3363,6 +3474,8 @@ OFFLINE_TESTS = (
     "test_a_refusal_is_never_retried",
     "test_preemption_must_beat_the_switch_it_costs",
     "test_a_scene_you_can_finish_is_not_yielded",
+    "test_priority_reaches_the_scene_choice",
+    "test_priority_cannot_starve_a_scene",
     "test_batching_never_becomes_starvation",
     "test_load_versus_render_time_is_accounted",
     "test_queued_scenes_are_evicted_last_not_first",

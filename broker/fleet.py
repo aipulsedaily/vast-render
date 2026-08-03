@@ -1986,7 +1986,26 @@ class Fleet:
                 budget / 1e9, report.after.cache_bytes / 1e9, incoming / 1e9,
                 ", ".join(d[:8] for d in sorted(keep)), report.after.free / 1e9)
 
-        remote.run(ep, f"mkdir -p {shlex.quote(remote.scene_dir(digest))}", timeout=60)
+        # `mkdir -p` succeeds on a directory that already exists and fails only
+        # when the path exists as something that is *not* one — a stray file or
+        # a dangling symlink where this scene's directory belongs. That makes an
+        # EEXIST here a corrupted entry in the broker's own cache, not a
+        # statement about the host.
+        #
+        # It was read as one anyway. On 2026-08-03 `mkdir -p
+        # /workspace/scenes/139698d62abee3bf` (relief_2light_A2.blend) failed
+        # three times in nine seconds, the deploy retry gave up, and
+        # `_deploy` classified it "host-level failure" and destroyed instance
+        # 46668588 — reachable, idle, 7 h uptime, 28 scenes and 5.46 GB of warm
+        # cache. The replacement cost a 900 s rental wait, a 481 MB Blender
+        # push, a 148 s deploy and an empty cache, and the queue starved for
+        # ~17 min, all for one bad inode that `rm -f` fixes.
+        #
+        # `test -d` first so a real cache directory is never touched: the
+        # removal only ever reaches a path that cannot be a scene directory.
+        scene_dir = shlex.quote(remote.scene_dir(digest))
+        remote.run(ep, f"test -d {scene_dir} || rm -f {scene_dir}; mkdir -p {scene_dir}",
+                   timeout=60)
         self.status = "uploading-scene"
         log.info("pushing scene %s (%.0f MB) hash=%s", scenes.label(scene), size / 1e6, digest)
         self.transfer = {"what": scenes.label(scene), "bytes": size,
