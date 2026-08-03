@@ -1,0 +1,37 @@
+# Version control added 2026-08-03, for the same reason it was added to f1-round2:
+# an agent's edit there sliced a 1,655-line reference document to 538 lines and the
+# content was not recoverable. This tree has no such incident yet, but it carries
+# the broker that EVERY render on this project depends on, it is edited by agents
+# under a standing "broker problems go to a subagent" rule, and 259 tests are the
+# only thing currently standing between a bad edit and a dead render pipeline.
+#
+# Track the source and the docs. Do not track outputs, state, or scene copies.
+
+# Rendered output -- 12 GB and entirely regenerable
+out/
+
+# Live broker state: the SQLite job database, its WAL, logs, locks, and the
+# provisioned-instance record. Machine state, not source, and it changes every
+# few seconds while the broker runs.
+state/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.lock
+
+# Scene copies pushed to the worker -- these are f1-round2 artefacts, tracked
+# (or deliberately not tracked) over there
+scenes/
+*.blend
+*.blend1
+*.png
+*.jpg
+*.exr
+
+# Bundled toolchain
+blender-*.tar.zst
+
+__pycache__/
+*.pyc
+.venv/

@@ -1,0 +1,696 @@
+# Incident notes
+
+Diagnoses worth keeping, because each one cost hours and none of them was the
+thing it first looked like. Newest first.
+
+---
+
+## 2026-07-28 — a perfect PNG with no picture in it, delivered and counted
+
+Job `0908e534b1d3` reported `done` in 33.217 s. Its output,
+`out/0908e534b1d3.png`, was:
+
+* 8,734 bytes
+* a valid PNG signature and an IEND chunk
+* 640x480 — exactly the dimensions requested
+* sha256 matching the digest the worker computed when it wrote the file
+* **mean 0.00000, standard deviation 0.00000, maximum 0.0000**
+
+An entirely black image. It passed every check the farm performed, because every
+check the farm performed verified that the FILE was intact. Nothing looked at
+the picture. The broker's own log line even carried the evidence, and there was
+no rule that could read it:
+
+    21:56:07 INFO broker  job 0908e534b1d3 done — render 33.2s, total 799.8s, 0.0 MB
+
+`0.0 MB`, in a batch where every neighbouring frame from the same instance and
+the same worker session logged 27-38 MB.
+
+### Root cause: a caller's camera, not a farm bug
+
+The job named `CAM_CAL` in `world/assembly/assembly_render.blend`. Linking that
+one datablock out of the 4.1 GB file — cheap, `bpy.data.libraries.load` reads
+only what you ask for — against its siblings:
+
+| camera | location | rotation X |
+|---|---|---|
+| `CAM_BEAT4_ROOF` | (14.0, 0.4, 3.3) | 88.6° |
+| `CAM_PIT_EDGE` | (-48.0, -103.8, 14.9) | 86.0° |
+| `CAM_T1_RUNOFF` | (590.5, 296.0, 10.8) | 84.8° |
+| `CAM_T10_HELI` | (-638.0, 422.5, 65.3) | 74.2° |
+| `CAM_HAIRPIN_KERB` | (253.6, 928.6, -2.6) | 88.2° |
+| **`CAM_CAL`** | **(2600.0, 2597.0, 4.3)** | **36.9°** |
+
+Every working camera sits within ~950 m of the origin looking near-horizontally
+at the track. `CAM_CAL` sits 3.7 km diagonally away from all of it, 4.3 m up,
+pitched 36.9° — which is **53° below the horizon**, pointing down into ground
+that does not exist out there. The file does have a world (`SKY_World`, a Sky
+Texture) and it does have lights: the four jobs that followed on the same
+instance, in the same worker process, from the same .blend, returned 27-38 MB
+frames measuring mean 0.30-0.68. One camera was aimed at nothing.
+
+So: a throwaway calibration camera in a caller's scene, not a defect in the
+broker or the worker. **The farm was still wrong**, because it reported success.
+
+A second frame turned up in the same sweep: `f36725c40f08`, a 3840x2160 render
+through `MACRO_SP` that came back at sd 0.00794, mean 0.774, **14 distinct
+luminance levels across 8.3 million pixels** — a flat light grey — in 15.3 s,
+where comparable 4K frames took 120-190 s. Not proven wrong, but nobody had ever
+been shown the number.
+
+### Fix
+
+`broker/imgstat.py` measures every returned frame and classifies it: `BLACK`,
+`TRANSPARENT`, `UNIFORM`, `SUSPICIOUS`, `OK`, `UNREADABLE`. The measurement
+happens inside `Broker.collect`, beside the sha256, structure and dimension
+checks rather than in a pass of its own, and the verdict is recorded on the job
+and frame rows so it stays queryable afterwards.
+
+Three decisions are load-bearing:
+
+* **A classification, not a threshold.** A near-black frame can be correct — a
+  fade, a night interior. `BLACK`, `TRANSPARENT` and `UNIFORM` fail a job;
+  `SUSPICIOUS` is reported loudly and never fails one. A check that refuses
+  legitimate work gets switched off, and then it protects nothing.
+* **`rq seq verify` will not count a blank frame as delivered.** That is the
+  resume-poisoning case: a `done` row makes every future pass skip the frame
+  forever, so the hole survives every retry and appears at assembly. In a shot
+  that is one continuous take there is nothing to cut around it.
+* **Blank fails terminally.** `MAX_ATTEMPTS` is 3, and a camera pointed at empty
+  space renders black three times for three times the money.
+
+Thresholds come from the 240 frames this farm had already returned. Sorted by
+standard deviation: 0.00000 (the defect), 0.00794 (the flat grey above), then
+0.03494 for the flattest legitimate frame and 237 more up to 0.34069. There is
+an empty gap between 0.008 and 0.035 and the thresholds sit in it —
+`BLANK_SD_MAX = 0.005`, one and a third 8-bit quantisation steps, and
+`SUSPECT_SD_MAX = 0.02`. A deliberately blank Cycles render measured
+mean 0.0003 / sd 0.0011, not exactly zero, so an `== 0` test would have missed
+it; 0.005 catches it with 4x margin.
+
+For sequences there is a second, relative check. A fixed threshold cannot see
+that frame 1,600 is nothing like frames 1,590-1,610, and a fade legitimately
+walks a whole neighbourhood to black together. `imgstat.outliers` compares each
+frame with a rolling window of 25 neighbours using median and MAD, and requires
+both a robust z past 8 **and** an absolute deviation worth re-rendering for —
+without that second condition, a locked-off shot has MAD ~0 and every frame in
+it is infinitely many MADs from the median.
+
+### The lesson worth keeping
+
+Round 1 of this project already learned it, in `f1-site/tools/drive.mjs`:
+
+> A frame whose pixels are effectively uniform is reported BLANK. A black canvas
+> from a dead GL context is the single most common headless-3D failure and it
+> passes every "file exists" check ever written.
+
+The render farm inherited the transport rigour — sha256 end to end, truncation
+detection, spec hashes, refusing to delete the remote copy until the local one
+verifies — and none of the content rigour. Every one of those checks answers
+"do the bytes I have match the bytes that were written". None of them answers
+"is there anything in the picture", and that is the question that decides
+whether a delivery is a delivery.
+
+---
+
+## 2026-07-28 — fixing the probe unmasked a misclassification, and it cost two GPUs
+
+Immediately after the `unknown`-forever wedge above was fixed, the fleet
+destroyed two **healthy** instances and blacklisted a **good** machine (96679).
+The trigger was on this machine, not on vast.ai:
+
+    bind [127.0.0.1]:8798: Address already in use
+    channel_setup_fwd_listener_tcpip: cannot listen to port: 8798
+    Could not request local forwarding.
+
+### Root cause
+
+Three faults stacked, and the third had been latent for the life of the broker.
+
+**The port conflict.** `kill -9` is the ONLY sanctioned way to restart this
+broker — SIGTERM runs the shutdown path, which destroys the instance — so a
+restarted broker *cannot by construction* clean up its own `ssh -L`. The orphan
+holds the local forward port and the next deploy's tunnel dies instantly. This
+is the documented restart procedure's guaranteed side effect, not a race.
+
+**The misclassification.** `wait_worker` reported the dead tunnel with a message
+that said, in English, *"this is a transport failure, not a worker failure"* —
+and the call sites raised it as a bare `RuntimeError`. `is_transport()` matches
+on **type**. So the text and the type said opposite things, and the type won: a
+local port conflict was read as the remote host being broken.
+
+**Why it had never bitten.** The `cat progress.json` bug made every
+never-rendered instance permanently `unknown`, and `unknown` blocked the
+destroy. The misclassification had been there all along, harmlessly, because a
+second bug was vetoing every action it could have caused. Fixing the probe
+removed the veto and the latent fault fired on the first restart.
+
+### Fix
+
+`WorkerUnreachable` carries `tunnel_died` and `local`, so the fleet classifies
+on type rather than prose. A local bind failure keeps the GPU, blacklists
+nothing, and reaps the stale forward (`remote.reap_stale_tunnels`, also run at
+broker startup — the orphan is expected after every `kill -9`). A remotely
+dropped tunnel is transport. A worker that never answers over a *healthy*
+tunnel on a *reachable* box now indicts the **scene**, not the hardware: a
+.blend that will not load will not load on new hardware either, and cycling
+hosts for it costs a rental plus a 481 MB Blender push plus a ~290 MB scene push
+per attempt.
+
+The machine blacklist was also pulled back to auth rejections only. "Host-level
+deploy failure" is also what a Blender-crashing .blend looks like from here, and
+blacklisting on it would walk the broker through every machine on vast.ai
+condemning good hardware for a fault that travels with the scene.
+
+`Fleet.contacted` became `Fleet.may_hold_render`, because those are not the same
+question. It had been set by any successful ssh command — but running `true` on
+a box cannot start a render, and instance 46124078 proved the gap: ssh worked
+long enough to provision, the Blender push then failed at 3.5% on all four
+retries, and the flag insisted a box that had never had Blender on it might be
+mid-frame. It is now set only where `start_worker` is called, plus
+unconditionally on adoption.
+
+### The lesson worth keeping
+
+**Fixing a bug can arm one that was already there.** The dangerous change is not
+the one that adds a behaviour; it is the one that removes a veto. The probe fix
+was correct in isolation and correct in the end, but it converted a dormant
+misclassification into destroyed hardware in under a minute — so after
+unblocking anything that had been suppressing action, look for what that
+suppression was protecting you from.
+
+And: **a message is not a classification.** The string said "transport failure"
+for as long as the code has existed; nothing read it. Facts that the code must
+branch on belong in the type, not the prose.
+
+---
+
+## 2026-07-28 — a host that never wrote our ssh key wedged the broker permanently
+
+Every job failed for sixteen minutes against rented instance 46118513 while a
+5090 billed at $0.356/hr. The broker's own message named the wrong cause:
+
+    SshNeverReady: sshd on 192.0.2.11:29502 never accepted a command within
+    240s of trying. The port answers TCP ... but the container behind it is not
+    serving.
+
+sshd was serving the whole time.
+
+### Root cause
+
+Two independent faults, one on vast.ai's side and one ours.
+
+**The host's fault.** `ssh -vvv` — the step that settles this in thirty seconds
+and was worth doing before reading any code — showed a completed handshake, a
+vast.ai banner, our key offered, and a refusal:
+
+    debug1: Offering public key: /root/.ssh/id_vast_render ED25519 SHA256:5IW5/...
+    debug1: Authentications that can continue: publickey
+    root@192.0.2.11: Permission denied (publickey).
+
+Not a young container, not a port-mapping error, not our ssh options. Proved by:
+the account has exactly one key and it is the right one (`GET /api/v0/ssh/`);
+vast's control plane reported that key attached to that instance
+(`GET /api/v0/instances/46118513/ssh/`); `attach_ssh` answered *"SSH key already
+associated with instance"*; the **proxy relay refused it identically**, which
+rules out the direct port mapping; and `detach_ssh` + `attach_ssh` did not repair
+it in the following five minutes. Meanwhile the container's own onstart watchdog
+ran and self-destructed the instance at the 30-minute stale-heartbeat mark — so
+the container was healthy and only `authorized_keys` was missing. Machine 42763
+simply failed to inject it.
+
+**Our fault, and the one that actually cost the evening.** `exit 255` is ssh's
+generic "I could not run your command", and the broker had exactly one bucket
+for it: `transport_failed`. So a *refused key* was classified as *flaky
+network* — the one reading that says "retry, it may heal". It cannot heal: vast
+writes the key at container start, so a key absent four minutes in was never
+written.
+
+Then the safety rule closed the trap. The destroy gate requires a reachable,
+definitely-idle answer, and `unknown` blocks it. But the activity probe is
+itself ssh, so on a host that refuses ssh the probe is *permanently* unknown.
+The broker correctly identified a host-level failure, correctly declined to
+destroy a possibly-rendering GPU — and had no way out. Three deploy rounds, the
+job failed, and the instance was kept forever.
+
+### Fix
+
+`Ran.auth_rejected` distinguishes the two exit-255s: an auth rejection means the
+handshake **completed**, which is positive evidence the box is up and final
+evidence we can never use it. It is excluded from `is_transport`, so it replaces
+the instance on the first round instead of the third, and it blacklists the
+`machine_id` — the same host re-lists under a new offer id within seconds.
+
+The gate keeps its tri-state rule with one exception, which is a strengthening
+rather than a weakening. `unknown` means "something might be rendering". On an
+instance this broker rented and has **never once run a command on**, nothing
+can be: the worker arrives over ssh and every frame is dispatched over ssh, so
+no contact means no worker, no scene, no frame. `Fleet.contacted` records that,
+`rendering` still blocks unconditionally, and adoption sets it True *without
+asking* — a previous broker may have left a frame in flight.
+
+Adoption has one carve-out, or a restart would launder a dead host back into a
+protected one. An adopted instance that **auth-rejects** is replaceable, because
+vast writes the key at container start: a container without it either never
+provisioned it or has restarted since, and a restart has already killed any
+Blender process. It cannot belong to a sibling broker either — ownership is per
+account, and this is the account's only key.
+
+### The lesson worth keeping
+
+A generic error code is not a diagnosis. `exit 255` was carrying two opposite
+facts under one name for as long as the broker has existed, and the message
+built on top of it asserted the one that was false. One `ssh -v` outranked all
+of it — run the failing command by hand before reading the code that wraps it.
+
+The structural lesson is narrower and worse: **a safety rule whose evidence
+comes through the channel that is broken has no bottom**. "Only a definitely-idle
+answer licenses a destroy" is right, but when the only way to ask is the thing
+that failed, it degrades to "never destroy" and the broker cannot escape. Such a
+rule needs a floor that does not depend on the failing channel — here, what the
+broker knows *by construction* about an instance it has never spoken to.
+
+---
+
+## 2026-07-28 — `brokerd.sh stop` was destroying the GPU it promised to keep
+
+Found while restarting the broker to load the frame-sequence code. Two log
+lines, in the same second:
+
+    04:39:18 WARNING brokerd  supervisor asked to stop — leaving broker 2656354 alone
+    04:39:18 ERROR   broker   SIGNAL: received SIGTERM (pid 2656354, ppid 1)
+
+The script had just printed *"broker killed — instance left running for the next
+broker"*.
+
+### Root cause
+
+`brokerd.sh stop` deliberately signals the supervisor **first**, so the
+supervisor does not faithfully restart the broker it is about to `kill -9`. But
+the broker runs with `PR_SET_PDEATHSIG`, and it was set to **SIGTERM**. The
+supervisor's death therefore delivered SIGTERM to the broker before the script's
+own `kill -9` could — and SIGTERM runs the broker's shutdown path, which with
+`KEEP_ON_EXIT` off **destroys the instance**.
+
+The one signal this whole project is written to avoid was being delivered by the
+mechanism meant to prevent orphans, on the documented, recommended way to
+restart a broker. It cost nothing that day only because nothing was rented.
+
+### Fix
+
+`parent_death_signal()` defaults to `SIGKILL`. That serves the mechanism's whole
+purpose — no unsupervised broker may hold the singleton lock — while leaving the
+instance alone, which is what every deliberate restart wants. The instance is
+not orphaned: the next broker adopts it in seconds, and the in-container
+watchdog destroys it 30 minutes after the heartbeat stops if none comes back.
+
+### The lesson worth keeping
+
+An automatic signal counts as a caller. "kill -9, never SIGTERM" was enforced
+everywhere a human types a command and nowhere the kernel sends one.
+
+---
+
+## 2026-07-28 — Blender 5.2 segfaults setting a rigid-body disk cache
+
+Building a test fixture with a baked rigid-body sim. Blender dies with a core
+dump — backtrace through `PyObject_SetAttr` into the point-cache RNA setter — on:
+
+```python
+bpy.ops.wm.save_as_mainfile(filepath=out)
+scene.rigidbody_world.point_cache.use_disk_cache = True    # segfault
+```
+
+Reproduced in isolation on an otherwise empty scene (one passive plane, one
+active cube), background mode, `--factory-startup`. The same assignment on a
+**cloth** or **particle** point cache is fine, so it is specific to the
+rigid-body world's cache — not to point caches generally, and not to background
+mode's ability to write disk caches at all: a cloth bake produced 48 `.bphys`
+files without complaint.
+
+Setting it *before* saving does not crash, and does not work either — the flag
+silently stays False, because `//blendcache_<name>/` has nothing to resolve
+against until the file has a path.
+
+### Why it matters here
+
+Round 2's wall breach is a rigid-body destruction sim, and a **memory** cache
+does not travel to a rented instance. A scene baked to memory renders on the
+farm by *simulating*: silently, differently, per frame.
+
+### Workaround
+
+Tick the rigid-body world's *Disk Cache* checkbox in the UI, then bake. The
+broker's handling of the resulting cache is identical either way, and it now
+refuses any frame a cache does not cover rather than rendering it. The test
+fixture (`scenes/build_anim_test.py`) uses cloth for exactly this reason.
+
+---
+
+## 2026-07-26 — the broker "crashed" nine times and never crashed once
+
+**Symptom.** The broker process vanished mid-batch, repeatedly. `broker.log`
+ended mid-sentence inside the reattach loop, no traceback, no shutdown line,
+stdout empty. Clients saw
+
+```
+http.client.RemoteDisconnected: Remote end closed connection without response
+```
+
+after 29m48s, then `Connection refused` for every job after it. Five queued
+renders lost, twice.
+
+The suspected cause was new code — a wait loop that polls the instance while a
+foreign render finishes — on the reasoning that repeated SSH timeouts in it
+"may raise somewhere unguarded".
+
+**That loop was innocent.** It is simply where the broker spends ~95% of its
+wall-clock time during an 8K frame, so it is where any clock-driven death lands.
+Duration is not causation.
+
+### What the evidence actually said
+
+| check | result |
+|---|---|
+| `dmesg` | no `oom_kill`, no `Killed process`, no segfault |
+| `coredumpctl` | five Blender SIGSEGVs from the day before, **no python core at all** |
+| the rented instance | **still running** after every death |
+| `broker.log`, whole history | nine `dispatcher started`, exactly **one** `dispatcher stopping` |
+| the launch command | `run_in_background: true` + `exec .venv/bin/python -m broker.app` |
+
+The third row is the one that decides it. `KEEP_ON_EXIT` is false, so *every*
+in-process exit path — an exception out of `main()`, `SystemExit`, uvicorn's
+SIGTERM handler, a clean shutdown — runs `broker.stop()` and destroys the
+instance. **The instance survived. Therefore no Python code ran on the way
+out.** Not an unhandled exception, not an exception on the event loop, not a
+thread dying: all of those would have exited through `stop()` and taken the GPU
+with them. And an active `systemd-coredump` that recorded Blender's segfaults
+but no python core rules out every core-dumping signal.
+
+### Root cause
+
+The broker was **started as a background task of the agent harness**, with
+`exec`:
+
+```
+run_in_background: true
+cd ~/vast-render && VASTRENDER_SCENE=... exec .venv/bin/python -m broker.app >> state/broker.log 2>&1
+```
+
+`exec` replaces the task's shell with the broker, so **the broker *is* that
+task's process**. Its lifetime belongs to whatever reaps the task, and when that
+happened it was signalled — mid-render, with no traceback (nothing ran) and no
+teardown (nothing ran). Nine brokers were started this way; not one of them
+logged a shutdown line.
+
+The single `dispatcher stopping` in the whole history is the same bug in its
+other form: that broker got SIGTERM rather than SIGKILL, ran the graceful path,
+and **destroyed a healthy instance on the way out** — the next start had to rent
+fresh hardware and re-push 481 MB. Both signals lose the batch; SIGTERM also
+loses the GPU.
+
+### Fixes
+
+* **`scripts/brokerd.sh`** — `setsid` into its own session and process group, so
+  a group-kill aimed at the shell that started it cannot reach it, and the
+  broker is a child of the supervisor rather than of anything the harness holds
+  a pid for. It restarts the broker on any abnormal exit, and refuses to restart
+  on status 3 (singleton lock held) or 0 (deliberate shutdown). It never touches
+  the vast API — it cannot adopt and cannot destroy, so it cannot repeat the
+  adopt-then-destroy bug the singleton lock exists for.
+* **The supervisor reports the wait status.** A process cannot report its own
+  SIGKILL; only its parent can, and nothing was anyone's parent. `broker
+  KILLED BY SIGNAL 9` now lands in `broker.log` — the one fact missing from both
+  incidents.
+* **`broker/diagnostics.py`** — `sys.excepthook`, `threading.excepthook`,
+  `sys.unraisablehook`, `loop.set_exception_handler`, `faulthandler`, and a
+  chaining handler that names SIGTERM/SIGINT/SIGHUP/SIGQUIT *before* uvicorn
+  acts on it, plus an `atexit` line. Every in-process death now writes one line
+  identifying itself, which makes **silence itself the diagnosis**: nothing in
+  the log means SIGKILL and nothing else. SIGHUP is now ignored, as a daemon's
+  should be. `kill -USR1 <pid>` dumps every thread's stack.
+* **Startup says who owns the process.** A detached broker is a session leader
+  (`pid == pgid == sid`); anything else logs `THIS BROKER IS NOT DETACHED`
+  naming the group that can kill it. The two lost batches were both diagnosable
+  from four integers nobody had.
+* **Shutdown no longer discards a live frame.** `stop()` asks the instance what
+  it is doing and destroys only on the same three-valued rule used everywhere
+  else — `rendering` or `unknown` keeps the GPU and says so loudly. The
+  in-container watchdog (30 min stale heartbeat, 12 h cap) remains the backstop,
+  so worst case is ~$0.15 of billing against a frame that is often 40 minutes of
+  GPU.
+* **Every loop thread is supervised.** `Broker.supervised` restarts dispatch,
+  heartbeat and progress if their body ever escapes — including `BaseException`,
+  which the `except Exception` inside each loop does not cover. A dead dispatch
+  thread used to be silent: HTTP kept answering while nothing claimed a job.
+* **`/teardown` runs in a thread**, not on the event loop. Minutes of blocking
+  SSH behind the fleet lock froze every HTTP handler, which reads to a client
+  exactly like the broker having died — the symptom this investigation started
+  from.
+
+### Also fixed, and wrong independent of any of this
+
+`wait_out_foreign_render` held `fleet.lock` for the entire wait — up to
+`REATTACH_SEC`, 5400 s — blocking `/teardown` and `hibernate` for the length of
+a render. It had already been replaced by `_refuse_if_rendering()` raising
+`WorkerBusy` so the *dispatcher* decides whose frame it is, with the waiting
+done in `await_render` outside the lock. That is now pinned by a test that
+starts a wait and asserts the lock is still acquirable:
+`test_wait_does_not_hold_the_fleet_lock`.
+
+### The lesson worth keeping
+
+The two previous entries say: check that the code producing a diagnosis can
+observe the component it names. This one is about the process itself.
+
+**Ask what the absence of evidence rules out.** An empty log looked like no
+information, and it was the whole answer: a broker that dies without destroying
+its instance did not run any Python, and everything the investigation had been
+looking for — an unguarded raise, an exception on the loop, a dying thread —
+requires Python to run. Every hypothesis on the table was excluded by a fact
+already in hand.
+
+And: **a process whose lifetime is owned by something else has no bugs worth
+fixing until that is fixed.** The broker was hardened for a month against
+failures it was never having.
+
+---
+
+## 2026-07-26 — the busy-guard worked, and the job was failed anyway
+
+**Symptom.** An 8K frame reached the queue as
+
+```
+job 54ed3b8bd22f  ->  failed: "WorkerBusy: refusing to restart the worker on 38.4..."
+```
+
+while the same instance, at the same moment, reported
+
+```
+{"state":"rendering","job_id":"54ed3b8bd22f","sample":6896,"total":8192,
+ "tile":1,"tiles":12,"elapsed_sec":756}     # one blender process, GPU 96%
+```
+
+The guard added by the previous fix did its job — it refused to SIGKILL the
+render. Then the broker marked the job `failed` for the very frame the guard had
+just protected, the queue emptied, and the render ran to completion with nobody
+waiting for it.
+
+### Root cause
+
+The same conflation as the entry below, one layer up. `WorkerBusy` had been made
+non-fatal to the **worker** and was still fatal to the **job**.
+
+Three separate holes, all the same shape — *"I could not ask" was read as "it is
+not happening"*:
+
+1. **The identity was thrown away.** `WorkerBusy` is only ever raised off a
+   *successful* read of `progress.json`, so at the moment of raising, the job id
+   of the running render is known for certain. It was formatted into the message
+   and discarded. The handler then **asked the instance a second time** — over an
+   SSH endpoint that flaps on this host — got nothing, and concluded the worker
+   was not rendering the job the exception had just named.
+
+2. **`await_render` gave up on one unreadable poll.** `read_progress` returns
+   None for a failed SSH probe *and* for "not rendering", so a single flap ended
+   the reattach with the operator-facing line *"the instance is not rendering
+   this job either, so the worker really is gone"*. It appears twice in one
+   twelve-minute window in the log, both times while the GPU was at 96% on that
+   frame.
+
+3. **There was no case for someone else's frame.** `WorkerBusy` naming a
+   *different* job fell through to the generic handler, so an agent's job could
+   be failed by the mere fact that another agent's render was on the GPU.
+
+### Fixes
+
+* **`Activity` — three states, never two.** `rendering` / `idle` / `unknown`,
+  where `unknown` means the probe did not answer. Only `idle` — reachable,
+  parsed, and definitely not rendering — licenses anything destructive. Every
+  caller that makes a decision takes an `Activity`; `rendering_now()` survives
+  only as a compatibility shim whose signature cannot express the difference.
+* **`WorkerBusy` carries `job_id` and `progress`.** Handlers use the evidence in
+  the exception instead of re-asking a channel that may have just failed.
+* **The dispatcher decides among three cases explicitly**, because
+  `progress.json` carries the job id and this is therefore decidable:
+  busy with **my** job → reattach and collect; busy with **another** job → queue
+  behind it, never kill it, never fail my job for it; **not rendering** →
+  deploy as usual.
+* **A job is never written `failed` while the instance is rendering it.** The
+  last gate before the queue records a verdict asks the box, and requeues
+  *without spending an attempt* if a render is in flight or the finished PNG is
+  already on disk.
+* **The kill guards itself, on the instance.** The pre-check and the kill were
+  two SSH round trips, and on a flapping endpoint they can disagree — three
+  failed probes report "unknown", the flap ends, and the kill lands on a live
+  render. The kill command now re-reads `progress.json` itself and exits with
+  `BUSY:<job_id>` before signalling anything, so there is no window at all.
+* **A finished frame is collected, never re-rendered.** Any retry first asks
+  whether `/workspace/out/<job_id>.png` already exists — the case this incident
+  created, where a completed 8K render sat on the instance belonging to a job
+  the queue had given up on.
+* **The idle timer refuses to stop a GPU it cannot ask about**, bounded by
+  `IDLE_UNKNOWN_MAX_SEC` (30 min, deliberately longer than the in-container
+  watchdog's heartbeat deadline, so an unreachable box self-destructs before
+  this branch ever has to guess).
+
+### The lesson worth keeping
+
+The previous entry's lesson was "check that the code producing a diagnosis can
+observe the component it names". This one is its corollary: **a guard that
+refuses to act must also tell the caller what it saw, or the caller will go and
+ask something less reliable.** The refusal and the recovery are one decision, and
+splitting them across two queries of a flapping channel is what turned a
+correct guard into a lost frame.
+
+Verification for this class of bug does not need a GPU:
+`broker/test_broker.py::test_busy_dispatch` drives all three cases plus the idle
+timer against a stub fleet, because the live path only exercises them when
+something has already gone wrong — which is exactly how the previous fix shipped
+unverified and failed the first 8K frame it met.
+
+---
+
+## 2026-07-26 — 8K renders "died" with `worker closed connection without replying`
+
+**Symptom.** `7680x4320 @ 8192 samples` failed after ~4m36s with
+
+```
+RuntimeError: worker closed connection without replying
+```
+
+The identical spec had succeeded earlier the same night (2425 s, valid 91 MB
+PNG), so it was not inherently impossible. Suspicion fell on instance RAM, VRAM,
+disk, the 16-bit colour depth, and OpenImageDenoise's host buffers at 33
+megapixels.
+
+**All of those were wrong.** The worker never crashed. Nothing ran out of
+memory.
+
+### What the evidence actually said
+
+| check | result |
+|---|---|
+| `cgroup memory.events` | `oom_kill 0` — the kernel never OOM-killed anything |
+| `cgroup memory.max` | 183.5 GB limit, **peak 11.2 GB** (6%) |
+| container restart? | no — pid 1 up since 12:32, so the counters cover the failure |
+| host RAM | 503 GB total, 460 GB available |
+| disk | 2.3 GB of 30 GB used, `/workspace/out` held one file |
+| Blender crash file | none — a segfault writes `.crash.txt`, there was none |
+| `worker.log` | ends at `[worker] ready`, no error, no traceback |
+
+Then the decisive one. The broker's own failure line quoted the worker
+contradicting it:
+
+```
+deploy attempt 1/3 failed: worker ... not ready after 1800s and 599 pings:
+ConnectionRefusedError. remote worker.log: ... [worker] ready on 127.0.0.1:8799
+```
+
+The worker was **alive, listening on 8799, and rendering at sample 832/8192**
+while the broker declared it dead. The broker was pinging its own dead SSH
+tunnel 599 times over 30 minutes and blaming the process at the other end.
+
+### Root cause
+
+**This instance's SSH endpoint flapped**, visible directly as
+
+```
+ssh: connect to host 192.0.2.19 port 53303: Connection refused
+mux_client_request_session: read from master failed: Broken pipe
+```
+
+When the tunnel carrying the job socket dies, the broker reads EOF. It reported
+that as *"worker closed connection without replying"* — an assertion it had no
+basis for. **EOF on a forwarded port means the forward ended; it says nothing
+about the process at the far end.**
+
+From there four failures compounded, each one making the next look justified:
+
+1. **Tunnel drops** mid-render → broker reads EOF → blames the worker.
+2. Broker "repairs" by **redeploying**, and the redeploy SIGKILLs a healthy
+   worker 33 s into a 40-minute frame. Three attempts, three destroyed renders.
+3. Job exhausts its attempts and is marked `failed`.
+4. The queue is now empty, so 300 s later the **idle timer stops the instance** —
+   while the GPU was still at 99% and 420 W finishing that very frame.
+
+A serial worker **cannot** answer a ping while rendering: it is inside
+`bpy.ops.render.render()` on its only thread. Silence on the job socket is the
+*expected* state during the exact window when the broker most wants to test
+liveness. Treating that silence as death is the whole bug.
+
+### Fixes
+
+* `worker_call` raises **`ConnectionDropped`**, never a bare RuntimeError, and
+  the message says the tunnel may be at fault rather than asserting the worker
+  closed anything.
+* On a drop the broker **reattaches instead of re-rendering**: the worker writes
+  its PNG to disk independently of the socket that asked for it, so the broker
+  polls `progress.json` over the SSH command channel (which stays up while the
+  forward flaps) and collects the finished frame. A dropped tunnel now costs a
+  connection, not 40 minutes of GPU.
+* `rendering_now()` asks the instance what it is doing. `_worker_alive()`
+  consults it before declaring death; `start_worker()` raises **`WorkerBusy`**
+  rather than killing a render in progress; `WorkerBusy` is re-raised through
+  the deploy-retry path so it can never reach the replace-the-hardware branch
+  and destroy a GPU mid-frame.
+* `wait_worker()` takes the tunnel handle and gives up the moment it dies —
+  one poll instead of 599 pings over 1800 s.
+* The idle timer asks the same question: **an idle queue is not an idle GPU.**
+* `rq` downloads to a temp file and verifies the PNG signature *and* `IEND`
+  before renaming, so a truncated 91 MB transfer can never look like a finished
+  render.
+
+### The lesson worth keeping
+
+Every layer here reported a component it had not tested. The socket layer
+reported on the worker. The readiness check reported on the worker. The idle
+timer reported on the GPU. In each case the honest statement was much narrower
+— "my forward died", "nothing answered on my local port", "my queue is empty" —
+and the honest statement was also the one that pointed at the fix.
+
+When a diagnosis names a component, check that the code that produced it can
+actually observe that component.
+
+---
+
+## Earlier, same session
+
+* **A second broker destroyed the first one's GPU.** uvicorn runs lifespan
+  startup *before* binding the port, so a second start got through
+  `adopt_or_reap`, took ownership of the live instance, failed its bind, and
+  destroyed on the way out what it had just adopted. Fixed with an exclusive
+  `flock` taken before any fleet call. See `operations.md`.
+* **`blender push failed:` with an empty message.** `run(check=False)` returned
+  only stdout, so an ssh that never executed was indistinguishable from a
+  command that printed nothing. Fixed by `probe()`/`Ran`, which carry exit code,
+  stderr tail, elapsed and endpoint.
+* **A worker launch that always timed out at 600 s.** `&` binds looser than
+  `&&`, so `A && B && blender … &` backgrounds the whole list as one subshell,
+  which then holds sshd's stdout/stderr pipes while waiting on blender. The
+  render had already started fine every time. `< /dev/null` does not fix it;
+  `setsid --fork` with no `&` does.
+* **A missing HDRI rendered a plausible but differently-lit frame**, silently,
+  because an unpacked `.blend` stores absolute paths and the broker shipped only
+  the blend. Assets are now mirrored per scene and anything unresolved is logged
+  loudly.

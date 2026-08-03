@@ -1,0 +1,963 @@
+#!/usr/bin/env python3
+"""rq — submit renders to the vast-render broker.
+
+The agent-facing interface. Standard library only, so any agent can call it
+without a virtualenv:
+
+    rq render --cam CAM_HeroLow --res 3840 2160 --samples 220 --wait
+    rq status
+    rq get <job_id> -o hero.png
+
+The broker owns transport and the GPU's lifecycle. It has no opinion about the
+image: camera, resolution, samples, denoiser, bounces and exposure are all
+yours, and every one is sent explicitly with each job so nothing is inherited
+from a previous render.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Optional
+
+BASE = os.environ.get("VASTRENDER_URL", "http://127.0.0.1:8760")
+AGENT = os.environ.get("VASTRENDER_AGENT", os.environ.get("USER", "anon"))
+
+
+def call(method: str, path: str, payload: Optional[dict] = None, timeout: float = 400) -> Any:
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        BASE + path, data=data, method=method,
+        headers={"Content-Type": "application/json"} if data else {},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode()[:400]
+        try:
+            return {"error": json.loads(body), "status": exc.code}
+        except json.JSONDecodeError:
+            return {"error": body, "status": exc.code}
+    except urllib.error.URLError as exc:
+        print(f"cannot reach broker at {BASE}: {exc.reason}", file=sys.stderr)
+        print("start it with:  .venv/bin/python -m broker.app", file=sys.stderr)
+        sys.exit(2)
+
+
+def resolve_dof(a: argparse.Namespace, default_scene: bool) -> Optional[bool]:
+    """True, False, or None meaning "whatever the .blend says".
+
+    Round 1 lost a render here. `05_Exploded` came back blurred because the
+    submission simply omitted `--nodof`, and the two-valued flag turned that
+    omission into "depth of field ON". For round 2 the camera's DOF is animated
+    and authored in the blend, so the only correct answer for an animation is
+    "do not override it at all" — which is what `None` means and what `rq anim`
+    defaults to. Forcing it remains available, but it has to be asked for.
+    """
+    choice = getattr(a, "dof", None)
+    if choice == "scene":
+        return None
+    if choice == "on":
+        return True
+    if choice == "off":
+        return False
+    if getattr(a, "nodof", False):
+        return False
+    return None if default_scene else True
+
+
+def build_spec(a: argparse.Namespace, default_scene_dof: bool = False) -> dict:
+    """The complete job spec. The worker rejects anything missing a field
+    rather than defaulting it — in a warm process an omitted value would be
+    served by whatever the previous job left behind."""
+    return {
+        "camera": a.cam,
+        "resolution": list(a.res),
+        "samples": a.samples,
+        "engine": a.engine,
+        "denoiser": a.denoiser,
+        "denoise_gpu": not a.no_denoise_gpu,
+        "use_dof": resolve_dof(a, default_scene_dof),
+        "film_transparent": a.film_transparent,
+        "border": list(a.border) if a.border else None,
+        "zoom": a.zoom,
+        "exposure": a.exposure,
+        "max_bounces": a.max_bounces,
+        "adaptive_threshold": a.adaptive_threshold,
+        # A still renders whatever frame the scene is on; `rq anim` overrides
+        # this per frame.
+        "frame": getattr(a, "frame", None),
+        "persistent_data": not getattr(a, "no_persistent_data", False),
+        "require_caches": not getattr(a, "no_require_caches", False),
+        # Policy, not an image field, and deliberately NOT part of `spec_hash` —
+        # see IMAGE_FIELDS in broker/seq.py. It changes what the broker does
+        # with a blank result, not what the frame looks like, so setting it must
+        # not invalidate 2,000 already-delivered frames.
+        "allow_blank": getattr(a, "allow_blank", False),
+    }
+
+
+def print_image_stats(job: dict, prefix: str = "") -> bool:
+    """Say what was actually in the returned image. True if it is fine.
+
+    Printed for every render, not only the bad ones. A number that appears only
+    when something is wrong is a number nobody has a feel for, and "sd 0.04" is
+    alarming only once you have seen a hundred lines saying 0.17.
+    """
+    stats = job.get("stats") or {}
+    verdict = stats.get("verdict") or job.get("blank")
+    if not verdict:
+        return True
+    if stats.get("mean") is not None:
+        print(f"{prefix}image     {verdict}  mean {stats['mean']:.4f}  "
+              f"sd {stats['sd']:.4f}  range {stats['min']:.3f}-{stats['max']:.3f}  "
+              f"{stats['levels']} levels")
+    else:
+        print(f"{prefix}image     {verdict}")
+    if verdict != "OK":
+        print(f"{prefix}          !! {stats.get('detail') or verdict}", file=sys.stderr)
+    return verdict == "OK"
+
+
+def cmd_render(a: argparse.Namespace) -> int:
+    body = {"spec": build_spec(a), "agent": a.agent, "prio": a.prio}
+    if a.scene:
+        body["scene"] = a.scene
+    resp = call("POST", "/jobs", body)
+    if "error" in resp:
+        print(json.dumps(resp, indent=2), file=sys.stderr)
+        return 1
+    job_id = resp["job_id"]
+    where = f" scene={resp['scene']}" if resp.get("scene") else ""
+    print(f"{job_id}  queued (depth {resp['depth']}){where}")
+    if not a.wait:
+        return 0
+
+    started = time.time()
+    while True:
+        job = call("GET", f"/jobs/{job_id}?wait=60", timeout=120)
+        state = job.get("state")
+        # Without this, any error reply (broker restarted, 5xx, DB reset -> 404)
+        # has no "state" key, never matches a terminal value, and the loop
+        # prints "None..." forever. An agent waiting on that never returns.
+        if "error" in job or state is None:
+            print(f"{job_id}  lost contact with broker: {job}", file=sys.stderr)
+            return 1
+        if state in ("done", "failed", "canceled"):
+            break
+        if a.timeout and time.time() - started > a.timeout:
+            print(f"{job_id}  still {state} after {a.timeout:.0f}s — giving up waiting "
+                  f"(the job is still queued; collect it with: rq get {job_id})",
+                  file=sys.stderr)
+            return 2
+        print(f"  {state}... {time.time() - started:.0f}s", file=sys.stderr)
+
+    if state != "done":
+        print(f"{job_id}  {state}: {job.get('err')}", file=sys.stderr)
+        # A job failed for being blank still measured something, and the numbers
+        # are the argument. Print them next to the refusal, not somewhere else.
+        print_image_stats(job, prefix="          ")
+        return 1
+
+    print(f"{job_id}  done in {job.get('render_sec')}s -> {job.get('result_path')}")
+    print_image_stats(job, prefix="          ")
+    if a.out:
+        download(job_id, a.out)
+    return 0
+
+
+def cmd_exec(a: argparse.Namespace) -> int:
+    """Queue one `blender -b -P <entry>` run on the rented box's CPUs.
+
+    The unit is a BUILD, not a render: the 553 broker jobs measured against item
+    scenes spent 81 % of their wall clock not rendering, almost all of it pushing
+    assembled .blends up a 4-5 MB/s line. An exec job pushes ~8 MB of Python
+    once per wave and the .blend is born where the render happens.
+
+    Nothing is defaulted. `--timeout`, `--slots` and `--blender-args` are all
+    required by the worker's own schema, because the exec server is a warm
+    process and an omitted field there would be served by the previous job's
+    value rather than being unset.
+    """
+    spec = {
+        "entry": a.entry,
+        "argv": a.arg or [],
+        "outputs": a.output,
+        "timeout_s": a.timeout,
+        "blender_args": a.blender_arg or ["-b", "--factory-startup"],
+        "cpu_slots": a.slots,
+    }
+    body = {"spec": spec, "agent": a.agent, "prio": a.prio,
+            "bundle_root": a.root, "bundle_patterns": a.include}
+    resp = call("POST", "/exec", body)
+    if "error" in resp:
+        print(json.dumps(resp, indent=2), file=sys.stderr)
+        return 1
+    job_id = resp["job_id"]
+    print(f"{job_id}  queued (depth {resp['depth']})  bundle={resp['bundle']} "
+          f"{resp['bundle_files']} file(s) {resp['bundle_bytes'] / 1e6:.1f} MB")
+    if not a.wait:
+        return 0
+
+    started = time.time()
+    while True:
+        job = call("GET", f"/jobs/{job_id}?wait=60", timeout=120)
+        state = job.get("state")
+        if "error" in job or state is None:
+            print(f"{job_id}  lost contact with broker: {job}", file=sys.stderr)
+            return 1
+        if state in ("done", "failed", "canceled"):
+            break
+        if a.timeout_wait and time.time() - started > a.timeout_wait:
+            print(f"{job_id}  still {state} after {a.timeout_wait:.0f}s — giving up "
+                  f"waiting (the job is still queued)", file=sys.stderr)
+            return 2
+        print(f"  {state}... {time.time() - started:.0f}s", file=sys.stderr)
+
+    if state != "done":
+        print(f"{job_id}  {state}: {job.get('err')}", file=sys.stderr)
+        return 1
+    outputs = json.loads(job.get("outputs") or "[]")
+    print(f"{job_id}  done in {job.get('exec_sec')}s on the box")
+    for path in outputs:
+        print(f"          {path}")
+    return 0
+
+
+def cmd_anim(a: argparse.Namespace) -> int:
+    """Submit a frame range as one job and, optionally, watch it.
+
+    The range is the unit of work, not the frame. Three thousand individual
+    jobs would re-pay dispatch, lease and scene-selection overhead three
+    thousand times and would not fit the queue's own admission limits — and the
+    scene, which for round 2 is hundreds of megabytes, must be uploaded once and
+    stay resident for the whole shot.
+    """
+    body = {
+        "spec": build_spec(a, default_scene_dof=True),
+        "agent": a.agent, "prio": a.prio,
+        "name": a.name, "frames": a.frames,
+    }
+    if a.scene:
+        body["scene"] = a.scene
+    resp = call("POST", "/sequences", body, timeout=600)
+    if "error" in resp:
+        print(json.dumps(resp, indent=2), file=sys.stderr)
+        return 1
+
+    est = resp.get("estimate") or {}
+    frames = resp.get("frames") or {}
+    print(f"{resp['job_id']}  queued — sequence {resp['seq']}")
+    # Echo the frame set the BROKER parsed, not the string that was typed. A
+    # comma form read as a plain range would render frames nobody asked for, and
+    # the only place that is visible is here, before anything is rented.
+    if frames.get("contiguous", True):
+        shown = (f"{frames.get('first')}-{frames.get('last')}"
+                 f"{'x' + str(frames.get('step')) if frames.get('step', 1) != 1 else ''}")
+    else:
+        shown = frames.get("spec") or "?"
+    print(f"          frames {shown}  ({frames.get('count')} total)")
+    print(f"          {resp.get('already_done', 0)} already delivered, "
+          f"{resp.get('to_render', 0)} to render")
+    if resp.get("stale"):
+        print(f"          re-rendering {resp['stale']} — their files no longer verify")
+    print(f"          scene {resp.get('scene')} ({resp.get('scene_hash')})  "
+          f"spec {resp.get('spec_hash')}")
+    print(f"          -> {resp.get('dir')}")
+    if est.get("known"):
+        print(f"          PROJECTED COST ${est['usd']:.2f} — {est['frames']} frames "
+              f"x {est['sec_per_frame']:.0f}s = {est['gpu_hours']:.1f} GPU-hours "
+              f"at ${est['dph']:.3f}/hr, ~{est['wall_hours']:.1f}h wall clock")
+        if est.get("instance_restarts"):
+            print(f"          (includes {est['instance_restarts']} cold start(s): the "
+                  f"in-container watchdog retires an instance every 12 h)")
+        # A measured number can still be the wrong measurement. Say what it was
+        # measured on, every time, so a projection from 1080p previews of another
+        # .blend cannot pass for one from this batch just because it is arithmetic.
+        if est.get("exact"):
+            print(f"          basis: {est.get('basis_samples')} {est.get('basis')} "
+                  f"— same spec, same .blend")
+        else:
+            print(f"          !! BASIS MISMATCH — measured on {est.get('basis')}, "
+                  f"not this batch's spec/.blend.")
+            print(f"          !! Order-of-magnitude hint only. For a number worth "
+                  f"budgeting against, render ONE frame at")
+            print(f"          !! this batch's own resolution and samples, then "
+                  f"re-run this command.")
+    else:
+        print(f"          cost unknown: {est.get('note')}")
+
+    # Disk, on THIS machine. Printed next to the money because it is the same
+    # kind of fact and fails the same way if nobody looks: the instance deletes
+    # each frame as it is fetched, so a long batch cannot fill it — every byte
+    # accumulates here instead.
+    disk = resp.get("local_disk") or {}
+    if disk.get("known"):
+        line = (f"          local disk: {disk['need_bytes'] / 1e9:.1f} GB needed "
+                f"({disk['frames']} x {disk['mean_bytes'] / 1e6:.1f} MB), "
+                f"{disk['free_bytes'] / 1e9:.1f} GB free at {disk['dir']}")
+        if disk.get("fits"):
+            print(line)
+        else:
+            print(line)
+            print(f"          !! IT DOES NOT FIT. Room for {disk['frames_that_fit']} "
+                  f"of {disk['frames']} frames — the batch fills this disk and "
+                  f"every")
+            print(f"          !! frame after that fails on write, hours or days "
+                  f"in. Free space or point")
+            print(f"          !! VASTRENDER_SEQ_DIR at a volume that can hold it "
+                  f"BEFORE starting.")
+    elif disk.get("note"):
+        print(f"          local disk: {disk['note']}")
+    if not a.wait:
+        print(f"          watch it:  rq seq status {resp['seq']}")
+        return 0
+    return watch_job(resp["job_id"], a.timeout)
+
+
+def watch_job(job_id: str, timeout: float) -> int:
+    started = time.time()
+    while True:
+        job = call("GET", f"/jobs/{job_id}?wait=30", timeout=90)
+        state = job.get("state")
+        if "error" in job or state is None:
+            print(f"{job_id}  lost contact with broker: {job}", file=sys.stderr)
+            return 1
+        if state in ("done", "failed", "canceled"):
+            break
+        if timeout and time.time() - started > timeout:
+            print(f"{job_id}  still {state} after {timeout:.0f}s — giving up waiting "
+                  f"(the job keeps running)", file=sys.stderr)
+            return 2
+        print(f"  {state}  {progress_str(job)}", file=sys.stderr)
+    if state != "done":
+        print(f"{job_id}  {state}: {job.get('err')}", file=sys.stderr)
+        return 1
+    print(f"{job_id}  done in {fmt_dur(job.get('render_sec'))}")
+    return 0
+
+
+def cmd_seq(a: argparse.Namespace) -> int:
+    """Report a sequence honestly: what is there, what is missing, what is wrong.
+
+    Never prints a bare "done". A frame sequence for a single unbroken shot is
+    a deliverable only if it has no gaps, and the way to know that is to check
+    every file rather than to trust a counter.
+    """
+    if a.seq_cmd == "list":
+        resp = call("GET", "/sequences")
+        for s in resp.get("sequences", []):
+            verdicts = s.get("verdicts") or {}
+            bad = sum(n for v, n in verdicts.items()
+                      if v in ("BLACK", "UNIFORM", "TRANSPARENT"))
+            print(f"{s['seq']:<24}{s['frames_done']:>6} done  "
+                  f"{s['frames_failed']:>4} failed  "
+                  f"{(s.get('bytes') or 0) / 1e9:>6.2f} GB  "
+                  f"frames {s.get('first')}-{s.get('last')}"
+                  + ("  MIXED SPECS" if len(s.get("spec_hashes") or []) > 1 else "")
+                  + (f"  {bad} BLANK" if bad else "")
+                  + (f"  {verdicts['unmeasured']} unmeasured"
+                     if verdicts.get("unmeasured") else ""))
+        if not resp.get("sequences"):
+            print("no sequences yet")
+        return 0
+
+    if a.seq_cmd == "stats":
+        return cmd_seq_stats(a)
+
+    query = "?deep=true" if a.deep else "?deep=false"
+    if a.frames:
+        query += f"&frames={a.frames}"
+    # `verify` now re-decodes every frame as well as re-hashing it, and a 4K
+    # frame costs ~0.5 s to decode — 3,000 of them is ~25 minutes before the
+    # re-hash is counted. The old 1800 s ceiling would have timed out on exactly
+    # the sequence this matters most for.
+    resp = call("GET", f"/sequences/{a.name}{query}", timeout=7200)
+    if "error" in resp:
+        print(json.dumps(resp, indent=2), file=sys.stderr)
+        return 1
+
+    summary = resp.get("summary") or {}
+    print(f"sequence  {resp['seq']}")
+    print(f"dir       {resp['dir']}")
+    print(f"checked   {resp['checked']} frame(s)"
+          + ("  (deep: every file re-hashed and re-measured)"
+             if resp.get("deep") else ""))
+    print(f"ok        {resp['ok']}   {resp.get('bytes', 0) / 1e9:.2f} GB")
+    print(f"range     {resp.get('contiguous')}")
+    if summary.get("mean_render_sec"):
+        print(f"mean      {summary['mean_render_sec']:.1f}s/frame")
+    dims = resp.get("dimensions") or {}
+    if len(dims) > 1:
+        print(f"WARNING   mixed frame dimensions: {dims} — these are not one sequence")
+    elif dims:
+        print(f"size      {next(iter(dims))}")
+    hashes = resp.get("spec_hashes") or {}
+    if len(hashes) > 1:
+        print(f"WARNING   frames were rendered from {len(hashes)} different specs: "
+              f"{hashes} — a seam is guaranteed somewhere in this shot")
+
+    verdicts = resp.get("verdicts") or {}
+    if verdicts:
+        print("image     " + "  ".join(f"{v} {n}" for v, n in sorted(verdicts.items()))
+              + ("" if resp.get("remeasured") else "   (recorded at delivery; "
+                                                   "`rq seq verify` re-measures)"))
+    if resp.get("unmeasured"):
+        print(f"UNCHECKED {resp['unmeasured']} frame(s) were delivered before blank "
+              f"detection existed — run `rq seq verify {resp['seq']}` to measure them")
+
+    missing = resp.get("missing") or []
+    bad = resp.get("bad") or []
+    blank = resp.get("blank") or []
+    outliers = resp.get("outliers") or []
+    if missing:
+        print(f"MISSING   {len(missing)} frame(s): "
+              f"{summarise_frames(m['frame'] for m in missing)}")
+        for m in missing[:5]:
+            print(f"            {m['frame']}: {str(m.get('why'))[:100]}")
+    if blank:
+        # Named separately from CORRUPT even though they are also in it: the
+        # file is fine, so "corrupt" would send someone to look at the transfer.
+        print(f"BLANK     {len(blank)} frame(s) have no picture in them: "
+              f"{summarise_frames(b['frame'] for b in blank)}")
+        for b in blank[:5]:
+            print(f"            {b['frame']}: {b['why']}")
+    # Blank frames are in `bad` too — that is what keeps them out of the
+    # delivered count — but listing them twice under a heading that says
+    # "corrupt" would send someone to look at the transfer. They are already
+    # named above, so only the genuinely damaged files are listed here.
+    blank_frames = {b["frame"] for b in blank}
+    damaged = [b for b in bad if b["frame"] not in blank_frames]
+    if damaged:
+        print(f"CORRUPT   {len(damaged)} frame(s): "
+              f"{summarise_frames(b['frame'] for b in damaged)}")
+        for b in damaged[:5]:
+            print(f"            {b['frame']}: {b['why']}")
+    if outliers:
+        # Never fatal on its own. These frames verified; they simply do not look
+        # like their neighbours, which in a single unbroken take is the strongest
+        # signal there is and still not proof of anything.
+        print(f"ODD       {len(outliers)} frame(s) do not match their neighbours: "
+              f"{summarise_frames(o['frame'] for o in outliers)}")
+        for o in outliers[:5]:
+            print(f"            {o['frame']}: {o['why']}")
+        print(f"          look at these before delivering; "
+              f"`rq seq stats {resp['seq']}` has the full table")
+    if not missing and not bad and resp["ok"]:
+        print("VERIFIED  every frame present, complete, consistent, and not blank")
+    return 1 if (missing or bad) else 0
+
+
+def cmd_seq_stats(a: argparse.Namespace) -> int:
+    """Dump what every frame's pixels measured, in frame order.
+
+    The point of this command is 2,978 rows. A summary cannot show you that
+    frame 1,600 is the only one at sd 0.00, and a spot check will not find it
+    either — so this prints the whole table, sorts on request, and emits CSV
+    when the answer belongs in a spreadsheet rather than a terminal.
+    """
+    resp = call("GET", f"/sequences/{a.name}/stats", timeout=600)
+    if "error" in resp:
+        print(json.dumps(resp, indent=2), file=sys.stderr)
+        return 1
+    rows = resp.get("frames") or []
+    if not rows:
+        print(f"no frames recorded for sequence {a.name}", file=sys.stderr)
+        return 1
+
+    if a.sort == "sd":
+        rows = sorted(rows, key=lambda r: (r["lum_sd"] is None, r["lum_sd"] or 0))
+    elif a.sort == "mean":
+        rows = sorted(rows, key=lambda r: (r["lum_mean"] is None, r["lum_mean"] or 0))
+    if a.limit:
+        rows = rows[:a.limit]
+
+    if a.csv:
+        cols = ("frame", "state", "blank", "lum_mean", "lum_sd", "lum_min",
+                "lum_max", "lum_levels", "bytes", "render_sec")
+        print(",".join(cols))
+        for r in rows:
+            print(",".join("" if r.get(c) is None else str(r.get(c)) for c in cols))
+        return 0
+
+    # A tone histogram is far easier to scan than eight decimal columns, but
+    # this script runs under whatever locale an agent happens to have; a
+    # UnicodeEncodeError on a diagnostic would be its own small disaster.
+    try:
+        "▁".encode(sys.stdout.encoding or "ascii")
+        bars = " ▁▂▃▄▅▆▇█"
+    except (UnicodeEncodeError, LookupError):
+        bars = " .:-=+*#@"
+    print(f"{'frame':>7} {'verdict':<11} {'mean':>7} {'sd':>7} {'min':>6} {'max':>6} "
+          f"{'lvl':>4}  {'tone dark->light':<16}  MB")
+    for r in rows:
+        h = r.get("hist16")
+        if h:
+            top = max(h) or 1
+            spark = "".join(bars[min(8, (v * 8 + top - 1) // top)] for v in h)
+        else:
+            spark = " " * 16
+        if r["lum_mean"] is None:
+            print(f"{r['frame']:>7} {(r.get('blank') or 'unmeasured'):<11} "
+                  f"{'-':>7} {'-':>7} {'-':>6} {'-':>6} {'-':>4}  {spark:<16}  "
+                  f"{(r.get('bytes') or 0) / 1e6:.1f}")
+            continue
+        print(f"{r['frame']:>7} {(r.get('blank') or '?'):<11} {r['lum_mean']:>7.4f} "
+              f"{r['lum_sd']:>7.4f} {r['lum_min']:>6.3f} {r['lum_max']:>6.3f} "
+              f"{r['lum_levels']:>4}  {spark:<16}  {(r.get('bytes') or 0) / 1e6:.1f}")
+
+    print(f"\nmeasured {resp.get('measured', 0)}, "
+          f"unmeasured {resp.get('unmeasured', 0)}")
+    t = resp.get("thresholds") or {}
+    if t:
+        print(f"thresholds: blank sd<={t.get('blank_sd')}, black mean<={t.get('black_mean')}, "
+              f"suspicious sd<={t.get('suspect_sd')}, "
+              f"outlier z>={t.get('outlier_z')} over {t.get('outlier_window')} neighbours")
+    for o in resp.get("outliers") or []:
+        print(f"ODD  frame {o['frame']}: {o['why']}")
+    return 0
+
+
+def summarise_frames(frames) -> str:
+    """`1-40, 57, 90-93`. Duplicated from broker/seq.py on purpose — `rq` is
+    stdlib-only and importable by any agent without this repo's package."""
+    nums = sorted(set(int(f) for f in frames))
+    if not nums:
+        return "none"
+    runs = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        runs.append((start, prev))
+        start = prev = n
+    runs.append((start, prev))
+    return ", ".join(str(x) if x == y else f"{x}-{y}" for x, y in runs)
+
+
+def cmd_budget(a: argparse.Namespace) -> int:
+    if a.set is not None:
+        resp = call("POST", "/budget", {"usd": a.set})
+    else:
+        resp = call("GET", "/budget")
+    if "error" in resp:
+        print(json.dumps(resp, indent=2), file=sys.stderr)
+        return 1
+    credit = resp.get("credit") or {}
+    print(f"cap        ${resp['cap_usd']:.2f}")
+    print(f"spent      ${resp['spent_usd']:.4f}   (banked ${resp['banked_usd']:.4f}, "
+          f"live ${resp['live_instance_usd']:.4f}, orphaned ${resp['orphaned_usd']:.4f})")
+    print(f"remaining  ${resp['remaining_usd']:.4f}")
+    if credit.get("usd") is not None:
+        print(f"credit     ${credit['usd']:.2f} on vast.ai — "
+              f"${credit.get('spent_since_first', 0):.2f} spent since this broker "
+              f"first looked")
+    else:
+        print("credit     not sampled yet (the broker polls it every 10 min)")
+    if resp.get("paused"):
+        print(f"PAUSED     {resp['paused']}")
+    return 0
+
+
+def download(job_id: str, dest: str) -> None:
+    """Fetch the PNG atomically, and verify it really is a complete one.
+
+    Written to a temp path and renamed only after the whole body has arrived and
+    the file carries both a PNG signature and an IEND trailer. A caller must
+    never be left holding a truncated file that looks finished: an 8K frame is
+    ~91 MB, and a stream that dies at 60 MB still opens in most viewers, showing
+    a partial image with nothing to indicate it is partial.
+    """
+    tmp = dest + ".part"
+    req = urllib.request.Request(f"{BASE}/jobs/{job_id}/result")
+    try:
+        with urllib.request.urlopen(req, timeout=1800) as resp, open(tmp, "wb") as fh:
+            declared = resp.headers.get("Content-Length")
+            got = 0
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                got += len(chunk)
+        if declared is not None and got != int(declared):
+            raise OSError(f"truncated download: got {got} of {declared} bytes")
+        if got < 12:
+            raise OSError(f"download is {got} bytes, not a PNG")
+        with open(tmp, "rb") as fh:
+            head = fh.read(8)
+            fh.seek(-12, os.SEEK_END)
+            trailer = fh.read(12)
+        if head != b"\x89PNG\r\n\x1a\n" or b"IEND" not in trailer:
+            raise OSError(f"not a complete PNG ({got} bytes; signature or IEND missing)")
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    os.replace(tmp, dest)
+    print(f"          saved {dest} ({os.path.getsize(dest) / 1e6:.1f} MB)")
+
+
+def fmt_dur(sec) -> str:
+    try:
+        sec = int(float(sec))
+    except (TypeError, ValueError):
+        return "?"
+    if sec >= 3600:
+        return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+    if sec >= 60:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec}s"
+
+
+def progress_str(job: dict) -> str:
+    """`3712/8192 (45%)  12m31s elapsed, ~22m08s remaining`, or "" if unknown.
+
+    On a tiled frame the sample counter restarts per tile, so the tile pair is
+    shown too and the percentage is frame-level — otherwise it would run 0-100%
+    once per tile, which is what it did before this was noticed.
+    """
+    sample, total = job.get("prog_sample"), job.get("prog_total")
+    tile, tiles = job.get("prog_tile"), job.get("prog_tiles")
+    bits = []
+    # Frames first: on a multi-hour sequence the frame counter is the one that
+    # says whether the BATCH is alive, and the sample counter only says whether
+    # the current frame is.
+    if job.get("seq"):
+        done = job.get("frames_done") or 0
+        whole = job.get("frames_total") or 0
+        where = f"frame {job.get('frame_current')}" if job.get("frame_current") else "frame ?"
+        pct = f" ({100.0 * done / whole:.0f}%)" if whole else ""
+        bad = f", {job['frames_failed']} FAILED" if job.get("frames_failed") else ""
+        bits.append(f"{job['seq']} {where}  {done}/{whole} frames{pct}{bad}")
+    if sample is not None and total:
+        pct = job.get("prog_pct")
+        pct = pct if pct is not None else 100.0 * sample / total
+        where = f"{sample}/{total}"
+        if tiles:
+            where = f"tile {min((tile or 0) + 1, tiles)}/{tiles}, sample {where}"
+        bits.append(f"{where} ({pct:.0f}%)")
+    elif job.get("prog_phase"):
+        bits.append(str(job["prog_phase"])[:40])
+    if job.get("prog_elapsed") is not None:
+        eta = job.get("prog_remaining")
+        when = f", ~{fmt_dur(eta)} remaining" if eta else ""
+        bits.append(f"{fmt_dur(job['prog_elapsed'])} elapsed{when}")
+    return "  ".join(bits)
+
+
+def cmd_get(a: argparse.Namespace) -> int:
+    """Download a finished render.
+
+    Exit codes let a caller tell "not ready" from "failed", which a JSON blob of
+    nulls could not: 0 = downloaded, 1 = the job failed or was cancelled,
+    3 = still queued or running. `--wait` blocks until it is one or the other.
+    """
+    started = time.time()
+    while True:
+        job = call("GET", f"/jobs/{a.job_id}")
+        if "error" in job or job.get("state") is None:
+            print(f"{a.job_id}  cannot read job: {job}", file=sys.stderr)
+            return 1
+        # A sequence job's result is a directory of thousands of frames, not a
+        # file this command can hand back. Say so instead of letting the 409
+        # come out as an unhandled HTTPError traceback.
+        if job.get("seq"):
+            print(f"{a.job_id}  rendered the frame sequence {job['seq']!r}, not a "
+                  f"single image.\n"
+                  f"          frames are in {job.get('result_path')}\n"
+                  f"          check them with:  rq seq status {job['seq']}",
+                  file=sys.stderr)
+            return 1
+
+        state = job["state"]
+        if state == "done":
+            break
+        if state in ("failed", "canceled"):
+            print(f"{a.job_id}  {state}: {job.get('err') or 'no error recorded'}",
+                  file=sys.stderr)
+            return 1
+
+        detail = progress_str(job)
+        if not a.wait:
+            print(f"{a.job_id}  {state}" + (f"  {detail}" if detail else "")
+                  + "  — not ready yet; add --wait to block", file=sys.stderr)
+            return 3
+        if a.timeout and time.time() - started > a.timeout:
+            print(f"{a.job_id}  still {state} after {a.timeout:.0f}s — giving up "
+                  f"waiting (the job keeps running)", file=sys.stderr)
+            return 3
+        print(f"  {state}" + (f"  {detail}" if detail else "") + "...", file=sys.stderr)
+        time.sleep(5)
+
+    download(a.job_id, a.out or f"{a.job_id}.png")
+    return 0
+
+
+def cmd_status(a: argparse.Namespace) -> int:
+    q = call("GET", "/queue")
+    fleet = q.get("fleet", {})
+    loaded = q.get("loaded_scene")
+    print(f"scene    default={q.get('scene')}")
+    if loaded:
+        print(f"loaded   {loaded}  (batch {q.get('scene_batch', 0)} job(s) served)")
+    depths = q.get("scene_depth") or {}
+    if depths:
+        per = "  ".join(f"{k}={n}" for k, n in depths.items())
+        print(f"waiting  {per}")
+    print(f"queue    {q.get('counts')}  depth={q.get('depth')}  idle={q.get('idle_sec')}s")
+    mean = q.get("mean_render_sec")
+    print(f"gpu      {fleet.get('status')}  instance={fleet.get('instance_id')} "
+          f"${fleet.get('dph')}/hr  up={fleet.get('uptime_sec')}s  "
+          f"spend=${fleet.get('spend_usd')}")
+    # A push in flight, so a slow one can be told from a wedged one. Without
+    # this, `uploading-scene` was the whole story for the 510 s a 4.22 GB scene
+    # took, and the only honest reading of it was "possibly hung".
+    tx = fleet.get("transfer")
+    if tx:
+        rate = f"  {tx['mb_per_sec']} MB/s" if tx.get("mb_per_sec") else ""
+        print(f"sending  {tx['what']}  {tx['mb']:.0f} MB  "
+              f"{tx['elapsed_sec']:.0f}s elapsed{rate}")
+    # The remote disk. Shown always, because the failure it reports — a scene
+    # cache filling the instance — kills a 30-hour run and used to be invisible
+    # from here: the only way to see it was to ssh in and run du.
+    disk = fleet.get("disk") or {}
+    if disk.get("measured"):
+        age = disk.get("age_sec") or 0
+        print(f"disk     {disk['used_gb']:.1f}G used of {disk['total_gb']:.1f}G "
+              f"({disk['pct_used']:.0f}%)  free {disk['free_gb']:.1f}G   "
+              f"cache {disk['cache_gb']:.2f}G in {disk['scene_count']} scene(s) "
+              f"(budget {disk['budget_gb']:.1f}G)  measured {age:.0f}s ago")
+        if disk["free_gb"] < disk.get("reserve_gb", 0):
+            print(f"DISK LOW free {disk['free_gb']:.2f}G is under the "
+                  f"{disk['reserve_gb']:.1f}G reserve — the next scene upload "
+                  f"may be refused")
+    elif fleet.get("instance_id"):
+        # Never silently absent. An unmeasured disk is a thing to know about,
+        # not a blank line that reads as "fine".
+        print(f"disk     UNKNOWN — {disk.get('detail') or 'not measured'}")
+    ex = q.get("exec") or {}
+    if ex.get("inflight") or ex.get("used"):
+        print(f"exec     {ex['used']}/{ex['slots']} slot(s) busy"
+              f"{'  tunnel DOWN' if not ex.get('tunnel') else ''}")
+        for j in ex.get("inflight", []):
+            print(f"  build  {j['job_id']}  {j['agent']:<10} {j['entry']}  "
+                  f"{j['elapsed_sec']:.0f}s")
+    if mean:
+        print(f"mean     {mean:.1f}s/render")
+    if q.get("paused"):
+        print(f"PAUSED   {q['paused']}")
+    # A running job is the one thing status could never say anything about. It
+    # is shown whether or not -v is passed, because "running" with no numbers is
+    # exactly the state that used to be indistinguishable from wedged.
+    for j in q.get("recent", []):
+        if j.get("state") == "running":
+            detail = progress_str(j) or "no progress reported yet"
+            print(f"running  {j['id']}  {j.get('agent', '')}  {detail}")
+
+    if a.verbose:
+        for j in q.get("recent", []):
+            extra = progress_str(j) if j.get("state") == "running" else ""
+            kind = "" if j.get("kind") in (None, "render") else j["kind"]
+            secs = j.get("render_sec") if kind != "exec" else j.get("exec_sec")
+            print(f"  {j['id']:<14}{j['agent']:<12}{kind:<6}{j['state']:<10}"
+                  f"{secs or '':<8}"
+                  f"{extra or (j.get('err') or '')[:50]}")
+    return 0
+
+
+def cmd_cancel(a: argparse.Namespace) -> int:
+    print(json.dumps(call("DELETE", f"/jobs/{a.job_id}"), indent=2))
+    return 0
+
+
+def cmd_teardown(a: argparse.Namespace) -> int:
+    print(json.dumps(call("POST", "/teardown"), indent=2))
+    return 0
+
+
+def cmd_resume(a: argparse.Namespace) -> int:
+    print(json.dumps(call("POST", "/resume"), indent=2))
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="rq", description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def render_flags(p):
+        """Every knob that describes an image. Shared by `render` and `anim` so
+        the two can never drift apart — a still and a frame of the sequence it
+        belongs to must be describable identically."""
+        p.add_argument("--cam", required=True, help="camera object name in the scene")
+        p.add_argument("--res", nargs=2, type=int, required=True, metavar=("W", "H"))
+        p.add_argument("--samples", type=int, required=True)
+        p.add_argument("--engine", default="CYCLES", choices=["CYCLES", "BLENDER_EEVEE"])
+        p.add_argument("--denoiser", default="OPENIMAGEDENOISE",
+                       choices=["OPENIMAGEDENOISE", "OPTIX", "NONE"])
+        p.add_argument("--no-denoise-gpu", action="store_true")
+        p.add_argument("--dof", choices=["scene", "on", "off"], default=None,
+                       help="'scene' uses the .blend's own depth of field INCLUDING "
+                            "its animation and is the default for anim; on/off "
+                            "override it. Overriding animated DOF is how a round-1 "
+                            "render came back wrongly blurred.")
+        p.add_argument("--nodof", action="store_true",
+                       help="deprecated alias for --dof off")
+        p.add_argument("--film-transparent", action="store_true")
+        p.add_argument("--border", nargs=4, type=float,
+                       metavar=("MINX", "MAXX", "MINY", "MAXY"),
+                       help="normalised crop, origin bottom-left")
+        p.add_argument("--zoom", type=float, default=1.0,
+                       help="multiply pixel density before cropping (true detail, "
+                            "not upscale)")
+        p.add_argument("--exposure", type=float, default=None)
+        p.add_argument("--max-bounces", type=int, default=None)
+        p.add_argument("--adaptive-threshold", type=float, default=0.01)
+        p.add_argument("--no-persistent-data", action="store_true",
+                       help="do not keep BVH/sync between frames (slower per frame, "
+                            "lower memory over a long sequence)")
+        p.add_argument("--no-require-caches", action="store_true",
+                       help="render even when a physics cache does not cover the "
+                            "frame. Blender will SIMULATE instead of reading the "
+                            "bake, which changes the sim between frames.")
+        p.add_argument("--allow-blank", action="store_true",
+                       help="accept a frame with no picture in it. By default a "
+                            "render that comes back black, fully transparent or "
+                            "one flat colour FAILS — a structurally perfect, "
+                            "sha256-matched, correctly sized black PNG has been "
+                            "delivered by this farm and counted as done. Use this "
+                            "when the frame is genuinely meant to be blank (a fade, "
+                            "a black plate). It never suppresses the report.")
+        p.add_argument("--scene", default=None,
+                       help="which .blend to render; a bare name resolves against the "
+                            "broker's scene roots. Defaults to the broker's scene.")
+        p.add_argument("--prio", type=int, default=100, help="lower runs sooner")
+        p.add_argument("--agent", default=AGENT, help="who is asking (fair-share key)")
+        p.add_argument("--timeout", type=float, default=3600,
+                       help="give up waiting after N seconds (the job keeps going); "
+                            "0 = forever")
+
+    r = sub.add_parser("render", help="submit a single still")
+    render_flags(r)
+    r.add_argument("--frame", type=int, default=None,
+                   help="which frame to render; omit for the scene's current frame")
+    r.add_argument("--wait", action="store_true", help="block until the render finishes")
+    r.add_argument("-o", "--out", help="save the PNG here when done (implies --wait)")
+    r.set_defaults(func=cmd_render)
+
+    x = sub.add_parser("exec", help="run a Blender script on the rented box's CPUs "
+                                    "(builds and gates, not renders)")
+    x.add_argument("--root", required=True,
+                   help="local directory the bundle is taken from; must sit "
+                        "inside a permitted bundle root")
+    x.add_argument("--include", action="append", required=True, metavar="GLOB",
+                   help="glob relative to --root; repeatable. This is the whole "
+                        "input, content-addressed at submit")
+    x.add_argument("--entry", required=True,
+                   help="script to run, relative to the bundle root")
+    x.add_argument("--arg", action="append", default=[],
+                   help="argument passed after `--`; repeatable. A token naming "
+                        "a path must resolve inside the job directory")
+    x.add_argument("--output", action="append", required=True, metavar="NAME",
+                   help="file the script writes into out/, fetched and "
+                        "sha256-verified; repeatable. Never a glob")
+    x.add_argument("--timeout", type=int, required=True,
+                   help="hard kill of the child's whole process group, seconds")
+    x.add_argument("--slots", type=int, default=1,
+                   help="exec slots this job occupies")
+    x.add_argument("--blender-arg", action="append", default=[],
+                   help="flag for Blender itself; defaults to -b --factory-startup")
+    x.add_argument("--prio", type=int, default=100)
+    x.add_argument("--agent", default=os.environ.get("VASTRENDER_AGENT", "anon"))
+    x.add_argument("--wait", action="store_true")
+    x.add_argument("--timeout-wait", type=float, default=7200,
+                   help="how long to WATCH for, which is not the job's own timeout")
+    x.set_defaults(func=cmd_exec)
+
+    n = sub.add_parser("anim", help="render a frame range into a named sequence")
+    render_flags(n)
+    n.add_argument("--name", required=True,
+                   help="sequence name; the output directory and the RESUME KEY. "
+                        "Re-submitting the same name renders only what is missing.")
+    n.add_argument("--frames", required=True, metavar="FRAMES",
+                   help="e.g. 1-240, 1-240x2, a single frame number, or a "
+                        "comma-separated list of any of those: 1-40,57,90-93. "
+                        "That last form is what `rq seq status` prints for "
+                        "missing frames, so its output can be pasted straight "
+                        "back in to re-render exactly the holes.")
+    n.add_argument("--wait", action="store_true",
+                   help="block until the whole range finishes (hours, for a real batch)")
+    n.set_defaults(func=cmd_anim)
+
+    q = sub.add_parser("seq", help="inspect and verify a rendered sequence")
+    qs = q.add_subparsers(dest="seq_cmd", required=True)
+    ql = qs.add_parser("list", help="every sequence this broker knows")
+    ql.set_defaults(func=cmd_seq, name=None, deep=False, frames=None)
+    for verb, helptext in (("status", "what is present, missing, corrupt or blank"),
+                           ("verify", "same, plus re-hash and re-measure every "
+                                      "frame (--deep)")):
+        sp = qs.add_parser(verb, help=helptext)
+        sp.add_argument("name")
+        sp.add_argument("--frames", default=None,
+                        help="restrict to a range or list, e.g. 1-240 or 1-40,57")
+        sp.add_argument("--deep", action="store_true",
+                        help="re-hash every file against the digest the worker "
+                             "computed when it rendered it, and re-decode every "
+                             "frame to check it is not blank. ~0.5 s per 4K frame.")
+        sp.set_defaults(func=cmd_seq)
+    # `verify` re-hashes by default; `status` is the cheap structural check.
+    # Two names for the same command because the expensive one should be the one
+    # you asked for by name, not a flag you might forget on the day it matters.
+    qs.choices["verify"].set_defaults(deep=True)
+
+    st = qs.add_parser("stats", help="per-frame image measurements — the table you "
+                                     "scan to find one bad frame in 3,000")
+    st.add_argument("name")
+    st.add_argument("--sort", choices=["frame", "sd", "mean"], default="frame",
+                    help="'sd' puts the flattest frames first, which is where a "
+                         "dropped frame will be")
+    st.add_argument("--limit", type=int, default=0, help="only the first N rows")
+    st.add_argument("--csv", action="store_true", help="machine-readable")
+    st.set_defaults(func=cmd_seq, deep=False, frames=None)
+
+    b = sub.add_parser("budget", help="cumulative spend, the cap, and vast.ai credit")
+    b.add_argument("--set", type=float, default=None,
+                   help="set the cumulative spend cap in USD (persisted; no restart)")
+    b.set_defaults(func=cmd_budget)
+
+    g = sub.add_parser("get", help="download a finished render")
+    g.add_argument("job_id")
+    g.add_argument("-o", "--out")
+    g.add_argument("--wait", action="store_true",
+                   help="block until the job finishes instead of exiting 3")
+    g.add_argument("--timeout", type=float, default=0,
+                   help="give up waiting after N seconds; 0 = forever")
+    g.set_defaults(func=cmd_get)
+
+    s = sub.add_parser("status", help="queue, GPU, and spend")
+    s.add_argument("-v", "--verbose", action="store_true")
+    s.set_defaults(func=cmd_status)
+
+    c = sub.add_parser("cancel", help="cancel a job")
+    c.add_argument("job_id")
+    c.set_defaults(func=cmd_cancel)
+
+    sub.add_parser("teardown", help="destroy the GPU now").set_defaults(func=cmd_teardown)
+    sub.add_parser("resume", help="clear a pause").set_defaults(func=cmd_resume)
+
+    a = p.parse_args()
+    if getattr(a, "out", None):
+        a.wait = True
+    return a.func(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
