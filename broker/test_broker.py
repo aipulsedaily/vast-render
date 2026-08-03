@@ -3158,6 +3158,76 @@ def test_a_slow_link_is_a_health_signal() -> None:
               not fleet2.condemned, f"condemned={fleet2.condemned}")
 
 
+def test_the_scene_dir_self_heal_keeps_the_evidence() -> None:
+    """The stray-inode fix must heal, must not over-reach, and must SAY what it found.
+
+    On 2026-08-03 `mkdir -p /workspace/scenes/<hash>` failed three times in
+    nine seconds, `_deploy` read EEXIST as a host-level failure, and instance
+    46668588 was destroyed — reachable, idle, 7 h uptime, 5.46 GB of warm
+    cache — for one bad inode that `rm -f` fixes.
+
+    The self-heal that followed closed the outage and opened a different hole:
+    it removed the offending thing silently, so what WROTE a non-directory into
+    a content-addressed cache path is still unknown, and every future
+    recurrence would have destroyed its own evidence too.
+
+    Run against a real filesystem with a real shell, because the whole thing is
+    shell semantics — `-e`, `-d` and `rm -f` on paths that are variously a
+    directory, a file, a dangling symlink, or absent.
+    """
+    from . import fleet as fleet_mod
+
+    def run(path: str) -> str:
+        return subprocess.run(["bash", "-c", fleet_mod.heal_scene_dir_cmd(path)],
+                              capture_output=True, text=True).stdout
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+
+        # The ordinary case: nothing there yet.
+        fresh = tmp / "fresh"
+        out = run(str(fresh))
+        check("an absent cache path is simply created",
+              fresh.is_dir() and fleet_mod.STRAY_MARK not in out, out[:60])
+
+        # A real cache directory, with a scene in it. Must survive untouched —
+        # this is the case that must never be "healed".
+        live = tmp / "live"
+        live.mkdir()
+        (live / "scene.blend").write_bytes(b"blend-data")
+        out = run(str(live))
+        check("a real cache directory and its contents are never touched",
+              (live / "scene.blend").read_bytes() == b"blend-data"
+              and fleet_mod.STRAY_MARK not in out, out[:60])
+
+        # The failure itself: a plain file where the directory belongs.
+        stray = tmp / "stray"
+        stray.write_bytes(b"PNG-ish bytes that should never have been here")
+        out = run(str(stray))
+        check("a stray file is removed and the directory created",
+              stray.is_dir(), f"is_dir={stray.is_dir()}")
+        check("the stray file is DESCRIBED before removal, not silently deleted",
+              fleet_mod.STRAY_MARK in out and "rw" in out
+              and "P   N   G" in out,
+              " | ".join(out.split("\n")[:3])[:90])
+
+        # A dangling symlink: `-e` is false on it, so a naive `[ -e ]` guard
+        # would skip the heal and leave `mkdir -p` failing forever.
+        dangle = tmp / "dangle"
+        dangle.symlink_to(tmp / "nowhere")
+        out = run(str(dangle))
+        check("a dangling symlink where a scene dir belongs is healed too",
+              dangle.is_dir(), f"exists={dangle.exists()} link={dangle.is_symlink()}")
+
+        # Paths are quoted: a scene digest is hex today, but the quoting is what
+        # stops this being a command injection into a shell running as root.
+        nasty = tmp / "a b; touch pwned"
+        run(str(nasty))
+        check("the path is shell-quoted, not interpolated",
+              nasty.is_dir() and not (tmp / "pwned").exists(),
+              f"pwned={(tmp / 'pwned').exists()}")
+
+
 def test_the_slow_link_signal_is_actually_wired_to_a_fetch() -> None:
     """The seam: a real fetch must PRODUCE the sample the verdict is made of.
 
@@ -3640,6 +3710,7 @@ OFFLINE_TESTS = (
     "test_preemption_must_beat_the_switch_it_costs",
     "test_a_scene_you_can_finish_is_not_yielded",
     "test_a_slow_link_is_a_health_signal",
+    "test_the_scene_dir_self_heal_keeps_the_evidence",
     "test_the_slow_link_signal_is_actually_wired_to_a_fetch",
     "test_priority_reaches_the_scene_choice",
     "test_priority_cannot_starve_a_scene",

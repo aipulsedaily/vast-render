@@ -166,6 +166,45 @@ class CondemnedIds(set):
         self._save()
 
 
+# Printed by `heal_scene_dir_cmd` only when it actually found something wrong,
+# so the caller can tell "healed a stray inode" from "nothing to do" without
+# parsing `ls` output.
+STRAY_MARK = "STRAY"
+
+
+def heal_scene_dir_cmd(scene_dir: str) -> str:
+    """Make `scene_dir` a usable directory, describing anything it displaces.
+
+    `mkdir -p` succeeds on an existing directory and fails only when the path
+    is something else, so an EEXIST here is a corrupted entry in the broker's
+    own cache rather than a statement about the host — and it was read as one
+    anyway, costing instance 46668588 (see the call site).
+
+    Two properties matter and are tested against a real filesystem:
+
+    * a genuine cache directory is never touched, whatever it contains. The
+      removal is reachable only on a path that already failed `-d`.
+    * the stray inode is DESCRIBED before it is removed. Healing silently would
+      guarantee the next recurrence is as unexplained as the last, and the
+      evidence stops existing the instant the fix runs, so it cannot be left
+      for whoever reads the log later.
+    """
+    q = shlex.quote(scene_dir)
+    # `-e` FOLLOWS symlinks, so it is false on a dangling one — and a dangling
+    # symlink is precisely a path that `mkdir -p` refuses with EEXIST while
+    # every "does it exist" test says no. Guarding on `-e` alone therefore
+    # skipped the heal on one of the few shapes that can actually cause the
+    # outage. `-L` catches the link itself, whatever it points at.
+    return (
+        f"if {{ [ -e {q} ] || [ -L {q} ]; }} && [ ! -d {q} ]; then "
+        f"echo {STRAY_MARK}; ls -ld {q}; "
+        f"readlink -f {q} 2>/dev/null; "
+        f"head -c 160 {q} 2>/dev/null | od -An -c | head -4; "
+        f"rm -f {q}; "
+        f"fi; mkdir -p {q}"
+    )
+
+
 class Fleet:
     """One instance, its tunnel, and the money it is spending."""
 
@@ -2082,9 +2121,27 @@ class Fleet:
         #
         # `test -d` first so a real cache directory is never touched: the
         # removal only ever reaches a path that cannot be a scene directory.
-        scene_dir = shlex.quote(remote.scene_dir(digest))
-        remote.run(ep, f"test -d {scene_dir} || rm -f {scene_dir}; mkdir -p {scene_dir}",
-                   timeout=60)
+        #
+        # And it DESCRIBES the thing before removing it. The self-heal above
+        # fixed the outage but destroyed the evidence: `rm -f` ran silently, so
+        # after instance 46668588 was thrown away nothing could say what had
+        # written a non-directory into a content-addressed cache path — the one
+        # root cause that post-mortem could not close. Healing without looking
+        # would have guaranteed the next recurrence was equally unexplained,
+        # and a stray inode is gone the moment it is fixed, so the capture
+        # cannot be left to whoever reads the log afterwards. One round trip,
+        # only on a path that is already known to be wrong.
+        healed = remote.run(ep, heal_scene_dir_cmd(remote.scene_dir(digest)),
+                            timeout=60)
+        if STRAY_MARK in healed:
+            log.warning(
+                "a non-directory was occupying the cache path for %s (hash %s) "
+                "on %s and has been removed. This is the failure that cost "
+                "instance 46668588; it has never been explained, so here is "
+                "what was actually there:\n%s",
+                scenes.label(scene), digest, ep,
+                "\n".join(line for line in healed.splitlines()
+                          if line.strip() and line.strip() != STRAY_MARK))
         self.status = "uploading-scene"
         log.info("pushing scene %s (%.0f MB) hash=%s", scenes.label(scene), size / 1e6, digest)
         self.transfer = {"what": scenes.label(scene), "bytes": size,
