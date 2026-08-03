@@ -3005,9 +3005,15 @@ def test_queued_scenes_are_evicted_last_not_first() -> None:
         ep = remote.Endpoint(host="stub", port=1, instance_id=1)
         # 3.0 G incoming against an 8 G budget and 6 G cached needs 1 G freed —
         # enough that something must go, not enough that everything must.
+        asked = []
+
+        def demand() -> set[str]:
+            asked.append(1)
+            return {"wanted"}
+
         report = remote.evict_to_fit(ep, keep=set(), incoming=int(3.0e9),
                                      budget=int(8e9), reserve=int(2e9),
-                                     state=before, defer={"wanted"})
+                                     state=before, defer=demand)
         gone = {e.digest for e in report.evicted}
         check("a scene with jobs queued is not evicted ahead of idle ones",
               gone == {"idle_a", "idle_b"}, f"evicted {sorted(gone)}")
@@ -3016,10 +3022,21 @@ def test_queued_scenes_are_evicted_last_not_first() -> None:
         # enough, the wanted one goes rather than the disk filling.
         report = remote.evict_to_fit(ep, keep=set(), incoming=int(5.5e9),
                                      budget=int(8e9), reserve=int(2e9),
-                                     state=before, defer={"wanted"})
+                                     state=before, defer=demand)
         check("a deferred scene is still evictable when nothing else fits",
               "wanted" in {e.digest for e in report.evicted},
               f"evicted {sorted(e.digest for e in report.evicted)}")
+
+        # Answering the question costs a content hash per queued scene — 31.3 s
+        # over 9.67 GB, measured on the live queue. A preflight that evicts
+        # nothing must not pay it.
+        asked.clear()
+        report = remote.evict_to_fit(ep, keep=set(), incoming=int(1.0e9),
+                                     budget=int(8e9), reserve=int(2e9),
+                                     state=before, defer=demand)
+        check("a preflight that evicts nothing never asks what is queued",
+              not report.evicted and not asked,
+              f"evicted {len(report.evicted)}, asked {len(asked)}x")
     finally:
         remote.run, remote.disk_state = saved_run, saved_disk
 

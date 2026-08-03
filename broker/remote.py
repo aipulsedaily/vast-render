@@ -1026,7 +1026,7 @@ def effective_budget(state: DiskState, configured: int, reserve: int) -> int:
 
 def evict_to_fit(ep: Endpoint, keep: set[str], *, incoming: int, budget: int,
                  reserve: int, state: Optional[DiskState] = None,
-                 defer: Optional[set[str]] = None) -> Eviction:
+                 defer: "Optional[Callable[[], set[str]]]" = None) -> Eviction:
     """Make room for `incoming` bytes of scene, LRU-first. Verified, not assumed.
 
     Two constraints, and they are deliberately not the same kind of thing:
@@ -1082,9 +1082,19 @@ def evict_to_fit(ep: Endpoint, keep: set[str], *, incoming: int, budget: int,
     need_space = max(0, incoming + reserve - before.free)
     need = max(need_policy, need_space)
 
-    wanted = defer or set()
-    candidates = sorted((s for s in before.scenes if s.digest not in keep),
-                        key=lambda s: (s.digest in wanted, s.used_at))
+    candidates = [s for s in before.scenes if s.digest not in keep]
+    # Asked for only when something is actually going to be deleted. Answering
+    # it means content-hashing every scene the queue still wants, and a cold
+    # memo over the live queue measured 31.3 s for 9.67 GB — a real tax to pay
+    # on the dispatch thread for an ordering that, most passes, orders nothing.
+    if need > 0 and candidates and defer is not None:
+        wanted = defer()
+        if wanted:
+            candidates.sort(key=lambda s: (s.digest in wanted, s.used_at))
+        else:
+            candidates.sort(key=lambda s: s.used_at)
+    else:
+        candidates.sort(key=lambda s: s.used_at)
     evicted: list[SceneEntry] = []
     freed = 0
     for entry in candidates:

@@ -1932,8 +1932,11 @@ class Fleet:
         keep = {digest} | self.protected_scenes()
         # Soft protection for scenes that still have jobs waiting on them:
         # evicted only after every idle scene, never instead of one. See
-        # `demanded_scenes` for why this is an ordering and not a pin.
-        defer = self.demanded_scenes() - keep
+        # `demanded_scenes` for why this is an ordering and not a pin. Passed
+        # as a thunk: answering it costs a content hash per queued scene, and
+        # most preflights evict nothing at all.
+        def defer() -> set[str]:
+            return self.demanded_scenes() - keep
         reserve = int(config.DISK_RESERVE_GB * 1e9)
         state = remote.disk_state(ep)
         self.disk = state
