@@ -447,6 +447,51 @@ Small scenes are unaffected — 2 x 120 s for a 0.2 GB scene is under the floor,
 so they interleave exactly as before. Only a scene that is genuinely expensive
 to reload earns patience, and `SCENE_BATCH_MAX` remains what bounds unfairness.
 
+#### …and a scene you could finish is not yielded
+
+The threshold above compares a WAIT against a COST, which stops discriminating
+once every scene in a contended queue has waited longer than any switch costs.
+Then every scene reads as starving and the dispatcher round-robins a job at a
+time — the same pathology from the other side. Measured 07:51–07:52 with the
+threshold fix already live: two 292 MB scenes, 7 and 6 jobs queued, both
+waiting ~2400 s, alternating every job; 54 s to switch and render one 6.1 s
+frame.
+
+So the dispatcher also asks what the wait cannot: **how much work is on each
+side.** If the loaded scene can be finished in less time than leaving and
+coming back would cost, it is finished. The waiting scene is served seconds
+later and is spared paying for the return trip at all.
+
+#### The bound, and why it needed a test rather than a comment
+
+Every rule above makes the dispatcher keener to hold a loaded scene. Together
+they are how batching becomes starvation with a nicer name, so the bound is
+`SCENE_BATCH_MAX` and it is now enforced rather than asserted.
+
+It used to bound nothing. A capped batch re-ran `oldest_waiting_scene()`
+*without excluding itself*, got itself back — it still held the oldest job —
+and reset the counter, so the cap was reachable forever without ever yielding.
+A scene submitted after a 60-job batch waited for all 60 whatever the cap said.
+The capped re-evaluation now excludes the loaded scene unless nothing else
+wants the GPU.
+
+`test_batching_never_becomes_starvation` is the positive control: with the
+exclusion removed it reports the small scene served **NEVER**; with it, served
+at exactly the cap, after the big scene got a full batch. A bound with no test
+that fails when it is exceeded is a comment.
+
+#### Where the money actually went
+
+`rq status` prints a `time` line: load seconds versus render seconds for the
+current instance, and flags the case where loading exceeded rendering.
+
+Loading a scene is paid GPU time that renders nothing, and this ratio is the
+single most useful number for whether the scheduler is behaving. Nobody knew
+it was upside-down until it was measured by hand off the log. Counted from the
+worker's own `render_sec` — not wall clock, which folds in the fetch and the
+queue wait and flatters the ratio — and a scene load that **failed** still
+counts as load, because the GPU was rented for every one of those seconds.
+
 Eviction learned the same lesson. The scene cache is LRU by last *use*, and a
 scene's stamp is written when it is **selected** — so a scene with jobs merely
 waiting carries the oldest possible timestamp and sorted ahead of idle scenes
