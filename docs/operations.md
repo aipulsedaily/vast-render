@@ -58,6 +58,9 @@ Useful overrides, all `VASTRENDER_`-prefixed:
 | `SCENE_STARVE_SEC` | `300` | **floor** for yielding to another scene whose oldest job has waited this long |
 | `SCENE_PRIO_BOOST_SEC` | `20` | seconds of head start per priority point in the scene choice (lower `prio` = more urgent) |
 | `SCENE_PRIO_BOOST_MAX_SEC` | `1800` | **the bound** — no scene is deferred more than this beyond its FIFO turn, whatever `prio` says |
+| `FETCH_MIN_KBPS` | `200` | download floor; under it the instance cannot return frames and its **offer** is condemned |
+| `FETCH_SAMPLE_MIN_BYTES` | `1000000` | fetches smaller than this measure latency, not bandwidth, and are ignored |
+| `FETCH_MIN_SAMPLES` | `2` | qualifying fetches before a verdict — one slow fetch is a hiccup |
 | `SCENE_SWITCH_PAYBACK` | `2.0` | multiple of the loaded scene's reload cost the wait must beat before preempting |
 | `SCENE_RELOAD_BASE_SEC` | `60` | assumed switch cost before one has been measured |
 | `SCENE_RELOAD_SEC_PER_GB` | `300` | …plus this per GB of scene |
@@ -520,6 +523,51 @@ signal that triggers a switch and the choice of what to switch *to* can never
 disagree about who has waited longest. When they disagreed, a high-priority job
 could win the target query while never clearing the threshold that causes a
 switch at all — priority looking like it works and not working.
+
+#### Download throughput, and the check that could not fail
+
+Every transport check in this broker counts **failures**: a reset, a timeout, a
+round that delivered no new bytes, a spent transport budget. Not one of them
+can see *slow*. A link that delivers, however slowly, never times out, never
+stalls a round, never spends the budget — so an instance that cannot return
+results passes every probe, reports `ready`, and bills.
+
+Measured 2026-08-03 on instance 46695656 (192.0.2.12), three independent
+ways — a multiplexed fetch, a dedicated no-mux fetch that ruled out our own
+`ControlMaster`, and a raw `dd` in each direction:
+
+| | |
+|---|---|
+| RTT | **265 ms** (these hosts normally ~69 ms) |
+| upload | 731 KB/s |
+| **download** | **14 KB/s** — 52x asymmetric, the wrong way round |
+
+A 7.5 MB PNG took over six minutes to fetch against a 16 s render. The farm is
+download-heavy — every frame has to come back — so the box was unusable while
+looking perfectly healthy. It went unnoticed for **68 % of a rental**.
+
+Throughput is a first-class signal now, sampled from the fetches the broker
+already performs. No synthetic probe: a health check that costs bandwidth is
+one that gets switched off.
+
+* **Only fetches ≥ `FETCH_SAMPLE_MIN_BYTES`** are sampled. At 265 ms RTT a
+  small file is nearly all handshake and reports a rate that measures latency,
+  not bandwidth — the same reason a 3 MB scene push logs 0.4 MB/s on a link
+  that does 5 MB/s. Sampling them would condemn healthy hosts.
+* **Median, not mean**, over `FETCH_SAMPLE_WINDOW`. One frame fetched while a
+  scene push shares the link is not evidence about the link.
+* **`FETCH_MIN_SAMPLES` before any verdict** — this ends in a destroyed
+  instance, and one slow fetch is a hiccup.
+* **Checked between jobs, never mid-render.**
+* **Condemns the OFFER, never the machine.** A transport wipeout — every push
+  dead across three rounds — proves a host's link and earns a machine ban. This
+  is one container's measured path over one rental; banning a machine for 24 h
+  on that is heavier than the evidence supports, and condemning the offer is
+  enough to send the next rent elsewhere.
+
+`rq status` prints it, and flags the case:
+
+    fetch    14 KB/s down (median of 2 real fetch(es))   <- TOO SLOW to return frames
 
 #### Where the money actually went
 
