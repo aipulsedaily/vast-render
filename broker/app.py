@@ -1101,6 +1101,17 @@ class Broker:
                     f"sequence {name} stopped at frame {frame} after {len(done)} "
                     f"frame(s) this pass: {remote.diagnose(exc)}"
                 ) from exc
+            except JobRefused:
+                # A verdict about the REQUEST, so it condemns every frame that
+                # would be asked the same question — an over-budget pixel count
+                # or a border that is not a rectangle is identical at frame 401
+                # and frame 402. Treated as a frame failure it burned
+                # FRAME_FAIL_STREAK frames restating the same refusal before
+                # anything stopped. Raised straight through so the job is
+                # failed once, with the answer in front of the agent that has
+                # to change the request. Delivered frames are already recorded
+                # and a resubmit renders only what is missing.
+                raise
             except Exception as exc:
                 why = remote.diagnose(exc)
                 streak += 1

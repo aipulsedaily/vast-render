@@ -24,6 +24,7 @@ leases surviving a crash, retries terminating, and admission control holding.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -2903,6 +2904,18 @@ def test_a_refusal_is_never_retried() -> None:
         check("a terminal reply raises JobRefused, a plain one does not",
               issubclass(app.JobRefused, RuntimeError)
               and not issubclass(RuntimeError, app.JobRefused), "")
+
+        # Inside a SEQUENCE a refusal must not be treated as a frame failure:
+        # the same question is asked of every remaining frame and gets the same
+        # answer, so it used to burn FRAME_FAIL_STREAK frames restating it.
+        # It is re-raised, which means it is NOT caught by the infrastructure
+        # tuple that requeues, and NOT counted by the streak.
+        src = inspect.getsource(app.Broker.run_sequence)
+        refuse_at = src.find("except JobRefused")
+        generic_at = src.find("except Exception as exc:")
+        check("a refusal in a sequence is raised, not counted as a frame failure",
+              refuse_at != -1 and generic_at != -1 and refuse_at < generic_at,
+              f"JobRefused at {refuse_at}, generic at {generic_at}")
 
 
 def test_preemption_must_beat_the_switch_it_costs() -> None:
