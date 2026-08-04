@@ -27,6 +27,7 @@ would be charged to the module rather than to the transfer.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import shlex
 import socket
@@ -39,6 +40,11 @@ from typing import Iterable, Optional
 from . import config, remote
 from .remote import (Endpoint, RemoteError, TransferError, probe, run, ssh_base,
                      tail)
+
+# Its own logger under the "exec" name the ExecService already uses, so the
+# compression line lands beside the staging line it explains rather than in a
+# different stream from it.
+log = logging.getLogger("exec")
 
 BUNDLE_COMPLETE = ".complete"
 
@@ -171,6 +177,55 @@ def bundle_cached(ep: Endpoint, digest: str) -> bool:
     return ran.ok and ran.out.split()[-1:] == ["YES"]
 
 
+def bundle_zstd_level(bundle: Bundle) -> tuple[int, str]:
+    """Which zstd level to push this bundle at, and why — for the log.
+
+    The exec path's mirror of `remote.scene_zstd_level`, and it exists for the
+    same reason that one does: `-19` was hardcoded here, optimising the WIRE
+    ALONE, on a farm whose CPU is the slower half. See
+    `config.BUNDLE_ZSTD_LEVEL` for the measurement — 89.30 s of compression to
+    save 1.44 MB, on a real 38.37 MB bundle.
+
+    Cheaper than the scene version and deliberately so: a bundle is many small
+    files rather than one big one, so there is no "middle of the file" to
+    sample and no magic number that describes the whole. It samples ACTUAL
+    MEMBER BYTES, largest first, because the largest members are what the
+    ratio will be decided by anyway.
+
+    Never raises, for the same reason `scene_zstd_level` never raises: a level
+    is a performance choice and no performance choice is worth failing an
+    upload over.
+    """
+    default = int(config.BUNDLE_ZSTD_LEVEL)
+    cheap = int(config.BUNDLE_ZSTD_LEVEL_PRECOMPRESSED)
+    try:
+        if bundle.bytes < config.BUNDLE_ZSTD_PROBE_MIN_MB * 1e6:
+            return default, f"level {default}"
+        span = int(config.BUNDLE_ZSTD_PROBE_MB * 1e6)
+        sample = bytearray()
+        for path in sorted(bundle.members, key=lambda p: -p.stat().st_size):
+            if len(sample) >= span:
+                break
+            with open(path, "rb") as fh:
+                sample += fh.read(span - len(sample))
+        if len(sample) < 1 << 20:
+            return default, f"level {default}"
+        probed = subprocess.run(["zstd", "-3", "-T6", "-c"], input=bytes(sample),
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=120)
+        if probed.returncode != 0 or not probed.stdout:
+            return default, f"level {default}"
+        ratio = len(sample) / len(probed.stdout)
+        if ratio < config.BUNDLE_ZSTD_MIN_RATIO:
+            return cheap, (f"probes at {ratio:.2f}x — incompressible; "
+                           f"level {cheap} instead of {default}")
+        return default, f"probes at {ratio:.2f}x, level {default}"
+    except Exception as exc:                       # noqa: BLE001 - see docstring
+        log.debug("zstd level probe for bundle %s failed (%s) — using level %d",
+                  bundle.digest[:12], exc, default)
+        return default, f"level {default}"
+
+
 def push_bundle(ep: Endpoint, bundle: Bundle, *, keep_scenes: Optional[set[str]] = None,
                 force: bool = False) -> dict:
     """Stage a bundle on the instance: one streamed tar, verified, marked last.
@@ -216,8 +271,10 @@ def push_bundle(ep: Endpoint, bundle: Bundle, *, keep_scenes: Optional[set[str]]
         ["tar", "-C", str(bundle.root), "-cf", "-", "--", *rel],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
+    level, why = bundle_zstd_level(bundle)
+    log.info("compressing %s at zstd -%d (%s)", bundle.describe(), level, why)
     comp = subprocess.Popen(
-        ["zstd", "-19", "-T4", "-c"],
+        ["zstd", f"-{level}", f"-T{int(config.BUNDLE_ZSTD_THREADS)}", "-c"],
         stdin=tar.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if tar.stdout:

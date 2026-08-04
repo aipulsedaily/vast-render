@@ -420,6 +420,50 @@ SCENE_ZSTD_PROBE_MIN_MB = _env("SCENE_ZSTD_PROBE_MIN_MB", 64.0)
 SCENE_ZSTD_PROBE_MB = _env("SCENE_ZSTD_PROBE_MB", 48.0)
 SCENE_ZSTD_MIN_RATIO = _env("SCENE_ZSTD_MIN_RATIO", 1.15)
 
+# BUNDLE COMPRESSION. The same mistake the scene path was fixed for, left in
+# place on the exec path because of a convention that no longer holds.
+#
+# `push_bundle` hardcoded `zstd -19 -T4`. That was defensible under its stated
+# premise — "the thing being shipped is code, not blends", 7.1 MB of Python — and
+# it stopped being defensible the moment a bundle carried real inputs. MEASURED
+# 2026-08-04 on the actual 96-file / 38.37 MB bundle a live agent submits
+# (8.2 MB Python, 29.6 MB JSON, 0.5 MB CSV):
+#
+#     level 19 -T4    89.30 s    6.46 MB    5.94x     0.43 MB/s
+#     level 12 -T6     5.33 s    7.82 MB    4.90x     7.20 MB/s
+#     level 10 -T6     3.11 s    7.90 MB    4.86x    12.34 MB/s
+#     level  3 -T6     0.33 s    9.09 MB    4.22x   118.04 MB/s
+#
+# **-19 spends 86 extra seconds of CPU to save 1.44 MB of wire.** Even against
+# a pessimistic 1 MB/s uplink that is 86 s bought for 1.4 s saved, and this
+# farm's measured bundle wire is faster than that. It is the identical shape to
+# the scene-path finding — `-19` feeding a 4-5 MB/s wire at 1.3 MB/s — and the
+# identical fix: optimise the SUM of compression and wire, not the wire alone.
+#
+# Caveat kept honest: the 89.30 s was measured on the live local box, which is
+# memory-constrained and was running three other agents' Blender processes. An
+# idle box would do better. That is the operating condition this broker actually
+# runs in, and the ranking between levels is unaffected by contention.
+#
+# Level 10 rather than 3 because the wire is not free either and the difference
+# between them is 2.8 s of CPU for 1.19 MB — the one place on this curve where
+# paying a little CPU is still worth it.
+BUNDLE_ZSTD_LEVEL = _env("BUNDLE_ZSTD_LEVEL", 10)
+
+# For a bundle that is already-compressed bytes (packed textures, .zst/.png
+# assets). Same reasoning as SCENE_ZSTD_LEVEL_PRECOMPRESSED: framing only.
+BUNDLE_ZSTD_LEVEL_PRECOMPRESSED = _env("BUNDLE_ZSTD_LEVEL_PRECOMPRESSED", 1)
+
+# Threads. -T4 was hardcoded alongside -19; the boxes and the local machine both
+# have more than four, and the scene path already uses 6.
+BUNDLE_ZSTD_THREADS = _env("BUNDLE_ZSTD_THREADS", 6)
+
+# Below this, do not bother probing: at a few MB even a bad level choice is
+# under a second, and reading the sample costs more than it saves.
+BUNDLE_ZSTD_PROBE_MIN_MB = _env("BUNDLE_ZSTD_PROBE_MIN_MB", 8.0)
+BUNDLE_ZSTD_PROBE_MB = _env("BUNDLE_ZSTD_PROBE_MB", 16.0)
+BUNDLE_ZSTD_MIN_RATIO = _env("BUNDLE_ZSTD_MIN_RATIO", 1.15)
+
 # --- blank-frame detection ------------------------------------------------
 #
 # Thresholds for `broker/imgstat.py`, all on luminance normalised to 0..1.

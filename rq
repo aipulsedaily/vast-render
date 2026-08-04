@@ -17,6 +17,7 @@ from a previous render.
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import json
 import os
@@ -285,6 +286,143 @@ def cmd_render(a: argparse.Namespace) -> int:
     return 0
 
 
+def import_closure(root: str, entry: str) -> list[str]:
+    """The entry script and every module under `root` it transitively imports.
+
+    WHY THIS IS IN THE TOOL AND NOT IN EACH AGENT'S HEAD. `--include` is a set
+    of globs, and the globs people actually write are directory-shaped:
+    `world/*.py`, `world/items/*.py`. That draws in every file those directories
+    happen to contain — measured 2026-08-04 on a live submission, 96 files and
+    38.3 MB to run a script whose real closure is SIX modules. On a tree eight
+    agents are editing, a bundle that wide is a moving target: the digest is
+    recomputed at dispatch, so any unrelated save between submit and dispatch
+    fails the job with StaleBundle. Narrowing the bundle is not tidiness, it is
+    what makes an exec job survive contact with a busy repository.
+
+    HOW THE SEARCH PATH IS FOUND. These scripts are `blender -P` entry points,
+    not importable packages, so they set their own path at the top:
+
+        R2 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for _p in (os.path.join(R2, "tools"), os.path.join(R2, "world"), ...):
+            sys.path.insert(0, _p)
+
+    So the script DECLARES where its imports live, and this reads that
+    declaration rather than guessing: every string literal appearing anywhere
+    inside a `sys.path.insert`/`append` call is taken as a candidate directory
+    relative to the root. The entry's own directory and the root are always
+    searched too.
+
+    DELIBERATELY STATIC AND DELIBERATELY OVER-INCLUSIVE. It walks `import` and
+    `from ... import` at every nesting depth, so the deferred imports these
+    build scripts do inside `main()` are caught — that is where four of the six
+    modules in the measured case live. Anything it cannot resolve to a file
+    under `root` is skipped in silence, which is the correct answer for `bpy`,
+    `numpy` and the standard library: those are on the box already.
+
+    It cannot see `importlib.import_module(name)` built from a variable. If a
+    bundle turns out to be missing a module, the failure is a clean ImportError
+    naming it, and `--include` still works and still composes with this.
+    """
+    root_p = os.path.realpath(root)
+    entry_p = os.path.realpath(os.path.join(root_p, entry))
+    if not entry_p.startswith(root_p + os.sep):
+        raise SystemExit(f"rq exec: --entry {entry} is outside --root {root}")
+
+    def search_dirs(path: str) -> list[str]:
+        """Where this file's imports might live: its own directory, the root,
+        and any string constant in it that names a real directory under root.
+
+        DELIBERATELY LOOSE, and the first version was not, which is why this
+        comment exists. Matching only literals *inside* a `sys.path.insert(...)`
+        call looked precise and found 2 of the 6 modules in the measured case,
+        because the idiom these scripts actually use puts the literal in the
+        loop, not in the call:
+
+            for _p in (os.path.join(R2, "tools"), os.path.join(R2, "world"),
+                       os.path.join(R2, "world/items"), os.path.join(R2, "anim")):
+                sys.path.insert(0, _p)
+
+        `insert`'s argument is `_p`, a Name. Statically chasing that is a
+        dataflow problem, and the next script would spell it differently again.
+
+        So: take every string constant that IS a directory under the root. It
+        cannot reach outside the root, and being wrong only means searching a
+        directory that holds no matching module — while being too strict means
+        silently shipping an incomplete bundle, which fails on the box as an
+        ImportError charged to the wrong thing.
+        """
+        # Every directory from the file's own up to the root. This is the OTHER
+        # idiom, and it has no literals at all to match on:
+        #
+        #     _HERE  = os.path.dirname(os.path.abspath(__file__))
+        #     _WORLD = os.path.dirname(_HERE)
+        #     for _p in (_WORLD, _HERE): sys.path.insert(0, _p)
+        #
+        # Without this, `world/items/x.py` importing `itemkit` (which lives in
+        # `world/`) resolves to nothing and the module is silently dropped —
+        # measured, on spectator_crowd_world.py, which lost both `itemkit` and
+        # `humankit` that way.
+        dirs = []
+        here = os.path.dirname(path)
+        while here.startswith(root_p):
+            dirs.append(here)
+            if here == root_p:
+                break
+            here = os.path.dirname(here)
+        if root_p not in dirs:
+            dirs.append(root_p)
+        try:
+            tree = ast.parse(open(path, "rb").read(), filename=path)
+        except (OSError, SyntaxError):
+            return dirs
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                text = node.value
+                if not text or os.path.isabs(text) or ".." in text.split(os.sep):
+                    continue
+                cand = os.path.realpath(os.path.join(root_p, text))
+                if cand.startswith(root_p) and os.path.isdir(cand) and cand not in dirs:
+                    dirs.append(cand)
+        return dirs
+
+    def resolve(mod: str, dirs: list[str]) -> str:
+        top = mod.split(".")[0]
+        for d in dirs:
+            for cand in (os.path.join(d, *mod.split(".")) + ".py",
+                         os.path.join(d, top + ".py"),
+                         os.path.join(d, *mod.split("."), "__init__.py")):
+                real = os.path.realpath(cand)
+                if os.path.isfile(real) and real.startswith(root_p + os.sep):
+                    return real
+        return ""
+
+    seen: set = set()
+    order: list = []
+    stack = [entry_p]
+    while stack:
+        path = stack.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        order.append(path)
+        dirs = search_dirs(path)
+        try:
+            tree = ast.parse(open(path, "rb").read(), filename=path)
+        except (OSError, SyntaxError):
+            continue
+        names: list = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names += [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                names.append(node.module)
+        for mod in names:
+            found = resolve(mod, dirs)
+            if found and found not in seen:
+                stack.append(found)
+    return sorted(os.path.relpath(p, root_p) for p in order)
+
+
 def cmd_exec(a: argparse.Namespace) -> int:
     """Queue one `blender -b -P <entry>` run on the rented box's CPUs.
 
@@ -306,8 +444,24 @@ def cmd_exec(a: argparse.Namespace) -> int:
         "blender_args": a.blender_arg or ["-b", "--factory-startup"],
         "cpu_slots": a.slots,
     }
+    patterns = list(a.include or [])
+    if a.closure:
+        found = import_closure(a.root, a.entry)
+        # Union, not replacement: data files (.json manifests, .csv telemetry)
+        # are read at runtime and no import graph can see them, so `--include`
+        # stays the way to name those and the two compose.
+        for rel in found:
+            if rel not in patterns:
+                patterns.append(rel)
+        print(f"  closure: {len(found)} module(s) from {a.entry}"
+              + (f" + {len(a.include or [])} explicit --include pattern(s)"
+                 if a.include else ""), file=sys.stderr)
+        for rel in found:
+            print(f"    {rel}", file=sys.stderr)
+    if not patterns:
+        raise SystemExit("rq exec: give --include, or --closure, or both")
     body = {"spec": spec, "agent": a.agent, "prio": a.prio,
-            "bundle_root": a.root, "bundle_patterns": a.include}
+            "bundle_root": a.root, "bundle_patterns": patterns}
     resp = call("POST", "/exec", body)
     if "error" in resp:
         print(json.dumps(resp, indent=2), file=sys.stderr)
@@ -1071,9 +1225,17 @@ def main() -> int:
     x.add_argument("--root", required=True,
                    help="local directory the bundle is taken from; must sit "
                         "inside a permitted bundle root")
-    x.add_argument("--include", action="append", required=True, metavar="GLOB",
-                   help="glob relative to --root; repeatable. This is the whole "
-                        "input, content-addressed at submit")
+    x.add_argument("--include", action="append", metavar="GLOB",
+                   help="glob relative to --root; repeatable. Content-addressed "
+                        "at submit. Optional if --closure is given")
+    x.add_argument("--closure", action="store_true",
+                   help="derive the bundle from --entry's transitive imports "
+                        "(the module and what it imports, nothing else). "
+                        "PREFER THIS: a directory-shaped --include on a tree "
+                        "other agents are editing fails with StaleBundle when "
+                        "any unrelated file is saved between submit and "
+                        "dispatch. Composes with --include for data files, "
+                        "which no import graph can see")
     x.add_argument("--entry", required=True,
                    help="script to run, relative to the bundle root")
     x.add_argument("--arg", action="append", default=[],
