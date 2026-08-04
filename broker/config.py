@@ -874,7 +874,13 @@ EXEC_BUSY_BACKOFF_SEC = _env("EXEC_BUSY_BACKOFF", 90.0)
 # possibly work, not a promise that anything passing it will succeed. Set it
 # higher to be stricter; a job that passes and dies anyway still requeues as a
 # wait rather than as a verdict.
-EXEC_SCENE_MEM_FACTOR = _env("EXEC_SCENE_MEM_FACTOR", 3.0)
+# RAISED 3.0 -> 5.5 THE SAME DAY, BY THE GATE FAILING TO FIRE. With 3.0 a
+# 7.97 GB scene demanded 23.9 GB, the box reported more than that, the job was
+# admitted and was OOM-killed at `Read blend` anyway - twice, burning its retry
+# budget both times. The 5.3x resident measurement was right and hedging below
+# it bought nothing: a gate set under the known cost is not conservative, it is
+# just a gate that does not fire. 5.5 sits just above it.
+EXEC_SCENE_MEM_FACTOR = _env("EXEC_SCENE_MEM_FACTOR", 5.5)
 
 MAX_QUEUE_DEPTH = _env("MAX_QUEUE_DEPTH", 200)
 MAX_PER_AGENT_QUEUED = _env("MAX_PER_AGENT", 25)
