@@ -110,6 +110,20 @@ class ExecError(ValueError):
     """Rejected exec submission. Message is safe to hand back over HTTP."""
 
 
+class ExecMemoryShort(RuntimeError):
+    """The box has not got the memory to open this job's scene RIGHT NOW.
+
+    A WAIT, not a verdict, and it exists as its own class so it cannot be
+    mistaken for one. The alternative is what actually happened on 2026-08-04:
+    the child is SIGKILLed at `Read blend`, `exited -9` is not a transport
+    class, all three attempts burn inside ninety seconds, and the job reports
+    `3/3` as though the build had been tried and found wanting.
+
+    Held to the same rule as WorkerBusy: refunded, and backed off long enough
+    that the retry lands somewhere different from the attempt.
+    """
+
+
 class StaleBundle(ValueError):
     """The code changed between submit and dispatch. TERMINAL ON SIGHT.
 
@@ -457,6 +471,36 @@ class ExecService:
         except Exception as exc:
             log.debug("exec purge skipped: %s", remote.diagnose(exc))
 
+    def refuse_if_memory_is_short(self, spec: dict) -> None:
+        """Do not start a scene-opening job the box cannot hold. See
+        config.EXEC_SCENE_MEM_FACTOR for the measurement and the reasoning.
+
+        Asks the exec SERVER rather than reading /proc over ssh, because the
+        server already reports `mem_available` on every ping and that is the
+        number its own children will be competing for. A server that will not
+        answer is not evidence of plenty, but it is also not this check's job to
+        adjudicate - it says nothing and lets the existing readiness path deal
+        with an unreachable server.
+        """
+        if not spec.get("scene_digest") or not spec.get("scene_bytes"):
+            return
+        need = int(spec["scene_bytes"]) * float(config.EXEC_SCENE_MEM_FACTOR)
+        try:
+            pong = execremote.exec_call({"cmd": "ping"}, timeout=30)
+        except Exception:
+            return
+        avail = float((pong or {}).get("mem_available") or 0.0)
+        if avail <= 0:
+            return
+        if avail < need:
+            raise ExecMemoryShort(
+                f"opening {spec['scene_name']} ({int(spec['scene_bytes'])/1e9:.2f} GB) "
+                f"needs about {need/1e9:.1f} GB free and the box has "
+                f"{avail/1e9:.1f} GB — the render worker is holding a scene of "
+                f"its own. Waiting rather than being OOM-killed at `Read blend`, "
+                f"which would spend this job's whole retry budget in ninety "
+                f"seconds and report it as a failed build.")
+
     def ensure_scene_staged(self, ep: remote.Endpoint, spec: dict) -> None:
         """Put this job's input scene in the instance's cache, if it asked for one.
 
@@ -556,7 +600,8 @@ class ExecService:
                 self.db.fail_terminal(job_id, why)
                 log.error("exec job %s FAILED on DISK and will NOT be retried — %s",
                           job_id, why)
-            elif isinstance(exc, (remote.WorkerBusy, remote.FleetUnavailable)):
+            elif isinstance(exc, (remote.WorkerBusy, remote.FleetUnavailable,
+                                  ExecMemoryShort)):
                 # A WAIT, NOT A VERDICT. `WorkerBusy` says "a frame is in flight
                 # right now" — a condition that clears on its own, usually
                 # within a minute. Failing the job for it is answering "not yet"
@@ -613,6 +658,7 @@ class ExecService:
                 f"want — a build filed under a request for different code is not "
                 f"something this broker will do quietly."
             )
+        self.refuse_if_memory_is_short(spec)
         self.ensure_scene_staged(ep, spec)
         info = execremote.push_bundle(ep, bundle,
                                       keep_scenes=self.fleet.protected_scenes())

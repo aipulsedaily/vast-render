@@ -851,6 +851,31 @@ def worker_ready_budget(scene_bytes: int) -> float:
 # waits for the SCHEDULER; this bounds how long it waits for the DEPLOY GUARD.
 EXEC_BUSY_BACKOFF_SEC = _env("EXEC_BUSY_BACKOFF", 90.0)
 
+# HOW MUCH FREE MEMORY A SCENE-OPENING EXEC JOB REQUIRES, AS A MULTIPLE OF THE
+# SCENE'S SIZE ON DISK — and why refusing is better than trying.
+#
+# A rented box's RAM is shared between the render worker and every exec child.
+# Measured 2026-08-04: `prove_items_cheap` opening the 7.97 GB film16_breach
+# assembly was SIGKILLed at `Read blend` with the box reporting 0.0 GB
+# available, while the render worker held the same assembly for the ladder pass.
+# Exec did not fail to get memory; it lost a race with the renderer for it.
+#
+# The cost of losing that race is not just the wasted work. `exited -9` is not
+# a transport class, so it burned all three attempts in ninety seconds, and
+# `attempts 3/3` reads as "tried and found wanting" when the truth is "the box
+# was out of memory three times". That is the third time in one day that a
+# RESOURCE CONDITION HAS WORN THE COSTUME OF A VERDICT ABOUT THE WORK -
+# `WorkerBusy` burning attempts, a wrong path accusing the data, and now this.
+# Each one sends the next person to the wrong place.
+#
+# THE FACTOR IS NOT 1. The only resident-memory measurement this project has is
+# 22 GB for a 4.17 GB scene - 5.3x - from the `_wait_for_worker` incident. 3.0
+# is deliberately BELOW that: this is a gate against the case that cannot
+# possibly work, not a promise that anything passing it will succeed. Set it
+# higher to be stricter; a job that passes and dies anyway still requeues as a
+# wait rather than as a verdict.
+EXEC_SCENE_MEM_FACTOR = _env("EXEC_SCENE_MEM_FACTOR", 3.0)
+
 MAX_QUEUE_DEPTH = _env("MAX_QUEUE_DEPTH", 200)
 MAX_PER_AGENT_QUEUED = _env("MAX_PER_AGENT", 25)
 
