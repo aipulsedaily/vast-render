@@ -5,6 +5,63 @@ thing it first looked like. Newest first.
 
 ---
 
+## 2026-08-04 — OPEN DEFECTS: a sequence never yields, and `rq exec` refuses instead of queueing
+
+Both are **open**. Both were worked around on 2026-08-04 by adding a second
+broker and routing bulk work to it, and a workaround is why they need writing
+down: with pinning in place the symptom mostly disappears, and the next person
+to see it will otherwise conclude the queue was merely deep.
+
+### `run_sequence` does not yield between frames
+
+**This is the root cause of the 6:1 wait-to-work ratio, not queue depth.**
+
+Measured over one 7.6 h instance life: the queue held **11 jobs, roughly 660 s
+of render work**, while the longest-waiting scene had been waiting **4,086 s**.
+Six times as much waiting as there was work to do. That is not a capacity
+shortage and adding capacity does not fix it.
+
+The cause is that a sequence job runs its whole frame loop inside one
+`dispatch_once`. Two `r1full` jobs took **7,461 s and 2,739 s — 10,200 s, 37 %
+of the instance's life** — and for all of it seven other agents' ~60 s
+verification renders could not run, because there is no yield point between
+frames at which the dispatcher can reconsider. Every frame is an independent
+74 s unit of work; nothing about the job requires them to be contiguous.
+
+Note the interaction with the scene-switch veto: `cheaper_to_finish` was fixed
+in `1fe0de4` to price a sequence at its real remaining work, which correctly
+stops the veto from rubber-stamping a 21-hour job as "nearly done". But that
+governs which scene is chosen NEXT — it cannot preempt a sequence already
+running, because there is no point at which control returns.
+
+**Mitigated, not fixed**, by pinning bulk sequence work to its own broker
+(`docs/multi-gpu.md`). A second card relieves the blocking; it does not remove
+it, and a single broker running a long sequence still starves everything
+behind it.
+
+### `rq exec` fails `WorkerBusy` instead of queueing behind a render
+
+`exec` work is refused outright while the worker is rendering, rather than
+waiting for it. From the live log, three escalating attempts inside four
+seconds and then a hard failure:
+
+```
+10:26:34 ERROR exec  exec job 69d028eb4b65 queued: WorkerBusy: refusing to restart the worker ...
+10:26:36 ERROR exec  exec job 69d028eb4b65 queued: WorkerBusy: ... at sample 80/400, 1.1 min in
+10:26:37 ERROR exec  exec job 69d028eb4b65 failed: WorkerBusy: ... at sample 192/400, 1.1 min in
+```
+
+The refusal itself is correct and must stay — it is the guard that stops a
+worker restart discarding a frame in flight, and it was written after a
+40-minute 8K render was thrown away. The defect is the **verdict**: a job that
+cannot run *yet* is failed as though it could never run, when the same
+condition would clear on its own within a minute.
+
+**Two workers do NOT fix this.** The brokers do not share a queue, so a broker
+whose own worker is busy still refuses; it has no idea the other card is idle.
+Routing exec to the bulk broker (`VASTRENDER_URL=http://127.0.0.1:8761 rq exec`)
+is a workaround that happens to land on an idle box, not a fix.
+
 ## 2026-08-03 — the stray inode that destroyed a healthy instance, and the fix that ate the evidence
 
 `mkdir -p /workspace/scenes/139698d62abee3bf` (relief_2light_A2.blend) failed
