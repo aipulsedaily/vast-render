@@ -9,11 +9,14 @@
 
 # Rendered output -- 12 GB and entirely regenerable
 out/
+out2/
 
 # Live broker state: the SQLite job database, its WAL, logs, locks, and the
 # provisioned-instance record. Machine state, not source, and it changes every
 # few seconds while the broker runs.
 state/
+# The second broker's state. Same reasoning; see scripts/broker2.sh.
+state2/
 *.db
 *.db-shm
 *.db-wal

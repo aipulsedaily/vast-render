@@ -537,6 +537,21 @@ LOCK_PATH = Path(_env("LOCK", str(ROOT / "state" / "broker.lock")))
 # --- remote ---------------------------------------------------------------
 
 WORKER_PORT = _env("WORKER_PORT", 8799)   # on the instance, reached via tunnel
+
+# The LOCAL end of the ssh forward to WORKER_PORT. It was a hardcoded default
+# argument on `Fleet.__init__`, and that made it a booby trap for any second
+# broker on this machine: `app` calls `remote.reap_stale_tunnels(local_port)` at
+# startup, which pgreps for `-L <local_port>:127.0.0.1:<WORKER_PORT>` and
+# SIGKILLs every match that is not its own child. A second broker starting on
+# the same port does not fail to bind and back off — it kills the FIRST
+# broker's tunnel, mid-frame, and the first broker learns about it as a
+# transport failure on a box it will then suspect of being bad hardware.
+#
+# It is env-driven so a second broker can be given 8796 and be structurally
+# unable to reach the first one's forward. The default is unchanged, so a
+# restart of the existing broker picks up exactly the port it already had.
+TUNNEL_LOCAL_PORT = _env("TUNNEL_LOCAL_PORT", 8798)
+
 REMOTE_ROOT = _env("REMOTE_ROOT", "/workspace")
 SSH_KEY = Path(_env("SSH_KEY", str(Path.home() / ".ssh" / "id_vast_render")))
 

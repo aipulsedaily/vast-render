@@ -5,6 +5,15 @@
 next person to price it does not re-derive it, and so the one thing that would
 make it a *regression* is written down before anyone starts.
 
+> **A SECOND CARD IS NOW RUNNING, AND IT IS NOT THIS.** See "Two brokers, one
+> card each" at the bottom. Everything below is about N workers inside ONE
+> broker driving ONE box, which is still unbuilt. The second card was obtained
+> instead by running a SECOND BROKER PROCESS, which needs none of it: every
+> single-instance assumption in `Fleet` stays true inside each process. Read
+> that section before starting any of the work sized below — it may already
+> cover what you need, and it cost 3 lines of behaviour change rather than
+> 1,100.
+
 ## The dollar case does not exist. The time case does.
 
 Measured against the live market and the live farm on 2026-08-04. A full rung-1
@@ -181,3 +190,134 @@ worse than an exclusive single card**. Rent it per-pass for the master and for
 full ladder runs, and destroy it after. (Honest caveat: queues build partly
 *because* the box is a bottleneck, so this overstates steady-state depth — and
 understates it, because agents throttle themselves to a slow farm.)
+
+---
+
+# Two brokers, one card each — BUILT 2026-08-04
+
+The farm had one card and eight agents on it. This is what was added, what was
+measured first, and the two things that would have destroyed the running farm.
+
+## What the broker already supported: one instance, and it enforces that
+
+There was no partial multi-worker support to finish. `Fleet`'s own docstring is
+`"""One instance, its tunnel, and the money it is spending."""`, and the
+singularity is not an oversight, it is enforced:
+
+* **`Fleet.adopt_or_reap` DESTROYS every labelled instance except the one it
+  adopts.** Renting a second card under the same label does not give you two
+  workers; it gives you one worker and a destroyed box, at the first restart.
+* `reconcile` is a *ghost check* — "does the instance I am bound to still exist
+  on vast.ai" — not fleet management. It fetches the full `our_instances` list
+  every cycle and discards everything but `mine.get(iid)`.
+* The **bandwidth ceiling** (`MAX_INET_COST_PER_TB`) is an offer *filter*, and
+  the **auto-migrate to cheaper offers does not exist in this tree at all** —
+  no code, no flag, no dead branch. A dead-code sweep over every `def` in
+  `fleet.py`, `app.py` and `vastctl.py` found zero unreferenced functions. The
+  only price-awareness is rent-time ranking (`estimate_cost`), consulted once
+  from `_rent`. Instance replacement exists but is quality-driven
+  (`condemn_slow_link`, stalled rounds), never price-driven.
+
+So it was a development job, not a provisioning job — but a *small* one, because
+the unit that has to be duplicated is the **process**, not the worker.
+
+## The two things that would have killed the farm
+
+Both are load-bearing. Neither is obvious.
+
+1. **The label is the entire definition of "mine", and the filter is
+   `startswith`.** A second broker labelled `renderbroker2` is matched by
+   `renderbroker`, so broker 1 would adopt-or-reap it out from under a running
+   frame at its next restart. The second prefix must share no prefix with the
+   first: `ladderbroker`, not `renderbroker-ladder`. `LABEL_PREFIX` is now
+   `VASTRENDER_LABEL`, default unchanged.
+
+2. **`local_port` was a hardcoded default argument, and startup reaps it.**
+   `app` calls `remote.reap_stale_tunnels(local_port)`, which pgreps for
+   `-L <port>:127.0.0.1:<WORKER_PORT>` and SIGKILLs every match that is not its
+   own child. A second broker on the default 8798 does not fail to bind and back
+   off — **it kills the first broker's tunnel, mid-frame**, and broker 1 reads
+   that as a transport failure on a box it may then condemn as bad hardware.
+   Now `config.TUNNEL_LOCAL_PORT`, default unchanged; broker 2 uses 8796.
+
+Because the prefixes are disjoint, **nothing about broker 1 had to change and it
+was never restarted.** Its tunnel was verified as the only one on 8798, and its
+in-flight frame ran through the whole exercise untouched.
+
+## What is NOT shared, and is therefore a routing decision
+
+There is no load balancing and that is deliberate. A job submitted to 8760 can
+never be served by 8761. Also per-broker, and each reports as if it were the
+whole truth: `rq status`, `rq budget`'s `spent`, `MAX_BATCH_USD`, and — the
+sharp one — **`rq teardown`, which destroys one card and reports success while
+the other keeps billing.** Only `rq budget`'s `credit` line is account-wide.
+
+## Send it bulk sequence work on ONE scene. Nothing else pays.
+
+A cold worker must be sent every scene it renders over a single unresumable
+`zstd -c | ssh zstd -d` stream. Measured on the live farm 2026-08-04:
+
+| | cost |
+|---|---|
+| push a ~5 GB film scene | **290–460 s** (12.75 MB/s raw on the Thailand host; 62 MB/s raw on a good one) |
+| one 720p/64 ladder frame | 74–76 s |
+| one 4K verification still | 53–90 s |
+
+* **Bulk, one scene:** one push amortised over a 21 h pass = **0.4 % overhead.**
+* **Short stills, five scenes:** 5 × ~300 s of push to enable ~750 s of render
+  — **2.8x more upload than render.** The second card would finish them *slower
+  than the queue it was bought to relieve.*
+
+**Bandwidth is not the ceiling and that was checked.** The local uplink sustains
+≥27 MB/s wire (62 MB/s raw at the measured zstd 2.29x); the 12.75 MB/s seen on
+the live push is the *host's* ingest limit. Two pushes to two different hosts do
+not contend locally — broker 2's 481 MB Blender bundle pushed at 11.88 MB/s
+while broker 1 was mid-render on its own box.
+
+## Why capacity was the right lever here, and the number that says so
+
+The queue was **not deep — it was blocked.** Depth 11, roughly 660 s of render
+work outstanding, against observed waits of **4,086 s**. A 6:1 wait-to-work
+ratio is the signature of blocking, not of insufficient capacity.
+
+What blocks it is bulk sequence work, because **`run_sequence` does not yield
+between frames**: two `r1full` jobs consumed 7,461 s and 2,739 s — 10,200 s,
+**37 % of a 7.6 h instance life** — during which seven agents' 60 s verification
+renders could not run at all.
+
+Scene switching cost 2,975 s (10.9 %) over the same window, and
+**`film14_breach_*` — the ladder family — is 47 % of it** (13 switches,
+1,385 s). Moving the ladder to its own card removes that from the shared box
+*and* stops a 5 GB scene evicting the stills cache.
+
+Beware the obvious mismeasurement: **`broker.log` lines carry `HH:MM:SS` and no
+date.** Filtering "since 10:15" across a multi-day log gives 30 % switching
+overhead. Anchor on a line unique to the current instance — the boot-time
+`scene cache 0.00G in 0 scene(s)` — and the real figure is 10.9 %.
+
+## The cheap fix that is not a GPU: the disk is smaller than the working set
+
+`vastctl.DEFAULT_DISK_GB` was 30, leaving a ~23 GB scene cache. Five ~5 GB film
+scenes rotate through it, so **the working set does not fit and scenes evict and
+re-push each other all day** — 8 of 19 expensive switches were re-pushes of a
+scene the box had already had. Disk is $0.20/GB/month: **80 GB costs ~$0.022/hr,
+less than one re-push of a 5 GB scene, per hour, forever.** Now
+`VASTRENDER_DISK_GB`, default unchanged; broker 2 rents 80 GB. Exclusive supply
+is completely insensitive to it — 8 offers at `disk>45`, `disk>75` and
+`disk>95` alike.
+
+**Raising broker 1's disk is the single best remaining spend on this farm and it
+has not been done** (it needs a re-rental, which needs a restart in a gap).
+
+## Price the card post-filter, never on the headline
+
+Cheapest *exclusive* 5090 meeting the full production filter on 2026-08-04 was
+**$0.4681/hr**, not the ~$0.45 assumed — plus $0.0219/hr for the 80 GB disk =
+**$0.490/hr all-in**. `cpu_cores_effective>=32` is already in `build_query`, so
+shopping happens post-filter and the "$0.3936/hr exclusive with 20 effective
+cores" trap cannot recur. `gpu_frac>=0.99` likewise.
+
+**Note what this exposed: broker 1's own card is `gpu_frac 0.125`** — a shared
+eighth of a box, the exact R2-382 co-tenant class, rented before the
+exclusivity preference landed and never replaced. It is $0.4203/hr against
+$0.490 for an exclusive card with 2.7x the disk.

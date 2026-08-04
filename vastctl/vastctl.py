@@ -61,8 +61,32 @@ except ModuleNotFoundError:
 
 # --- policy ---------------------------------------------------------------
 
-LABEL_PREFIX = "renderbroker"
-DEFAULT_DISK_GB = 30          # 285 MB blend + ~7 GB output + image + Blender
+# THE LABEL IS THE OWNERSHIP BOUNDARY, AND IT IS THE ONLY ONE.
+#
+# `our_instances` selects on this prefix and `Fleet.adopt_or_reap` DESTROYS
+# every instance it returns except the one it adopts. So the label is not a
+# cosmetic tag: it is the entire definition of "mine", and two brokers sharing
+# it cannot coexist for one round of adoption. The second one reaps the first
+# one's GPU out from under a running frame.
+#
+# Making it settable is what allows a SECOND, fully independent broker (its own
+# DB, port, lock and state directory) to drive a second rented card without any
+# change to the running one. The running broker keeps the default in memory and
+# would re-read the same default on restart, so nothing about it changes.
+#
+# THE SECOND PREFIX MUST NOT START WITH THE FIRST. The filter is `startswith`,
+# so "renderbroker2" is matched BY "renderbroker" — a second broker labelled
+# that way would be visible to the first, and reaped by it. Pick a disjoint
+# word: "ladderbroker", not "renderbroker-ladder".
+LABEL_PREFIX = os.environ.get("VASTRENDER_LABEL") or "renderbroker"
+
+# Disk is rented per instance and sized here. 30 GB leaves a ~23 GB scene cache
+# after Blender and the image, which is SMALLER THAN THE LIVE WORKING SET —
+# measured 2026-08-04, five ~5 GB film scenes rotating through a 23 GB budget
+# evicted and re-pushed each other all afternoon. Overridable so a box rented
+# for one bulk sequence, or for a working set that does not fit, can pay the
+# ~$0.02/hr that a 100 GB disk costs instead of re-uploading 5 GB at a time.
+DEFAULT_DISK_GB = int(os.environ.get("VASTRENDER_DISK_GB") or 30)
 # `base`, not `devel`: Blender 5.2 ships precompiled sm_120 cubins and never
 # invokes nvcc, so the ~5 GB toolkit in the devel image buys nothing and cost
 # ~6 minutes of image pull on the first live boot. The driver itself is injected

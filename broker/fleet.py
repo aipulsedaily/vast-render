@@ -296,7 +296,7 @@ class Fleet:
     def switch_cost(self, value: dict) -> None:
         self._bound().switch_cost = value
 
-    def __init__(self, local_port: int = 8798):
+    def __init__(self, local_port: int = config.TUNNEL_LOCAL_PORT):
         self.client = VastAI(raw=True, quiet=True)
         self.local_port = local_port
         # Bound to the instance that earned them; see _PerInstance. Created
