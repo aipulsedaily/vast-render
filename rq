@@ -29,6 +29,18 @@ from typing import Any, Optional
 BASE = os.environ.get("VASTRENDER_URL", "http://127.0.0.1:8760")
 AGENT = os.environ.get("VASTRENDER_AGENT", os.environ.get("USER", "anon"))
 
+# Where a `get` with no -o puts the file. It used to be a bare "<job>.png",
+# which is relative, so the frame landed in whatever directory the calling
+# shell happened to be sitting in. On 2026-08-04 that was the read-only
+# reference tree /home/zany/opus5-car-render, twice — the agent never named a
+# path and had no reason to think it was choosing one. An absolute default
+# next to the broker's own copies makes the destination a property of the
+# tool instead of a property of the caller's cwd; -o still overrides, and a
+# relative -o is still resolved against the cwd, which is what someone who
+# passes -o actually means.
+GET_DIR = os.environ.get("VASTRENDER_GET_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "out")
+
 # How long to keep re-offering a request that was REFUSED — see call(). 0
 # restores the old fail-immediately behaviour; the bound exists so a genuinely
 # dead broker is still an error rather than a hang.
@@ -780,7 +792,15 @@ def cmd_get(a: argparse.Namespace) -> int:
         print(f"  {state}" + (f"  {detail}" if detail else "") + "...", file=sys.stderr)
         time.sleep(5)
 
-    download(a.job_id, a.out or f"{a.job_id}.png")
+    dest = a.out or os.path.join(GET_DIR, f"{a.job_id}.png")
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+    download(a.job_id, dest)
+    # Say where it went. With a default that is no longer the cwd, a caller who
+    # omitted -o cannot otherwise tell — and silently writing somewhere the
+    # caller did not choose is how the cwd version went unnoticed for so long.
+    if not a.out:
+        print(f"{a.job_id}  -> {dest}", file=sys.stderr)
     return 0
 
 
@@ -1052,7 +1072,9 @@ def main() -> int:
     g = sub.add_parser("get", help="download a finished render")
     g.add_argument("job_id")
     g.add_argument("-o", "--out",
-                   help="save the PNG here if it is ready; does NOT imply --wait")
+                   help="save the PNG here if it is ready; does NOT imply --wait. "
+                        f"Default: {GET_DIR}/<job_id>.png — an absolute path, so a "
+                        "bare `rq get` never writes into the caller's cwd")
     g.add_argument("--wait", action="store_true",
                    help="block until the job finishes instead of exiting 3")
     g.add_argument("--timeout", type=float, default=0,

@@ -484,6 +484,73 @@ def test_blank_still_fails_terminally_unless_allowed() -> None:
               f"state={row['state']} attempts={row['attempts']}")
 
 
+def test_a_black_frame_on_a_scene_that_used_to_work_gets_one_retry() -> None:
+    """Blackness that arrives suddenly is a farm question, not a camera question.
+
+    2026-08-04: film14_breach_r6b.blend, unchanged on disk, rendered four
+    correct frames (07:54-07:59) and then four all-black ones (08:04-08:36) on
+    an instance that was simultaneously throwing CUDA OOM and
+    OPTIX_ERROR_UNKNOWN. All four blacks were failed terminally. The scenes were
+    blamed for a fault in the box, and because three different agents hit it at
+    once the identical blackness was read as proof of the opposite.
+
+    So the rule is history-based, and this pins both halves of it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        db = DB(root / "t.db")
+        worked = "/home/zany/f1-round2/render/has_worked.blend"
+        never = "/home/zany/f1-round2/render/never_worked.blend"
+
+        # A scene with a good frame behind it, and one that has only ever been black.
+        good_id = db.submit(spec(), agent="t", scene=worked)
+        db.claim(60)
+        db.set_image_stats(good_id, {"verdict": "OK", "mean": 0.4, "sd": 0.1})
+        db.finish(good_id, str(root / "g.png"), 1.0, {"verdict": "OK"}, 10)
+
+        # The gate records the image stats BEFORE it raises, so by the time the
+        # handler asks for history the current black frame is already counted.
+        # Mirror that here, or the note suppresses itself as a single data point.
+        blk_id = db.submit(spec(), agent="t", scene=worked)
+        db.claim(60)
+        db.set_image_stats(blk_id, {"verdict": "BLACK", "mean": 0.0003, "sd": 0.001})
+        db.fail_terminal(blk_id, "blank")
+
+        blk, ok, _ = db.scene_blank_verdict_history(worked)
+        check("history sees the good frame this scene produced", ok >= 1, f"ok={ok}")
+        check("...and the black one alongside it", blk >= 1, f"blk={blk}")
+        blk2, ok2, _ = db.scene_blank_verdict_history(never)
+        check("a scene with no history reports none", ok2 == 0, f"ok={ok2}")
+
+        b = app.Broker.__new__(app.Broker)
+        b.db = db
+
+        note_worked = b.blank_history_note(worked)
+        note_never = b.blank_history_note(never)
+        check("the note tells an operator the scene HAS worked",
+              "HAS rendered fine" in note_worked, note_worked[:70])
+        check("...and says nothing when there is no history to report",
+              note_never == "", note_never[:70])
+
+        # The policy itself: one retry for the scene with a good frame, terminal
+        # for the one that has never produced a picture.
+        retry_id = db.submit(spec(), agent="t", scene=worked)
+        db.claim(60)
+        blk, ok, _ = db.scene_blank_verdict_history(worked)
+        retried: set = set()
+        first = ok > 0 and retry_id not in retried
+        check("a black frame on a proven scene is retried, not failed", first, f"ok={ok}")
+        retried.add(retry_id)
+        second = ok > 0 and retry_id not in retried
+        check("...but only once — the second black is believed", not second, "")
+
+        dead_id = db.submit(spec(), agent="t", scene=never)
+        db.claim(60)
+        blk, ok, _ = db.scene_blank_verdict_history(never)
+        check("a scene that has never rendered a picture is still terminal",
+              not (ok > 0), f"ok={ok}")
+
+
 def test_seq_resume() -> None:
     """A resume must render exactly the frames that are not already good."""
     from . import seq
@@ -4206,6 +4273,7 @@ def test_a_dns_outage_never_condemns_the_hardware() -> None:
         f = Fleet.__new__(Fleet)
         f.client = Client(raw)
         f.bad_offers, f.bad_machines = set(), set()
+        f.stalled_machines = set()
         f.instance_id = f.started_at = None
         f.status = "down"
         f.destroyed = []
@@ -4242,6 +4310,19 @@ def test_a_dns_outage_never_condemns_the_hardware() -> None:
           46067200 in dns_fleet.bad_offers, str(dns_fleet.bad_offers))
     check("...and the instance is still destroyed, so nothing keeps billing",
           dns_fleet.destroyed == [46710272], str(dns_fleet.destroyed))
+    # Not blaming the hardware is not the same as buying it again ten minutes
+    # later. Machine 73811 stalled at `loading` on offer 46234730, was rightly
+    # not condemned, and was then re-rented on offer 46234736 — the same box,
+    # another 15 min, the same stall. Avoidance lives in its own in-memory set
+    # so it can be true without costing the host a 24 h ban.
+    check("...but the machine IS skipped for the rest of this process, so the "
+          "next offer on the same box is not bought back",
+          int(offline_dns["machine_id"]) in dns_fleet.stalled_machines,
+          str(dns_fleet.stalled_machines))
+    check("...and that skip is NEVER persisted — bad_hosts.json is for blame, "
+          "and a control-plane fault has earned none",
+          not isinstance(dns_fleet.stalled_machines, fleet_mod.CondemnedIds),
+          type(dns_fleet.stalled_machines).__name__)
 
     host_fleet = rent_against({**offline_dns, "machine_id": 99999,
                                "status_msg": "no space left on device"})
@@ -4251,6 +4332,7 @@ def test_a_dns_outage_never_condemns_the_hardware() -> None:
 
 OFFLINE_TESTS = (
     "test_a_dns_outage_never_condemns_the_hardware",
+    "test_a_black_frame_on_a_scene_that_used_to_work_gets_one_retry",
     "test_the_pixel_cap_counts_what_is_actually_rendered",
     "test_a_refusal_is_never_retried",
     "test_preemption_must_beat_the_switch_it_costs",

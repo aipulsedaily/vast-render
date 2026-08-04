@@ -526,6 +526,34 @@ class DB:
             ).fetchone()
         return None if row is None else max(0.0, row["eff"])
 
+    def scene_blank_verdict_history(self, scene: Optional[str]) -> tuple[int, int, Optional[float]]:
+        """(times this scene rendered blank, times it rendered fine, when last fine).
+
+        The one fact that separates "this scene is broken" from "the farm is
+        broken", and the one nobody had when three agents each reported a black
+        4K frame within an hour on 2026-08-04. Answering it by hand took an
+        afternoon of SQL; the farm was exonerated by a single observation —
+        every scene that ever rendered black had rendered black on 100% of its
+        attempts, and no scene had ever produced both. A GPU that had gone bad
+        would blacken whatever ran on it next, so a scene with a clean history
+        and a sudden blank is a farm question, and a scene that has never once
+        produced a picture is a scene question. Cheap enough to run on the
+        failure path, which is the only place it is needed.
+        """
+        if not scene:
+            return (0, 0, None)
+        row = self.conn.execute(
+            "SELECT "
+            " SUM(CASE WHEN blank IS NOT NULL AND blank != 'OK' THEN 1 ELSE 0 END) blk,"
+            " SUM(CASE WHEN state='done' AND (blank IS NULL OR blank='OK') THEN 1 ELSE 0 END) ok,"
+            " MAX(CASE WHEN state='done' AND (blank IS NULL OR blank='OK') THEN finished END) lastok"
+            " FROM jobs WHERE scene = ?",
+            (scene,),
+        ).fetchone()
+        if row is None:
+            return (0, 0, None)
+        return (int(row["blk"] or 0), int(row["ok"] or 0), row["lastok"])
+
     def depth_by_scene(self) -> dict[str, int]:
         """Waiting jobs per scene, for `rq status`. Key "" is the default scene."""
         now = time.time()

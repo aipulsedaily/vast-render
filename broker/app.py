@@ -817,8 +817,42 @@ class Broker:
                    timeout=60, check=False)
         return size, stats
 
+    def blank_history_note(self, scene: Optional[str]) -> str:
+        """One sentence saying whether THIS scene has ever rendered a picture.
+
+        Put in front of whoever reads the failure, because the alternative is
+        what happened on 2026-08-04: three agents each got a black 4K frame,
+        each correctly reported it, and the shared conclusion — "three
+        unrelated scenes, so it must be the farm" — sent an afternoon into the
+        broker while the GPU was provably fine, rendering other scenes
+        correctly between the black ones. The counts below would have settled
+        it in one line.
+        """
+        try:
+            blk, ok, last_ok = self.db.scene_blank_verdict_history(scene)
+        except Exception:                       # never let diagnostics fail a job
+            return ""
+        if not scene or (blk + ok) <= 1:
+            return ""
+        name = os.path.basename(scene)
+        if ok == 0:
+            return (f"SCENE HISTORY: {name} has now rendered blank {blk} time(s) "
+                    f"and has NEVER returned a frame with a picture in it. A "
+                    f"failing GPU blackens whatever runs on it next, so it would "
+                    f"not spare this farm's other scenes — look at the .blend "
+                    f"first (world, lights, camera, and whether the last build "
+                    f"step actually wrote what you think it did).")
+        when = (f", most recently {time.strftime('%Y-%m-%d %H:%M', time.localtime(last_ok))}"
+                if last_ok else "")
+        return (f"SCENE HISTORY: {name} HAS rendered fine before — {ok} good "
+                f"frame(s){when}, against {blk} blank one(s). A scene that used "
+                f"to work and now does not is the one shape of this failure that "
+                f"really can be the farm: check what changed in the .blend since "
+                f"then, and whether other scenes are still coming back OK.")
+
     @staticmethod
-    def blank_gate(spec: dict, stats: dict, what: str, path: Path) -> None:
+    def blank_gate(spec: dict, stats: dict, what: str, path: Path,
+                   history: str = "") -> None:
         """Report what the image measured as, and refuse it if it has no content.
 
         Always reports. `OK` goes to the log at info level so a stats trail
@@ -862,6 +896,7 @@ class Broker:
             f"aimed at empty space, a scene with no world and no lights, or "
             f"film_transparent with nothing composited behind it. If this frame "
             f"is genuinely meant to be blank, resubmit with --allow-blank."
+            + (f"\n{history}" if history else "")
         )
 
     def run_job(self, job: dict) -> None:
@@ -919,13 +954,46 @@ class Broker:
             self.db.fail_terminal(job_id, str(exc))
             log.error("job %s REFUSED and will NOT be retried — %s", job_id, exc)
         except BlankOutput as exc:
-            # Not retried, and it does not matter what the instance is doing:
-            # the render finished, the file arrived, it verified, and there is
-            # no picture in it. Rendering it twice more produces the same black
-            # frame for twice the money. The caller is the only one who can fix
-            # the camera — or say the frame is meant to be blank.
-            self.db.fail_terminal(job_id, str(exc))
-            log.error("job %s FAILED and will NOT be retried — %s", job_id, exc)
+            # Usually not retried: the render finished, the file arrived, it
+            # verified, and there is no picture in it. Rendering it twice more
+            # produces the same black frame for twice the money, and the caller
+            # is the only one who can fix the camera.
+            #
+            # ONE exception, and it is paid for in blood. On 2026-08-04
+            # film14_breach_r6b.blend — byte-identical on disk throughout —
+            # rendered four correct frames between 07:54 and 07:59 and four
+            # all-black ones between 08:04 and 08:36 on the same instance,
+            # which was also throwing CUDA OOM and OPTIX_ERROR_UNKNOWN in that
+            # window. Cycles under VRAM exhaustion can hand back a zero-filled
+            # buffer that Blender writes out as a perfectly valid PNG. Every
+            # one of those jobs was failed terminally, so four agents lost work
+            # to a fault in the box, and the identical blackness across
+            # unrelated scenes was read as evidence about the scenes.
+            #
+            # So: a scene that has NEVER produced a picture is still terminal
+            # (that is a scene bug, and retrying it burns GPU to learn nothing).
+            # A scene with a good frame in its history gets exactly one retry —
+            # which reloads the worker on the way back through dispatch — before
+            # it is believed. Bounded in memory, so a restart re-arms at most
+            # one more attempt and this can never become a loop.
+            blk, ok, _ = self.db.scene_blank_verdict_history(job.get("scene"))
+            retried = getattr(self, "_blank_retried", None)
+            if retried is None:
+                retried = self._blank_retried = set()
+            if ok > 0 and job_id not in retried:
+                retried.add(job_id)
+                self.db.requeue(job_id, str(exc))
+                log.error(
+                    "job %s came back BLACK, but %s has returned %d good "
+                    "frame(s) before — a scene that has worked and suddenly "
+                    "has not is the shape of a farm fault, not a camera aimed "
+                    "at nothing. Requeuing it ONCE on a reloaded worker rather "
+                    "than failing it. If it comes back black again the scene is "
+                    "believed and the job fails for good. %s",
+                    job_id, os.path.basename(job.get("scene") or "?"), ok, exc)
+            else:
+                self.db.fail_terminal(job_id, str(exc))
+                log.error("job %s FAILED and will NOT be retried — %s", job_id, exc)
         except Exception as exc:
             # diagnose(), never str(exc). `str()` on an exception carrying no
             # message is the empty string, and this line is where that reached
@@ -1125,7 +1193,8 @@ class Broker:
                 # trusts to skip a frame forever, so a blank one must never
                 # reach the table — that is the resume-poisoning case, and it is
                 # the reason this check exists at all.
-                self.blank_gate(spec, stats, f"{name} frame {frame}", local)
+                self.blank_gate(spec, stats, f"{name} frame {frame}", local,
+                                self.blank_history_note(scene))
                 png = reply.get("png") or {}
                 self.db.frame_done(
                     name, frame, job_id, str(local), size,
@@ -1226,7 +1295,8 @@ class Broker:
         # still carries the numbers that condemned it. Arguing with the verdict
         # requires being able to see it.
         self.db.set_image_stats(job_id, stats)
-        self.blank_gate(spec, stats, f"job {job_id}", local)
+        self.blank_gate(spec, stats, f"job {job_id}", local,
+                        self.blank_history_note(scene))
         # `size` is what makes a deliberate calibration still usable as the disk
         # basis for the batch it was rendered to price. See mean_bytes_for_spec.
         self.db.finish(job_id, str(local), float(reply.get("render_sec", 0.0)),

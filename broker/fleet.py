@@ -343,6 +343,14 @@ class Fleet:
         # worse, not better, since the restart is what emptied the list.
         self.bad_offers: set[int] = CondemnedIds("offers")
         self.bad_machines: set[int] = CondemnedIds("machines")
+        # Machines to skip WITHOUT condemning them: they stalled on the way up
+        # for a reason we do not blame the hardware for, but re-renting one
+        # inside the same recovery costs another full readiness budget for the
+        # same answer. Deliberately a plain set, not CondemnedIds — this must
+        # never reach bad_hosts.json, because persisting it would turn a
+        # control-plane blip into the 24 h ban that a control-plane blip must
+        # never earn. Dies with the process; cleared when offers run out.
+        self.stalled_machines: set[int] = set()
         # Consecutive failed deploy rounds against the *current* instance. A
         # transport failure is retried on the same hardware until this is
         # exhausted; only then is the GPU assumed to be the problem.
@@ -2009,14 +2017,21 @@ class Fleet:
             o for o in offers
             if int(o.get("id") or 0) not in self.bad_offers
             and int(o.get("machine_id") or 0) not in self.bad_machines
+            and int(o.get("machine_id") or 0) not in self.stalled_machines
         ]
         if not fresh:
             # Everything on the market has already failed for us this session.
             # Better to try the cheapest again than to stop renting entirely.
+            # `stalled_machines` clears here too: skipping a host is only ever
+            # a preference, so when it is the difference between renting and
+            # not renting, it loses. This is also what makes a genuine
+            # control-plane outage — which stalls every host we try — recover
+            # instead of deadlocking on an empty candidate list.
             log.warning("all %d matching offers failed earlier this session — "
                         "clearing the blacklist and retrying", len(offers))
             self.bad_offers.clear()
             self.bad_machines.clear()
+            self.stalled_machines.clear()
             fresh = offers
 
         failures: list[str] = []
@@ -2082,26 +2097,52 @@ class Fleet:
                     "destroying it and trying the next offer. %s",
                     instance_id, offer_id, machine_id or "?", remote.diagnose(exc),
                 )
-                # Slow is not broken: blacklist the offer either way so we do not
-                # immediately re-rent it, but only blame the whole machine when
-                # the host actually reported a problem.
+                # Blacklist the offer either way so we do not immediately re-rent
+                # it. Whether the MACHINE is condemned is a separate question,
+                # and it is asked twice below, because "is this hardware to
+                # blame?" and "should we buy this box again right now?" are not
+                # the same question — see the stalled_machines note.
                 self.bad_offers.add(offer_id)
                 if host_at_fault and machine_id:
                     self.bad_machines.add(machine_id)
                     log.warning("machine %s blacklisted for this session (host-level "
                                 "failure, not slow provisioning)", machine_id)
-                elif not provisioning and machine_id:
-                    # Stopped dead, but demonstrably not its own fault. Say so
-                    # loudly: this is the line whose absence let a DNS outage
-                    # look identical to broken hardware for 40 minutes.
+                elif machine_id:
+                    # Stopped dead, or never started moving, but demonstrably not
+                    # its own fault. Say so loudly: this is the line whose absence
+                    # let a DNS outage look identical to broken hardware for 40
+                    # minutes.
+                    #
+                    # BLAME and AVOIDANCE are different decisions, and conflating
+                    # them cost 30 minutes on 2026-08-04. Machine 73811 sat at
+                    # `loading` — pulling the CUDA image, zero transitions — for
+                    # the full budget on offer 46234730. It was correctly not
+                    # blamed, so only that offer was condemned; 15 minutes later
+                    # the loop rented offer 46234736, which is the SAME machine,
+                    # and it stalled identically. One machine backs many offers,
+                    # so condemning the offer alone does not stop us buying the
+                    # same box back, and each proof costs a full readiness budget.
+                    #
+                    # `bad_machines` is the wrong home for that: it persists to
+                    # bad_hosts.json with a 24 h TTL, which is precisely the ban
+                    # a control-plane fault must not earn. So avoidance gets its
+                    # own set — in memory, this process only, never written to
+                    # disk, cleared the moment the market runs dry. The hardware
+                    # keeps its clean record; we simply stop paying to re-learn
+                    # the same thing inside one recovery.
+                    self.stalled_machines.add(machine_id)
                     log.warning(
-                        "machine %s NOT blacklisted despite failing to come up: "
-                        "vast.ai's own status message is a name-resolution "
-                        "failure, so this host could not reach the control "
-                        "plane — which during a vast.ai DNS event is true of "
-                        "every host and says nothing about this one. Condemning "
-                        "the offer only. Detail: %s",
-                        machine_id, getattr(exc, "detail", "") or "?",
+                        "machine %s NOT blacklisted despite failing to come up (%s) "
+                        "— the hardware is not blamed and earns no 24 h ban. But it "
+                        "just burned the whole %.0fs readiness budget, and one "
+                        "machine backs many offers, so condemning the offer alone "
+                        "would let us re-rent the same box minutes later (it did, "
+                        "twice, on 2026-08-04). Skipping it for the rest of this "
+                        "process only. Detail: %s",
+                        machine_id,
+                        "still provisioning, never reached running" if provisioning
+                        else "reached the control plane but could not be raised",
+                        vastctl.READY_TIMEOUT, getattr(exc, "detail", "") or "?",
                     )
                 failures.append(f"offer {offer_id}: {remote.diagnose(exc)}")
                 self._destroy_confirmed(instance_id, "never became reachable")
