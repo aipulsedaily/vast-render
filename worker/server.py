@@ -345,6 +345,63 @@ def restore_baseline_dof() -> None:
 # read-only on the instance.
 
 
+# --- linked libraries -----------------------------------------------------
+#
+# A scene that links geometry out of another .blend renders EMPTY when that
+# .blend is not on the box, in a fraction of the time, and reports success.
+# Blender does not fail on an unresolved library: it substitutes placeholders
+# and carries on. Probe job 82ebdd064292 came back as a strip of sky over pure
+# black in 0.83 s and was recorded `blank: OK, state: done`.
+#
+# Two things make this the worst shape of failure this farm has:
+#
+#   * The broker uploads the .blend and a name-matched list of sibling
+#     directories. It has never uploaded a linked library, and nothing in it
+#     ever read one — so the far side simply does not have the file.
+#   * `remote.missing_assets` exists to catch exactly this and cannot. It greps
+#     worker.log for `Image file ... does not exist`, which is what a missing
+#     IMAGE prints. A missing library prints `Cannot find lib '...'`. Different
+#     text, invisible check.
+#
+# So the decision is made here, on the machine that actually loaded the file,
+# against Blender's own answer rather than against a log message. `is_missing`
+# is set by the loader for any library it could not read.
+#
+# Blender's own bundled asset libraries (sculpt brushes, essentials node
+# groups) appear in `bpy.data.libraries` too. They are not special-cased and do
+# not need to be: they resolve against the running Blender's own installation,
+# which by construction exists — verified on instance 46712525, which carries
+# `/workspace/blender/5.2/datafiles/assets/`. If one of those IS missing, the
+# install is broken and refusing is still right.
+
+
+def library_report() -> list[dict]:
+    """Every linked library of the loaded file, and whether Blender found it."""
+    out = []
+    for lib in bpy.data.libraries:
+        try:
+            resolved = bpy.path.abspath(lib.filepath, library=lib.parent)
+        except Exception:
+            resolved = lib.filepath
+        out.append({
+            "filepath": lib.filepath,
+            "resolved": resolved,
+            "exists": os.path.exists(resolved),
+            # Blender's verdict, not ours. It falls back to reading the stored
+            # path as an absolute one when the relative form misses, so
+            # `exists` on the computed path can be False for a library that
+            # loaded perfectly well — measured here on 2026-08-04. `is_missing`
+            # is the only field that answers the question actually being asked.
+            "missing": bool(getattr(lib, "is_missing", False)),
+            "parent": lib.parent.filepath if lib.parent else None,
+        })
+    return out
+
+
+def missing_libraries() -> list[dict]:
+    return [lib for lib in library_report() if lib["missing"]]
+
+
 def _cache_dir() -> str:
     """Where Blender puts `//blendcache_*` for the loaded file.
 
@@ -1078,6 +1135,26 @@ def handle(spec: dict, out_dir: str) -> dict:
     reassert_overrides(scene, spec)
     t_apply = time.time() - t0
 
+    # Asked before anything else, because it is not a question about this frame
+    # or this spec — it is a question about whether the file on this box is the
+    # scene at all. Unconditional: there is no `require_libraries=false`,
+    # because unlike a physics cache there is no reading under which a render
+    # missing its linked geometry is the render that was asked for. The frame
+    # it would return is the one that started this: fast, plausible, empty.
+    absent = missing_libraries()
+    if absent:
+        raise Refused(
+            f"scene refused: {len(absent)} linked librar"
+            f"{'y is' if len(absent) == 1 else 'ies are'} missing on this "
+            f"instance, so Blender has already dropped everything they contain "
+            f"and would render the scene without it — "
+            + " ; ".join(f"{lib['filepath']} (tried {lib['resolved']})"
+                         for lib in absent)
+            + ". The broker uploads the .blend and its sibling directories, "
+              "never its linked libraries. Make the scene self-contained "
+              "(File > External Data > Make Local: All) and resubmit."
+        )
+
     # Asked after the frame is set, because a cache's coverage is a question
     # about this frame. Never bakes, never frees, never re-points anything.
     caches = cache_report(scene)
@@ -1149,6 +1226,27 @@ def handle(spec: dict, out_dir: str) -> dict:
             "shutter": round(float(getattr(scene.render, "motion_blur_shutter", 0.0)), 4),
             "fps": scene.render.fps / max(scene.render.fps_base, 1e-9),
             "persistent_data": bool(scene.render.use_persistent_data),
+            # The sampling and denoise state, read back off the scene rather
+            # than echoed from the spec. In a warm process the spec says what
+            # was ASKED for; only the scene says what the renderer was holding
+            # when the shutter opened. An A/B whose null is meant to expose the
+            # repeat-render floor is worthless if a denoiser was quietly on, and
+            # nothing else in this reply could have told anyone.
+            "camera": scene.camera.name if scene.camera is not None else None,
+            "engine": scene.render.engine,
+            "samples": (int(scene.cycles.samples)
+                        if scene.render.engine == "CYCLES"
+                        else int(getattr(scene.eevee, "taa_render_samples", 0))),
+            "use_denoising": (bool(scene.cycles.use_denoising)
+                              if scene.render.engine == "CYCLES" else None),
+            "denoiser": (str(scene.cycles.denoiser)
+                         if scene.render.engine == "CYCLES"
+                         and scene.cycles.use_denoising else None),
+            "adaptive_threshold": (round(float(scene.cycles.adaptive_threshold), 6)
+                                   if scene.render.engine == "CYCLES" else None),
+            "resolution_percentage": int(scene.render.resolution_percentage),
+            "color_mode": str(scene.render.image_settings.color_mode),
+            "color_depth": str(scene.render.image_settings.color_depth),
         },
         "caches": caches,
         "cache_problems": problems,
@@ -1170,6 +1268,26 @@ def serve(port: int, out_dir: str, host: str = "127.0.0.1", progress_path: str =
     enable_gpu()
     # Must run before prewarm, which mutates samples and resolution.
     capture_baseline(scene)
+
+    # Stated at load, before a single sample is traced, and stated in BOTH
+    # directions. The broker greps this line; a line that only appeared when
+    # something was wrong would leave "no libraries" and "the check did not run"
+    # looking identical from the outside, which is the exact hole the blank gate
+    # fell into when it answered OK for a frame containing none of its subject.
+    libs = library_report()
+    absent = [lib for lib in libs if lib["missing"]]
+    if not libs:
+        log("LIBRARIES: none — scene is self-contained")
+    elif not absent:
+        log(f"LIBRARIES: {len(libs)} linked, all resolved — "
+            + ", ".join(lib["filepath"] for lib in libs))
+    else:
+        for lib in absent:
+            log(f"MISSING LIBRARY: {lib['filepath']} (tried {lib['resolved']}) "
+                f"— everything it contains has been dropped from this scene")
+        log(f"LIBRARIES: {len(libs)} linked, {len(absent)} MISSING — renders from "
+            f"this scene will be refused")
+
     prewarm(out_dir)
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1246,6 +1364,11 @@ def serve(port: int, out_dir: str, host: str = "127.0.0.1", progress_path: str =
                     "shutter": round(float(getattr(sc.render, "motion_blur_shutter", 0.0)), 4),
                     "cache_dir": _cache_dir(),
                     "caches": caches,
+                    # Reported whether or not any are missing, so a caller can
+                    # tell "this scene links nothing" from "this scene links
+                    # things and they are all here" — a field that reads the
+                    # same in both cases would not be a measurement.
+                    "libraries": library_report(),
                     "baseline_dof": BASELINE.get("use_dof") or {},
                 }).encode() + b"\n")
                 continue
