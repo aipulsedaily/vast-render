@@ -127,6 +127,16 @@ EXEC_REQUIRED = frozenset({
     "cpu_slots",     # int; how many of this server's slots the job occupies
 })
 
+# Fields a caller MAY supply. Separate from EXEC_REQUIRED because "no defaults"
+# is a rule about fields that must be present on every job, and these are not:
+# a build that opens an existing assembly needs a scene, a build whose blend is
+# born here does not. The broker reads BOTH sets, so an optional field still
+# travels rather than being silently dropped from the payload.
+EXEC_OPTIONAL = frozenset({
+    "scene_digest",  # digest of a scene already in this instance's scene cache
+    "scene_name",    # bare filename INSIDE that digest's directory
+})
+
 JOB_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 DIGEST_RE = re.compile(r"[0-9a-f]{8,64}")
 
@@ -467,11 +477,30 @@ class ExecServer:
                 f"slot(s) — the job could never start"
             )
 
+        # Optional, and validated here rather than in `stage` so a malformed
+        # request is refused before any directory is built. Both halves or
+        # neither: a digest with no name cannot be resolved to a file, and a
+        # name with no digest is exactly the resolve-by-name trap.
+        scene_digest = spec.get("scene_digest") or ""
+        scene_name = spec.get("scene_name") or ""
+        if bool(scene_digest) != bool(scene_name):
+            raise ValueError(
+                "scene_digest and scene_name must be given together: a digest "
+                "with no name cannot be resolved, and a name with no digest "
+                "would resolve by name, which is the thing this forbids")
+        if scene_digest and not DIGEST_RE.fullmatch(scene_digest):
+            raise ValueError(f"scene_digest {scene_digest!r} is not a digest")
+        if scene_name and ("/" in scene_name or scene_name in (".", "..")):
+            raise ValueError(
+                f"scene_name {scene_name!r} must be a bare filename — it is "
+                "resolved INSIDE the digest's own directory, never as a path")
+
         return {"job_id": job_id, "digest": digest, "timeout": timeout,
                 "cpu_slots": cpu_slots, "entry": str(spec["entry"]),
                 "argv": list(spec["argv"]),
                 "blender_args": list(spec["blender_args"]),
-                "outputs": list(spec["outputs"])}
+                "outputs": list(spec["outputs"]),
+                "scene_digest": scene_digest, "scene_name": scene_name}
 
     def stage(self, plan: dict) -> dict:
         """Build the job directory and resolve every path inside it."""
@@ -487,6 +516,44 @@ class ExecServer:
         shutil.copytree(self.bundle_dir(plan["digest"]), bundle, symlinks=False)
         os.makedirs(out, exist_ok=True)
         os.makedirs(tmp, exist_ok=True)
+
+        # OPTIONAL INPUT SCENE, RESOLVED BY CONTENT.
+        #
+        # Exec was "code in, blend born on the box", and every build that was
+        # ever too big to run locally is the other shape: it OPENS an existing
+        # assembly. The blend is already here — content-addressed in the scene
+        # cache the render path fills — so this links it into the job directory
+        # instead of moving 8 GB across a wire that cannot carry it.
+        #
+        # It is a LINK, not a copy: an 8 GB copy per job would exhaust the disk
+        # and take longer than the build. Hard link first so the child sees a
+        # plain file, falling back to a symlink across filesystems.
+        #
+        # BY DIGEST, NEVER BY NAME. The name is used only to find the file
+        # INSIDE the digest's own directory; the digest is the identity. Asking
+        # for a scene by name and getting whichever blend currently answers to
+        # it is precisely the trap that cost the 0.1449 m travel guard, where
+        # two `breach_film.npz` files with the same name held different tables.
+        # A digest that is not present is an error, never a near-match.
+        if plan.get("scene_digest"):
+            digest = plan["scene_digest"]
+            if not DIGEST_RE.fullmatch(digest):
+                raise ValueError(f"scene_digest {digest!r} is not a digest")
+            src = os.path.join(self.root, "scenes", digest, plan["scene_name"])
+            marker = os.path.join(self.root, "scenes", digest, ".complete")
+            if not os.path.isfile(marker):
+                raise ValueError(
+                    f"scene {digest} is not completely staged on this instance "
+                    f"(no .complete marker) — refusing to open a half-pushed "
+                    f"blend, which reads as valid and renders as wrong")
+            if not os.path.isfile(src):
+                raise ValueError(
+                    f"scene {digest} is staged but holds no {plan['scene_name']!r}")
+            dst = os.path.join(job, "scene.blend")
+            try:
+                os.link(src, dst)
+            except OSError:
+                os.symlink(src, dst)
 
         entry = contained(plan["entry"], bundle)
         if not os.path.isfile(entry):

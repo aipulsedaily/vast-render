@@ -2436,7 +2436,22 @@ async def submit_exec(request: Request):
     except execservice.ExecError as exc:
         raise HTTPException(400, str(exc)) from None
 
+    # An optional input scene, hashed HERE so what travels is a digest. See
+    # execservice.resolve_scene: a build that asks for a blend BY NAME and gets
+    # whichever file currently answers to it is the trap the 0.1449 m travel
+    # guard exists because of, and inside exec the caller cannot even see which
+    # file it got.
     row_spec = dict(spec)
+    if body.get("scene"):
+        try:
+            digest, name, size = await asyncio.to_thread(
+                execservice.resolve_scene, body["scene"])
+        except execservice.ExecError as exc:
+            raise HTTPException(400, str(exc)) from None
+        row_spec["scene_digest"] = digest
+        row_spec["scene_name"] = name
+        row_spec["scene_bytes"] = size
+        row_spec["scene_path"] = str(Path(body["scene"]).expanduser().resolve())
     row_spec["bundle"] = bundle.digest
     row_spec["bundle_root"] = str(bundle.root)
     row_spec["bundle_patterns"] = list(body["bundle_patterns"])

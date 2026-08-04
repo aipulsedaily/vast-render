@@ -49,7 +49,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import config, execremote, remote
+from . import config, execremote, remote, scenes
 from .db import DB
 from .fleet import Fleet
 
@@ -63,7 +63,7 @@ log = logging.getLogger("exec")
 # retried to exhaustion — three rentals' worth of round trips for a typo. The
 # worker module imports nothing but the standard library, precisely so it can be
 # read from here without dragging bpy into the broker.
-def _worker_required() -> frozenset:
+def _worker_required() -> tuple[frozenset, frozenset]:
     import importlib.util
     src = Path(__file__).resolve().parent.parent / "worker" / "exec_server.py"
     spec_ = importlib.util.spec_from_file_location("_exec_server_schema", src)
@@ -71,10 +71,10 @@ def _worker_required() -> frozenset:
         raise ImportError(f"cannot read the exec worker's schema from {src}")
     mod = importlib.util.module_from_spec(spec_)
     spec_.loader.exec_module(mod)
-    return frozenset(mod.EXEC_REQUIRED)
+    return frozenset(mod.EXEC_REQUIRED), frozenset(mod.EXEC_OPTIONAL)
 
 
-WORKER_FIELDS = _worker_required()
+WORKER_FIELDS, WORKER_OPTIONAL = _worker_required()
 # What a CALLER must supply. The broker mints `job_id` and computes `bundle`
 # from the code tree, so those two are the broker's to fill in and nobody
 # else's — `job_id` because a client-supplied one was a path traversal, and
@@ -149,6 +149,50 @@ def resolve_bundle_root(raw: str) -> Path:
     if not real.is_dir():
         raise ExecError(f"bundle_root {text!r} is not a directory at {real}")
     return real
+
+
+def resolve_scene(raw: str) -> tuple[str, str, int]:
+    """A local .blend a build wants to OPEN, as (digest, filename, bytes).
+
+    THE ONE THING THIS EXISTS TO GET RIGHT IS THAT THE ANSWER IS A DIGEST.
+
+    Exec was "code in, blend born on the box", and every build that was ever too
+    big to run locally is the other shape: it opens an existing assembly. The
+    assembly is already on the instance, content-addressed in the scene cache
+    the render path fills, so a build can be handed the resident copy instead of
+    moving gigabytes up a wire that cannot carry them.
+
+    What must not happen is that the build asks for "film16_breach.blend" and
+    gets whichever file currently answers to that name. This project has already
+    paid for that once: two `breach_film.npz` files with the same name held
+    different tables, and the 0.1449 m travel guard exists because of it.
+    Rebuilding that trap inside exec — where the caller cannot even see which
+    file it got — would be strictly worse. So the scene is hashed HERE, at
+    submit, and the digest travels; the name is only ever used to find the file
+    inside that digest's own directory on the box.
+
+    Containment is `config.SCENE_ROOTS`, the same rule and the same reason as
+    the render path: this string arrives from a client and becomes a filesystem
+    path. Resolved first, then required to sit inside a root, because a prefix
+    compare is defeated by a sibling directory with a longer name.
+    """
+    if not raw or not str(raw).strip():
+        raise ExecError("scene is empty")
+    text = str(raw).strip()
+    if "\x00" in text:
+        raise ExecError("scene contains a null byte")
+    try:
+        real = Path(text).expanduser().resolve()
+    except OSError as exc:
+        raise ExecError(f"cannot resolve scene {text!r}: {exc}") from None
+    if not any(real == r or r in real.parents for r in config.SCENE_ROOTS):
+        raise ExecError(
+            f"scene {text!r} resolves to {real}, which is outside every "
+            f"permitted scene root: "
+            f"{', '.join(str(r) for r in config.SCENE_ROOTS)}")
+    if not real.is_file():
+        raise ExecError(f"scene {text!r} is not a file at {real}")
+    return remote.scene_hash(real), real.name, real.stat().st_size
 
 
 def plan_bundle(root: str, patterns: list) -> execremote.Bundle:
@@ -413,6 +457,56 @@ class ExecService:
         except Exception as exc:
             log.debug("exec purge skipped: %s", remote.diagnose(exc))
 
+    def ensure_scene_staged(self, ep: remote.Endpoint, spec: dict) -> None:
+        """Put this job's input scene in the instance's cache, if it asked for one.
+
+        AND DO IT WITHOUT GOING NEAR THE RENDER WORKER. `Fleet._switch_scene`
+        would also get the bytes there, and it restarts the worker to load them
+        — the one thing an exec job may never cause. The scene CACHE is not the
+        worker: `push_scene` writes a content-addressed directory that nothing
+        reads until something opens it, so filling it while a frame renders is
+        as safe as filling it while the box is idle.
+
+        Idempotent and usually free. The overwhelmingly common case is that the
+        render path already has this scene resident — which is the entire reason
+        this feature is cheap — and `scene_cached` answers that in one round
+        trip. It is size-verified, so a half-pushed scene is a miss, not a
+        near-hit.
+
+        `keep` protects the render worker's resident scene from being evicted to
+        make room for ours. Evicting the scene a frame is currently being drawn
+        from would be a spectacular way to honour "never disturb the worker".
+        """
+        digest = spec.get("scene_digest")
+        if not digest:
+            return
+        name, size = spec["scene_name"], int(spec["scene_bytes"])
+        if remote.scene_cached(ep, digest, size, name):
+            remote.touch_scene(ep, digest)
+            return
+        source = Path(spec["scene_path"])
+        if not source.is_file():
+            raise remote.FleetUnavailable(
+                f"exec job needs scene {name} ({digest[:12]}) and it is neither "
+                f"on the instance nor at {source} any more")
+        reserve = int(config.DISK_RESERVE_GB * 1e9)
+        state = remote.disk_state(ep)
+        if state.ok and state.free < size + reserve:
+            remote.evict_to_fit(
+                ep, keep=set(self.fleet.protected_scenes()), incoming=size,
+                budget=remote.cache_budget(state, reserve), reserve=reserve,
+                state=state)
+        log.info("staging scene %s (%s, %.2f GB) for exec — the render worker "
+                 "is not touched", name, digest[:12], size / 1e9)
+        seconds = remote.push_scene(ep, source)
+        # Sim caches and anything else the blend references relatively. Same
+        # call the render path makes: without them the scene opens and renders
+        # EMPTY rather than failing, which is the silent-wrong-output class.
+        siblings = scenes.sibling_dirs_for(source)
+        if siblings:
+            remote.push_scene_siblings(ep, digest, source.parent, siblings)
+        log.info("scene %s staged for exec in %.1fs", digest[:12], seconds)
+
     def _wait_out_the_frame(self) -> float:
         """Sleep off a busy render worker, HOLDING THIS JOB'S EXEC SLOT.
 
@@ -519,13 +613,14 @@ class ExecService:
                 f"want — a build filed under a request for different code is not "
                 f"something this broker will do quietly."
             )
+        self.ensure_scene_staged(ep, spec)
         info = execremote.push_bundle(ep, bundle,
                                       keep_scenes=self.fleet.protected_scenes())
         if not info.get("cached"):
             log.info("staged %s for exec job %s in %.1fs",
                      bundle.describe(), job_id, info.get("seconds", 0.0))
 
-        payload = {k: spec[k] for k in WORKER_FIELDS if k in spec}
+        payload = {k: spec[k] for k in (WORKER_FIELDS | WORKER_OPTIONAL) if k in spec}
         payload["job_id"] = job_id          # broker-minted, always
         payload["bundle"] = bundle.digest
 

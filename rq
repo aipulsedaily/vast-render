@@ -462,6 +462,12 @@ def cmd_exec(a: argparse.Namespace) -> int:
         raise SystemExit("rq exec: give --include, or --closure, or both")
     body = {"spec": spec, "agent": a.agent, "prio": a.prio,
             "bundle_root": a.root, "bundle_patterns": patterns}
+    if a.scene:
+        # Staged from the instance's own content-addressed scene cache and
+        # linked into the job directory as `scene.blend`. Refer to it by THAT
+        # name in --arg/--blender-arg: it is inside the job directory, so it
+        # satisfies the containment check rather than needing it relaxed.
+        body["scene"] = a.scene
     resp = call("POST", "/exec", body)
     if "error" in resp:
         print(json.dumps(resp, indent=2), file=sys.stderr)
@@ -1228,6 +1234,12 @@ def main() -> int:
     x.add_argument("--include", action="append", metavar="GLOB",
                    help="glob relative to --root; repeatable. Content-addressed "
                         "at submit. Optional if --closure is given")
+    x.add_argument("--scene", metavar="BLEND",
+                   help="a local .blend the build OPENS. Hashed at submit and "
+                        "staged from the instance's scene cache, so an assembly "
+                        "the render path already holds costs nothing to reuse. "
+                        "It appears in the job directory as `scene.blend` — pass "
+                        "that name, not this path, to --arg/--blender-arg")
     x.add_argument("--closure", action="store_true",
                    help="derive the bundle from --entry's transitive imports "
                         "(the module and what it imports, nothing else). "
