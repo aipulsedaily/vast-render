@@ -121,12 +121,42 @@ MAX_FRAMES_PER_JOB = _env("MAX_FRAMES_PER_JOB", 5000)
 # would have reached 117 GB, and a 12 GB cap plus Blender plus the container
 # image does not fit the 16 GB disk this farm is moving to at all.
 #
-# The sizing: a 16 GB volume carries ~1.7 GB of image + Blender install, this
-# reserve of free space, and the cache. 8 GB holds the largest assembly seen
-# here (3.9 GB) beside the loaded one with ~4 GB of slack left over. The value
-# is a CEILING, not a target — `remote.effective_budget` lowers it further
-# whenever the measured disk cannot afford even this.
-SCENE_CACHE_GB = _env("SCENE_CACHE_GB", 8.0)
+# The sizing WAS: a 16 GB volume carries ~1.7 GB of image + Blender install,
+# this reserve of free space, and the cache. 8 GB holds the largest assembly
+# seen here (3.9 GB) beside the loaded one with ~4 GB of slack left over.
+#
+# That constant went stale exactly the way a constant does. Scenes reached
+# 4.53-5.22 GB — the largest is now 34 % past the 3.9 GB the 8 GB was sized
+# around — so two current scenes cannot both fit BY CONSTRUCTION. Measured
+# 2026-08-03 on instance 46712525: a 32.2 GB disk with 20.8 GB free logged
+# "scene cache will exceed its 8.0 GB budget (4.77 + 5.22)" while a third of
+# the volume sat unused, because the ceiling was written for a 16 GB disk the
+# farm may or may not migrate to and applied to a 32 GB one.
+#
+# So it is DERIVED from the disk actually present, not hardcoded for a disk we
+# hope to have. `remote.derived_cache_bytes` takes a fraction of the room left
+# after the container image, Blender and the free-space reserve. That room is
+# stable as the cache fills — `DiskState.other_bytes` subtracts the cache, so
+# the budget does not chase its own tail — and a 16 GB box and a 32 GB box both
+# get a correct answer with no constant to go stale. The derived value is
+# logged once per instance so it is never a mystery.
+#
+# Set SCENE_CACHE_GB to pin an explicit ceiling; 0 (the default) means derive.
+# Either way `remote.effective_budget` still lowers it whenever the measured
+# disk cannot afford the answer.
+SCENE_CACHE_GB = _env("SCENE_CACHE_GB", 0.0)
+
+# Fraction of usable room the scene cache may claim when SCENE_CACHE_GB is 0.
+# 0.80 of a 16 GB volume is ~9.8 GB and of a 32 GB volume ~23 GB — both hold
+# the largest assembly beside the loaded one, which is the property the old
+# 8 GB was chosen for and then lost.
+SCENE_CACHE_FRACTION = _env("SCENE_CACHE_FRACTION", 0.80)
+
+# Never derive a budget below this. Guards the case where a small or unusually
+# full disk would otherwise produce a cache too small to hold one scene beside
+# the loaded one, which is thrash by arithmetic rather than by policy. Clamped
+# to the room that actually exists — a floor may not conjure disk.
+SCENE_CACHE_FLOOR_GB = _env("SCENE_CACHE_FLOOR_GB", 4.0)
 
 # Free space that must survive every scene upload, measured with `df` on the
 # instance rather than inferred from DISK_GB (which is what we asked vast.ai

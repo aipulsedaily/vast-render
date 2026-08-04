@@ -1236,6 +1236,16 @@ class Broker:
             job_id, reply.get("render_sec", 0), time.time() - started, size / 1e6,
             imgstat.summary(stats),
         )
+        # The worker's readback of what the SCENE held at render time, not what
+        # the spec asked for. It was being computed and thrown away, which meant
+        # the only record of an A/B's sampling and denoise state was the request
+        # — and a request is exactly the thing a caller is trying to verify.
+        effective = reply.get("effective")
+        if isinstance(effective, dict) and effective:
+            log.info(
+                "job %s effective — %s", job_id,
+                "  ".join(f"{k}={effective[k]}" for k in sorted(effective)),
+            )
 
     def maybe_idle_down(self) -> None:
         """Wind the instance down in two stages once work stops.
@@ -1903,6 +1913,13 @@ async def submit(request: Request):
     # becomes a filesystem path on this machine and on the instance.
     try:
         scene = scenes.resolve_scene(body.get("scene"))
+        # Refused here, at submit, for the same reason the path is validated
+        # here: a scene that links libraries the broker will not upload renders
+        # EMPTY on the instance and comes back marked done. `UnresolvedLibraries`
+        # is a `SceneError`, so it becomes the same 400 — a verdict about the
+        # reference, decided before a GPU exists rather than after a 4K frame
+        # that looks finished.
+        scenes.require_resolvable_libraries(scene)
     except scenes.SceneError as exc:
         raise HTTPException(400, str(exc)) from None
     # Stored resolved and absolute. The queued row must not depend on a relative
@@ -1970,6 +1987,10 @@ async def submit_range(request: Request):
         raise HTTPException(400, str(exc)) from None
     try:
         scene = scenes.resolve_scene(body.get("scene"))
+        # A sequence is where this defect is worst: one unresolved library
+        # returns five hundred plausible, empty frames that pass every per-frame
+        # check and are only questioned when somebody watches the shot.
+        scenes.require_resolvable_libraries(scene)
     except scenes.SceneError as exc:
         raise HTTPException(400, str(exc)) from None
 
@@ -2232,6 +2253,15 @@ async def queue():
                 # running job instead of only naming it.
                 "prog_sample", "prog_total", "prog_tile", "prog_tiles",
                 "prog_pct", "prog_elapsed", "prog_remaining", "prog_phase",
+                # WHEN that progress was last seen and last actually moved, on
+                # the broker's clock. Without these the counters above are
+                # indistinguishable from a frozen file: on 2026-08-04 the
+                # instance's container was restarted mid-frame, progress.json
+                # stopped being written, and `rq status` reprinted "sample
+                # 304/512, 1m41s elapsed" identically for five minutes while
+                # the GPU sat at 0%. The staleness was already recorded here
+                # and simply never left the broker.
+                "prog_seen", "prog_advanced",
                 # Sequence progress. A multi-hour range needs both numbers: the
                 # frame counter proves the batch is moving, the sample counter
                 # proves the current frame is.

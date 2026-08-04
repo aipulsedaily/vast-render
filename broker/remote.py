@@ -799,8 +799,12 @@ def push_scene_siblings(ep: Endpoint, digest: str, parent: Path,
     if tar.stdout:
         tar.stdout.close()
     ssh = subprocess.Popen(
-        ssh_base(ep) + [f"mkdir -p {shlex.quote(base)} && zstd -d -c | "
-                        f"tar -x -C {shlex.quote(base)}"],
+        # Its own connection, for the same reason as `push_scene` above: this is
+        # a bulk stream, a sim-cache tree is routinely gigabytes, and on the
+        # multiplexed master anything that takes over 180 s is killed by the
+        # starved-keepalive teardown rather than by anything wrong with the link.
+        ssh_nomux(ep) + [f"mkdir -p {shlex.quote(base)} && zstd -d -c | "
+                         f"tar -x -C {shlex.quote(base)}"],
         stdin=comp.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if comp.stdout:
@@ -1022,6 +1026,65 @@ def effective_budget(state: DiskState, configured: int, reserve: int) -> int:
     """
     room = state.total - state.other_bytes - reserve
     return max(0, min(configured, room))
+
+
+def cache_room(state: DiskState, reserve: int) -> int:
+    """Bytes available to the scene cache on this disk, cache itself excluded.
+
+    Split out because both the derivation and the ceiling need it, and because
+    the exclusion is the load-bearing part: `other_bytes` subtracts the cache,
+    so this does NOT shrink as the cache fills. A budget derived from free
+    space would chase its own tail — every upload would lower the ceiling that
+    permitted it — and settle wherever the feedback happened to stop.
+    """
+    return max(0, state.total - state.other_bytes - reserve)
+
+
+def derived_cache_bytes(state: DiskState, reserve: int) -> int:
+    """A scene-cache ceiling sized from the disk in front of us.
+
+    Replaces a hardcoded 8 GB that was correct for the 16 GB volume it was
+    written for and wrong for the 32 GB volume it was applied to. See
+    config.SCENE_CACHE_GB for the measurement that retired the constant.
+
+    The floor may not conjure disk it does not have, so it is clamped to the
+    room that exists; a disk too small for the floor gets all of its room and
+    the eviction path deals with the consequences honestly.
+    """
+    room = cache_room(state, reserve)
+    floor = min(int(config.SCENE_CACHE_FLOOR_GB * 1e9), room)
+    return max(floor, int(config.SCENE_CACHE_FRACTION * room))
+
+
+def cache_budget(state: DiskState, reserve: int) -> int:
+    """The scene-cache budget for THIS disk: derived unless explicitly pinned.
+
+    One place that answers the question, so `rq status`, the eviction preflight
+    and the exec path cannot disagree about it — they read the same number or
+    none of them do.
+    """
+    pinned = float(getattr(config, "SCENE_CACHE_GB", 0.0) or 0.0)
+    if pinned > 0:
+        return effective_budget(state, int(pinned * 1e9), reserve)
+    return effective_budget(state, derived_cache_bytes(state, reserve), reserve)
+
+
+def describe_cache_budget(state: DiskState, reserve: int) -> str:
+    """One line explaining where the budget came from, for the deploy log.
+
+    A derived number that is never printed is a magic number with extra steps.
+    """
+    budget = cache_budget(state, reserve)
+    pinned = float(getattr(config, "SCENE_CACHE_GB", 0.0) or 0.0)
+    if pinned > 0:
+        how = f"pinned by SCENE_CACHE_GB={pinned:g}"
+    else:
+        how = (f"derived: {config.SCENE_CACHE_FRACTION:.0%} of "
+               f"{cache_room(state, reserve) / 1e9:.1f}G room "
+               f"(floor {config.SCENE_CACHE_FLOOR_GB:g}G)")
+    return (f"scene cache budget {budget / 1e9:.2f}G — {how}; disk "
+            f"{state.total / 1e9:.1f}G total, {state.other_bytes / 1e9:.1f}G "
+            f"non-cache, {reserve / 1e9:.1f}G reserve")
 
 
 def evict_to_fit(ep: Endpoint, keep: set[str], *, incoming: int, budget: int,
@@ -1282,7 +1345,28 @@ def push_scene(ep: Endpoint, scene: Path, remote_path: str = "",
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     ssh = subprocess.Popen(
-        ssh_base(ep) + [f"zstd -d -o {shlex.quote(remote_path)} -f"],
+        # NOT the multiplexed master. Measured 2026-08-04 on instance 46712525:
+        # two consecutive 5.2 GB scene pushes died at 181.4 s and 168.7 s with
+        # `ssh exit 255, no stderr | local zstd exit -13` (SIGPIPE), and both
+        # retries — on a freshly built master — completed the same bytes in 94 s
+        # and 118 s at 44-55 MB/s. The link was never the problem.
+        #
+        # `ssh_base` sets ServerAliveInterval=30 with ServerAliveCountMax=6, and
+        # 30 x 6 = 180 s is the number both failures landed on. A bulk stream
+        # saturating one channel of a multiplexed connection head-of-line-blocks
+        # the master's own keepalive replies; six go unanswered and ssh tears
+        # down the WHOLE master, which is why the transfer dies with no stderr
+        # (LogLevel=ERROR eats "Timeout, server not responding") and zstd takes
+        # a SIGPIPE. So this is not a flaky link that retrying fixes — it is a
+        # hard 180 s ceiling on the mux path, and every scene big or slow enough
+        # to need longer than that would fail forever, burn the deploy attempts
+        # and start condemning perfectly good GPUs.
+        #
+        # A dedicated connection has nothing to be starved behind. This is the
+        # same reasoning that already puts `push_parallel` and the frame fetch
+        # on `ssh_nomux`, and the same reasoning as the job tunnel's own
+        # connection; the scene push was the last bulk path still on the master.
+        ssh_nomux(ep) + [f"zstd -d -o {shlex.quote(remote_path)} -f"],
         stdin=zstd.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if zstd.stdout:
@@ -1801,21 +1885,82 @@ def finished_png(ep: Endpoint, job_id: str) -> int:
     return info["bytes"] if info else 0
 
 
-def missing_assets(ep: Endpoint) -> list[str]:
-    """External files Blender could not resolve, read back from worker.log.
+# Every way Blender says "I could not find that file", as printed by Blender
+# 5.2 and captured verbatim from a real load on 2026-08-04.
+#
+# This list is a list because the version of this check that shipped was ONE
+# STRING — `Image file <path> does not exist` — and its own docstring named the
+# failure it could not see: "the broker returns a subtly wrong frame and logs
+# nothing". A missing *image* prints that. A missing *library* prints none of
+# it; it prints `Cannot find lib '<path>'`, and so a scene that linked its
+# entire set of grandstands out of another .blend rendered a strip of sky over
+# pure black in 0.83 s, passed the blank gate, and was reported done.
+#
+# The shape of that defect is a check that names the right class of failure and
+# then tests for one instance of it. So each pattern below is paired with the
+# observation that produced it, and `test_missing_asset_patterns_cover_blender`
+# fails if a captured line stops matching.
+#
+#   Warning: Unable to open '<path>': No such file or directory   library, first
+#   Info: Cannot find lib '<path>'                                library, named
+#   Info: LIB: Collection: 'X' missing from '<path>'              per datablock
+#   Warning: N libraries and M linked data-blocks are missing     summary
+#   Warning: Image file <path> does not exist                     image
+ASSET_MISS_PATTERNS = (
+    r"Image file [^ ]+ does not exist",
+    r"Cannot find lib '[^']+'",
+    r"Unable to open '[^']+': No such file or directory",
+    r"LIB: [A-Za-z]+: '[^']*' missing from '[^']+'",
+    r"[0-9]+ libraries and [0-9]+ linked data-blocks are missing",
+)
 
-    The worker reports these as `WARNING Image file <path> does not exist` and
-    then renders anyway, so without this the broker returns a subtly wrong frame
-    and logs nothing. Reading them back turns a silent wrong render into a
-    visible warning naming the exact path.
+
+def missing_assets(ep: Endpoint) -> list[str]:
+    """Lines where Blender said it could not resolve an external file.
+
+    Returned as the matched TEXT, not as bare paths. The previous version
+    stripped its one pattern down to a path, which read well in a log line and
+    threw away the only thing that distinguishes a missing HDRI — cosmetic, the
+    frame may still be what was wanted — from a missing linked .blend, which
+    means the geometry is not in the render at all.
     """
+    pattern = "|".join(ASSET_MISS_PATTERNS)
     ran = probe(
         ep,
-        f"grep -oE 'Image file [^ ]+ does not exist' {config.REMOTE_ROOT}/worker.log "
-        f"2>/dev/null | sed -E 's/^Image file //; s/ does not exist$//' | sort -u || true",
+        f"grep -aoE {shlex.quote(pattern)} {config.REMOTE_ROOT}/worker.log "
+        f"2>/dev/null | sort -u || true",
         timeout=60,
     )
     return [ln.strip() for ln in ran.out.splitlines() if ln.strip()] if ran.ok else []
+
+
+# Substrings that mean "a linked .blend was not found", as opposed to a missing
+# texture. Kept separate from the patterns above because the two demand
+# different responses: a missing image is a warning, a missing library is a
+# scene that cannot be rendered.
+LIBRARY_MISS_MARKERS = ("Cannot find lib '", "libraries and", "missing from '",
+                        "Unable to open '")
+
+
+def missing_libraries(ep: Endpoint) -> list[str]:
+    """The subset of `missing_assets` that means linked geometry is absent.
+
+    Also matches the worker's own `MISSING LIBRARY:` line, which is the
+    authoritative one: it comes from `bpy.data.libraries[...].is_missing` rather
+    than from parsing Blender's console output, and it is printed at load,
+    before any render.
+    """
+    found = [ln for ln in missing_assets(ep)
+             if any(m in ln for m in LIBRARY_MISS_MARKERS)]
+    ran = probe(
+        ep,
+        f"grep -a 'MISSING LIBRARY:' {config.REMOTE_ROOT}/worker.log 2>/dev/null "
+        f"| sort -u || true",
+        timeout=60,
+    )
+    if ran.ok:
+        found += [ln.strip() for ln in ran.out.splitlines() if ln.strip()]
+    return sorted(set(found))
 
 
 # Parallel byte-range fetching was tried here and MEASURED SLOWER. Eight

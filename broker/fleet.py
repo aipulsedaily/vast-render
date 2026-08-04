@@ -205,12 +205,106 @@ def heal_scene_dir_cmd(scene_dir: str) -> str:
     )
 
 
+class _PerInstance:
+    """Measurements that belong to ONE rented box, keyed by its instance id.
+
+    Keyed rather than merely cleared, because a reset that only runs on the
+    clean path is not a reset. `_forget_vanished` zeroes these at teardown and
+    that was believed to be enough; then instance 46705078 died through the
+    ERROR path during a DNS outage — its stop call could not resolve
+    console.vast.ai, five reap retries failed, and the reset never ran. Its
+    3660 s of load survived into the next box's numbers, so `rq status` read
+    `load 4152s (52%)` on an instance whose real figures were 492 s load
+    against 2923 s render: 14 %, healthy. The exact sum 3660 + 492 = 4152 is
+    how the contamination was proved.
+
+    That cost a coordinator and an agent a scene-thrash investigation into a
+    farm that was not thrashing. This project has been bitten by the same shape
+    before: `assert_levelled` sat inside `if not a.no_rig:` and a rig-less
+    build shipped un-relit. A guard on the clean path only guards the clean
+    path, so the fix here is structural — a read for the wrong instance cannot
+    return the previous instance's value, because the value is not reachable
+    without its id matching.
+    """
+
+    __slots__ = ("iid", "load_sec", "render_sec", "fetch_samples", "switch_cost")
+
+    def __init__(self, iid: Optional[int]) -> None:
+        self.rebind(iid)
+
+    def rebind(self, iid: Optional[int]) -> None:
+        self.iid = iid
+        self.load_sec: float = 0.0
+        self.render_sec: float = 0.0
+        self.fetch_samples: list[float] = []
+        self.switch_cost: dict[str, float] = {}
+
+
 class Fleet:
     """One instance, its tunnel, and the money it is spending."""
+
+    def _bound(self) -> "_PerInstance":
+        """The accounting for the CURRENT instance, rebinding if it changed.
+
+        Every read and every write of the four per-instance measurements goes
+        through here, which is what makes a stale value unreachable rather than
+        unlikely: adopting a different instance id — however the previous one
+        died, and whether or not any teardown path ran — reaches a zeroed
+        record on the very next access.
+        """
+        # Lazily created rather than assumed: tests build a Fleet with
+        # `__new__` to exercise one method without a constructor, and a
+        # measurement accessor that raises on those is a worse accessor. Same
+        # tolerance for `instance_id`, which those objects also lack.
+        acct = getattr(self, "_acct", None)
+        if acct is None:
+            acct = self._acct = _PerInstance(getattr(self, "instance_id", None))
+        iid = getattr(self, "instance_id", None)
+        if acct.iid != iid:
+            acct.rebind(iid)
+        return acct
+
+    @property
+    def load_sec(self) -> float:
+        return self._bound().load_sec
+
+    @load_sec.setter
+    def load_sec(self, value: float) -> None:
+        self._bound().load_sec = float(value)
+
+    @property
+    def render_sec(self) -> float:
+        return self._bound().render_sec
+
+    @render_sec.setter
+    def render_sec(self, value: float) -> None:
+        self._bound().render_sec = float(value)
+
+    @property
+    def fetch_samples(self) -> list:
+        return self._bound().fetch_samples
+
+    @fetch_samples.setter
+    def fetch_samples(self, value: list) -> None:
+        self._bound().fetch_samples = value
+
+    @property
+    def switch_cost(self) -> dict:
+        return self._bound().switch_cost
+
+    @switch_cost.setter
+    def switch_cost(self, value: dict) -> None:
+        self._bound().switch_cost = value
 
     def __init__(self, local_port: int = 8798):
         self.client = VastAI(raw=True, quiet=True)
         self.local_port = local_port
+        # Bound to the instance that earned them; see _PerInstance. Created
+        # before `instance_id` exists because the properties below read it.
+        self._acct = _PerInstance(None)
+        # Which instance's derived cache budget has been logged, so the line
+        # lands once per box rather than on every heartbeat.
+        self._budget_logged: Optional[int] = None
         self.ep: Optional[Endpoint] = None
         self.tunnel: Optional[subprocess.Popen] = None
         self.instance_id: Optional[int] = None
@@ -223,23 +317,10 @@ class Fleet:
         # Asset directories already mirrored onto *this* instance, so switching
         # back and forth between scenes does not re-push them every time.
         self.mirrored_assets: set[Path] = set()
-        # Measured seconds to make each scene live, by content hash. Feeds
-        # `reload_cost_sec`, which is how the dispatcher knows whether leaving
-        # a scene costs more than the wait it would relieve. Keyed by hash, so
-        # a reassembled .blend is re-measured rather than judged by its
-        # predecessor's timing.
-        self.switch_cost: dict[str, float] = {}
-        # Where this instance's paid seconds actually went. The scheduler's
-        # whole job is the ratio between these two, and until it was measured
-        # by hand nobody knew it: over one instance's life more money went to
-        # LOADING scenes than to rendering them. A number nobody can see is a
-        # number nobody defends, so `rq status` prints it.
-        self.load_sec: float = 0.0
-        self.render_sec: float = 0.0
-        # Observed download rates (bytes/sec) from REAL fetches. See
-        # `note_fetch` — this is the signal that did not exist when an instance
-        # delivering 14 KB/s passed every health check the broker had.
-        self.fetch_samples: list[float] = []
+        # switch_cost, load_sec, render_sec and fetch_samples all live in
+        # `self._acct` and are reached through the properties below. They are
+        # per-instance measurements, so they are KEYED by instance id rather
+        # than merely cleared at teardown — see _PerInstance for the incident.
         # Which scenes have work queued against them, injected by the Broker —
         # the fleet owns no queue and must not grow one. Returns scene hashes.
         # Used to order eviction, never to forbid it: see protected_scenes.
@@ -448,9 +529,8 @@ class Fleet:
             "cache_gb": round(state.cache_bytes / 1e9, 2),
             "scene_count": state.scene_count,
             "other_gb": round(state.other_bytes / 1e9, 2),
-            "budget_gb": round(remote.effective_budget(
-                state, int(config.SCENE_CACHE_GB * 1e9),
-                int(config.DISK_RESERVE_GB * 1e9)) / 1e9, 2),
+            "budget_gb": round(remote.cache_budget(
+                state, int(config.DISK_RESERVE_GB * 1e9)) / 1e9, 2),
             "reserve_gb": round(config.DISK_RESERVE_GB, 2),
         }
 
@@ -473,6 +553,13 @@ class Fleet:
             log.warning("could not measure the instance disk: %s", state.detail)
             return state
         reserve = int(config.DISK_RESERVE_GB * 1e9)
+        # Once per instance, on the first successful measurement: the budget is
+        # derived from this disk now, so the number that governs eviction must
+        # be visible next to the disk it was derived from. A derived value that
+        # is never printed is a magic number with extra steps.
+        if self._budget_logged != self.instance_id:
+            self._budget_logged = self.instance_id
+            log.info("%s", remote.describe_cache_budget(state, reserve))
         if state.free < reserve:
             log.warning(
                 "DISK LOW on instance %s: %s — under the %.1f GB reserve. The next "
@@ -894,16 +981,17 @@ class Fleet:
         self.gpu_seconds = 0.0
         self.scene_hash = None
         self.scene_path = None
-        # Per-instance, like gpu_seconds: a new box has a cold scene cache and
-        # its own load-vs-render story. Carrying the old one across would hide
-        # exactly the cold start an operator is looking for.
-        self.load_sec = 0.0
-        self.render_sec = 0.0
-        self.switch_cost = {}
-        # A new box has its own link. Carrying the old one's samples across
-        # would either condemn a healthy replacement on its predecessor's
-        # numbers or, worse, hide a bad one behind them.
-        self.fetch_samples = []
+        # Per-instance, like gpu_seconds: a new box has a cold scene cache, its
+        # own load-vs-render story and its own link. Carrying any of it across
+        # would hide the cold start an operator is looking for, and would judge
+        # a healthy replacement on its predecessor's numbers.
+        #
+        # Belt and braces only. `instance_id` is already None above, so this
+        # call rebinds the record to None and zeroes it — but the same would
+        # happen on the next access even if this line never ran, which is the
+        # point: THIS reset is exactly what a failed teardown skipped once.
+        # Keep it; do not rely on it.
+        self._bound()
         self.mirrored_assets = set()
         self.last_ready = False
         self.may_hold_render = False
@@ -1098,6 +1186,27 @@ class Fleet:
             self._mirror_assets(scene)
             blend = self._ensure_scene_cached(scene)
 
+            # The worker is relaunched a few lines below, so refreshing its code
+            # here is free and it is the difference between a worker-side fix
+            # taking effect at the next scene switch and taking effect at the
+            # next full redeploy — which, on a warm instance held deliberately
+            # for hours, may be never. `_deploy` and the resume path already do
+            # this; the switch path was the one that did not.
+            #
+            # Guarded, and the guard is the point: a failed push here must not
+            # become "this instance cannot switch scenes". That verdict starts a
+            # redeploy, and on this project a redeploy has repeatedly meant a
+            # healthy 5090 destroyed over something that was never the hardware.
+            # The old code keeps running; that is a stale worker, not a broken
+            # box.
+            try:
+                remote.push_file(ep, config.ROOT / "worker" / "server.py",
+                                 f"{config.REMOTE_ROOT}/server.py")
+            except Exception as exc:
+                log.warning("could not refresh worker code before switching to "
+                            "%s: %s — continuing with the worker already on the "
+                            "instance", scenes.label(scene), remote.diagnose(exc))
+
             self.status = "starting-worker"
             # From here on this instance may hold a render, so it is no
             # longer replaceable on an unanswered probe. Set BEFORE the
@@ -1119,10 +1228,7 @@ class Fleet:
                     tunnel_died=ready.tunnel_died,
                     local=ready.local_bind_failed,
                 )
-            for path in remote.missing_assets(ep):
-                log.warning("MISSING ASSET for %s: %s — the render will not match "
-                            "local. Add its directory to VASTRENDER_ASSET_DIRS.",
-                            scenes.label(scene), path)
+            self._report_missing(ep, scene)
 
             self.scene_hash = remote.scene_hash(scene)
             self.scene_path = scene
@@ -2103,8 +2209,8 @@ class Fleet:
         # An unmeasurable disk gets the configured ceiling here only so the
         # number exists; `evict_to_fit` refuses outright on `state.ok == False`
         # a line later, which is the behaviour that matters.
-        budget = (remote.effective_budget(state, int(config.SCENE_CACHE_GB * 1e9), reserve)
-                  if state.ok else int(config.SCENE_CACHE_GB * 1e9))
+        budget = (remote.cache_budget(state, reserve) if state.ok
+                  else int(config.SCENE_CACHE_FLOOR_GB * 1e9))
         incoming = size + self._sibling_bytes(scene)
         report = remote.evict_to_fit(ep, keep, incoming=incoming, budget=budget,
                                      reserve=reserve, state=state, defer=defer)
@@ -2204,6 +2310,41 @@ class Fleet:
         # scene is here", rather than "a .blend is here and its caches may be".
         remote.mark_scene_complete(ep, digest)
         return final
+
+    def _report_missing(self, ep, scene: Path) -> list[str]:
+        """Say what Blender could not resolve on the instance, at both severities.
+
+        Two classes, and they are not the same defect:
+
+        * A missing IMAGE is a warning. Blender renders anyway, the frame may
+          still be exactly what was wanted, and it may be nothing worse than an
+          HDRI that changes the key light.
+        * A missing LIBRARY means the linked datablocks are not in the render at
+          all. That is what returned a strip of sky over pure black in 0.83 s
+          from job 82ebdd064292, passed the blank gate, and was recorded done.
+
+        Reported here and ENFORCED in the worker, deliberately. Raising from a
+        scene switch would land in the `except Exception` below and be read as
+        "this instance failed to switch scenes" — which starts a redeploy, and
+        every farm outage on this project so far has been a healthy 5090 thrown
+        away over something that was not the hardware's fault. A scene that
+        links libraries is wrong wherever it runs; the box is fine. So the
+        broker says so, and `worker.server` refuses the render terminally.
+        """
+        libs = remote.missing_libraries(ep)
+        for line in libs:
+            log.error("MISSING LIBRARY for %s: %s — every datablock it holds is "
+                      "ABSENT from this render. Renders from this scene will be "
+                      "refused by the worker. Make the scene self-contained "
+                      "(File > External Data > Make Local: All).",
+                      scenes.label(scene), line)
+        for line in remote.missing_assets(ep):
+            if line in libs:
+                continue
+            log.warning("MISSING ASSET for %s: %s — the render will not match "
+                        "local. Add its directory to VASTRENDER_ASSET_DIRS.",
+                        scenes.label(scene), line)
+        return libs
 
     def _mirror_assets(self, scene: Path) -> None:
         """Mirror this scene's external assets — per scene, not once per deploy.
@@ -2364,13 +2505,7 @@ class Fleet:
                 local=ready.local_bind_failed,
             )
 
-        # Blender renders happily with an unresolved texture, so this is the
-        # only thing standing between a missing HDRI and a batch of subtly
-        # wrong finals. Loud, naming the path, but not fatal — the frame may
-        # still be exactly what was wanted.
-        for path in remote.missing_assets(ep):
-            log.warning("MISSING ASSET on the instance: %s — the render will not "
-                        "match local. Add its directory to VASTRENDER_ASSET_DIRS.", path)
+        self._report_missing(ep, scene)
 
         self.scene_hash = digest
         self.scene_path = scene

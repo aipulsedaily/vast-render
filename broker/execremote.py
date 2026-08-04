@@ -197,7 +197,7 @@ def push_bundle(ep: Endpoint, bundle: Bundle, *, keep_scenes: Optional[set[str]]
     if state.free < bundle.bytes + reserve:
         remote.evict_to_fit(
             ep, keep=set(keep_scenes or ()), incoming=bundle.bytes,
-            budget=remote.effective_budget(state, int(config.SCENE_CACHE_GB * 1e9), reserve),
+            budget=remote.cache_budget(state, reserve),
             reserve=reserve, state=state,
         )
 

@@ -28,6 +28,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -997,9 +998,17 @@ def test_disk_state_refuses_to_invent_numbers() -> None:
                                       free=10 * 10 ** 9, measured_at=time.time(),
                                       scenes=(remote.SceneEntry("a", 4 * 10 ** 9, 1),))
         good = fleet.disk_report()
+        # budget_gb is DERIVED from this disk, not a constant: 16 GB total,
+        # 2 GB non-cache, 2 GB reserve leaves 12 GB of room, and 80 % of that
+        # is 9.6. Asserted as a derivation rather than a literal because the
+        # literal is what went stale last time — an 8 GB ceiling written for a
+        # 16 GB volume was still being applied to a 32 GB one.
+        expect = round(remote.cache_budget(
+            fleet.disk, int(config.DISK_RESERVE_GB * 10 ** 9)) / 1e9, 2)
         check("a good measurement reports totals, cache and budget",
               good["measured"] and good["cache_gb"] == 4.0 and good["scene_count"] == 1
-              and good["other_gb"] == 2.0 and good["budget_gb"] == 8.0, str(good))
+              and good["other_gb"] == 2.0 and good["budget_gb"] == expect == 9.6,
+              f"{good} expected budget_gb={expect}")
     finally:
         remote.probe = real_probe
 
@@ -2559,6 +2568,286 @@ def test_exec_queue_and_bundles() -> None:
                 check(f"REFUSED: bundle_dir({bad!r})", True)
 
 
+# --- linked libraries -----------------------------------------------------
+
+# Blender 5.2's output when a linked library cannot be found, captured verbatim
+# on 2026-08-04 by loading a scene whose library had been moved away. These are
+# the strings the broker greps, so they are pinned here rather than paraphrased:
+# the defect being tested for is a check that matched ONE of them.
+BLENDER_MISSING_LIBRARY_LINES = (
+    "Warning: Unable to open '/x/lib_source.blend': No such file or directory",
+    "Info: Cannot find lib '/x/lib_source.blend'",
+    "Info: LIB: Collection: 'SourceCollection' missing from '/x/lib_source.blend', parent '<direct>'",
+    "Warning: 1 libraries and 1 linked data-blocks are missing (including 0 ObjectData), "
+    "please check the Info and Outliner editors for details",
+)
+BLENDER_MISSING_IMAGE_LINE = "Warning: Image file /x/hdri.exr does not exist"
+BLENDER_ORDINARY_LINES = (
+    "Info: Read library: '/x/lib_source.blend', '/x/lib_source.blend', parent '<direct>'",
+    "Fra:1 Mem:412.00M | Time:00:03.21 | Rendering 24/24 samples",
+    "00:01.123  blend            | Read blend: \"/workspace/scenes/abc/scene.blend\"",
+)
+
+# The check that shipped. Kept as a literal so the test can demonstrate what it
+# could and could not see, rather than assert that in prose.
+OLD_ASSET_PATTERN = r"Image file [^ ]+ does not exist"
+
+
+def test_missing_asset_patterns_see_libraries() -> None:
+    """The broker's log check must match every way Blender says "not found".
+
+    The version that shipped greps for one string, `Image file ... does not
+    exist`, while its own docstring named the failure it was written to prevent:
+    "the broker returns a subtly wrong frame and logs nothing". A missing
+    library prints none of that text, so a scene that linked its grandstands out
+    of another .blend rendered sky over black in 0.83 s and passed.
+
+    Both directions are checked. Matching the library lines is worthless on its
+    own — `.*` would do it — so the ordinary lines must NOT match, and the old
+    pattern must be shown failing on the very lines the new one catches.
+    """
+    from . import remote
+
+    combined = re.compile("|".join(remote.ASSET_MISS_PATTERNS))
+    old = re.compile(OLD_ASSET_PATTERN)
+
+    for line in BLENDER_MISSING_LIBRARY_LINES:
+        check(f"matches library miss: {line[:38]!r}", bool(combined.search(line)))
+        # The regression itself, asserted rather than described.
+        check(f"OLD pattern was BLIND to: {line[:38]!r}", not old.search(line))
+
+    check("still matches the missing-image line",
+          bool(combined.search(BLENDER_MISSING_IMAGE_LINE)))
+    check("old pattern matched the image line (it was not useless)",
+          bool(old.search(BLENDER_MISSING_IMAGE_LINE)))
+
+    # The negative control, and it is a real one: these are lines from a
+    # SUCCESSFUL load of a scene that links a library. `Read library:` names the
+    # same path in the same log; a pattern keyed on the path, or on the word
+    # "library", would fire on a scene that is completely fine.
+    for line in BLENDER_ORDINARY_LINES:
+        check(f"does NOT match healthy line: {line[:38]!r}", not combined.search(line))
+
+    # And the split between "warn" and "refuse" has to survive the same test:
+    # a missing image must not be classified as a missing library.
+    lib_markers = remote.LIBRARY_MISS_MARKERS
+    check("image miss is not classified as a library miss",
+          not any(m in BLENDER_MISSING_IMAGE_LINE for m in lib_markers))
+    check("library misses are classified as library misses",
+          all(any(m in ln for m in lib_markers)
+              for ln in BLENDER_MISSING_LIBRARY_LINES))
+
+
+def _blender_fixtures(tmp: Path) -> Optional[Path]:
+    """Build the control pair with Blender: one scene that links, one that does
+    not. Returns None if Blender is not installed.
+
+    Written by Blender, never by this test. A .blend synthesised here would be
+    a file shaped like whatever `blendlibs` expects to read, and a reader tested
+    against its own idea of the format is the round-trip-against-the-constant
+    this project has already shipped once.
+    """
+    blender = shutil.which("blender")
+    if not blender:
+        return None
+    script = tmp / "mk.py"
+    script.write_text(
+        "import bpy, os, sys\n"
+        "OUT = sys.argv[-1]\n"
+        "def fresh():\n"
+        "    bpy.ops.wm.read_factory_settings(use_empty=True)\n"
+        "def save(p, compress=False):\n"
+        "    bpy.ops.wm.save_as_mainfile(filepath=p, compress=compress,\n"
+        "                                relative_remap=False)\n"
+        "fresh()\n"
+        "bpy.ops.mesh.primitive_cube_add()\n"
+        "ob = bpy.context.active_object\n"
+        "col = bpy.data.collections.new('SourceCollection')\n"
+        "bpy.context.scene.collection.children.link(col)\n"
+        "bpy.context.scene.collection.objects.unlink(ob)\n"
+        "col.objects.link(ob)\n"
+        "save(os.path.join(OUT, 'lib_source.blend'))\n"
+        "src = os.path.join(OUT, 'lib_source.blend')\n"
+        "def link_and_save(name, compress):\n"
+        "    fresh()\n"
+        "    with bpy.data.libraries.load(src, link=True) as (fro, to):\n"
+        "        to.collections = ['SourceCollection']\n"
+        "    for c in bpy.data.collections:\n"
+        "        if c.library:\n"
+        "            inst = bpy.data.objects.new('Inst', None)\n"
+        "            inst.instance_type = 'COLLECTION'\n"
+        "            inst.instance_collection = c\n"
+        "            bpy.context.scene.collection.objects.link(inst)\n"
+        # The instance is load-bearing: a linked collection nothing references
+        # is orphan data, Blender drops it on save, and the "linked" fixture
+        # silently becomes a second copy of the clean one.
+        "    save(os.path.join(OUT, name), compress)\n"
+        "link_and_save('linked.blend', False)\n"
+        "link_and_save('linked_z.blend', True)\n"
+        "fresh()\n"
+        "with bpy.data.libraries.load(src, link=False) as (fro, to):\n"
+        "    to.collections = ['SourceCollection']\n"
+        "for c in bpy.data.collections:\n"
+        "    bpy.context.scene.collection.children.link(c)\n"
+        "save(os.path.join(OUT, 'appended.blend'))\n"
+        "print('FIXTURES-OK')\n"
+    )
+    out = tmp / "fx"
+    out.mkdir(exist_ok=True)
+    ran = subprocess.run(
+        [blender, "--background", "--factory-startup", "--python", str(script),
+         "--", str(out)],
+        capture_output=True, text=True, timeout=600,
+    )
+    if "FIXTURES-OK" not in ran.stdout:
+        return None
+    return out
+
+
+def test_unresolved_libraries_are_refused() -> None:
+    """A scene that links must fail; a self-contained scene must pass.
+
+    The negative control is `appended.blend`, not an empty file. It holds the
+    SAME collection, from the SAME source .blend, appended instead of linked —
+    so its datablock names still carry the source's name and its geometry is
+    identical. A detector that keys on "mentions another .blend" passes the
+    positive and fails here, which is the point: this project has already
+    shipped a negative control that was a second positive.
+    """
+    from . import blendlibs, scenes
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        fx = _blender_fixtures(tmp)
+        if fx is None:
+            # Not a skip. A gate whose controls did not run is a gate that has
+            # not been shown to work, and reporting that as a pass is the exact
+            # habit this whole defect came out of.
+            check("library gate controls ran", False,
+                  "blender unavailable, so neither control was exercised")
+            return
+        check("library gate controls ran", True)
+
+        linked = fx / "linked.blend"
+        linked_z = fx / "linked_z.blend"
+        appended = fx / "appended.blend"
+        source = fx / "lib_source.blend"
+
+        # 1. the reader, on a file Blender wrote
+        refs = blendlibs.library_paths(linked)
+        check("POSITIVE: reader finds the linked library",
+              len(refs) == 1 and refs[0].path == source.resolve(),
+              str([r.stored for r in refs]))
+        check("NEGATIVE: appended scene has no library",
+              blendlibs.library_paths(appended) == [])
+        check("NEGATIVE: the library source itself links nothing",
+              blendlibs.library_paths(source) == [])
+        check("POSITIVE: compressed .blend is read, not skipped",
+              len(blendlibs.library_paths(linked_z)) == 1,
+              "zstd is Blender's save default; a reader blind to it clears "
+              "half the corpus without opening it")
+
+        # 2. the policy, which is what actually admits or refuses a job
+        os.environ["VASTRENDER_SCENE_ROOTS"] = str(fx)
+        try:
+            import importlib
+            from . import config as cfg
+            importlib.reload(cfg)
+            importlib.reload(scenes)
+
+            for name, want_refused in (("linked.blend", True),
+                                       ("linked_z.blend", True),
+                                       ("appended.blend", False),
+                                       ("lib_source.blend", False)):
+                try:
+                    scenes.require_resolvable_libraries(fx / name)
+                    refused, why = False, ""
+                except scenes.UnresolvedLibraries as exc:
+                    refused, why = True, str(exc)
+                check(f"{'REFUSED' if want_refused else 'ACCEPTED'}: {name}",
+                      refused == want_refused, why[:90])
+                if want_refused and refused:
+                    check(f"{name} refusal names the missing path",
+                          "lib_source.blend" in why)
+
+            # 3. a library that DOES travel must be accepted, or the gate is
+            #    just "refuse everything that links" wearing a policy's clothes.
+            sib = fx / "cache"
+            sib.mkdir(exist_ok=True)
+            shutil.copy(source, sib / "lib_source.blend")
+            carried_scene = fx / "carried.blend"
+            shutil.copy(linked, carried_scene)
+            # Point the copy at the sibling directory the broker really uploads.
+            refs = blendlibs.library_paths(carried_scene)
+            check("carried-library case is set up on a real linked scene",
+                  len(refs) == 1)
+            fake = blendlibs.LibRef(stored="//cache/lib_source.blend",
+                                    path=(sib / "lib_source.blend").resolve(),
+                                    exists=True, linker=carried_scene)
+            check("a `//cache/` library is classified as carried",
+                  _is_carried(scenes, carried_scene, fake))
+            outside = blendlibs.LibRef(
+                stored="//../elsewhere/lib_source.blend",
+                path=(fx.parent / "elsewhere" / "lib_source.blend").resolve(),
+                exists=False, linker=carried_scene)
+            check("a library above the scene directory is NOT carried",
+                  not _is_carried(scenes, carried_scene, outside))
+        finally:
+            os.environ.pop("VASTRENDER_SCENE_ROOTS", None)
+            import importlib
+            from . import config as cfg
+            importlib.reload(cfg)
+            importlib.reload(scenes)
+
+
+def _is_carried(scenes_mod, scene: Path, ref) -> bool:
+    """Run one LibRef through the same classification `library_status` uses."""
+    original = scenes_mod._library_closure_cached
+    scenes_mod._library_closure_cached = lambda _p: [ref]
+    try:
+        carried, _unresolved = scenes_mod.library_status(scene)
+        return bool(carried)
+    finally:
+        scenes_mod._library_closure_cached = original
+
+
+def test_bundled_essentials_are_not_refused() -> None:
+    """Blender's own shipped assets must not trip the gate.
+
+    Thirteen round-1 scenes link `geometry_nodes_essentials.blend` — that is
+    what the "Smooth by Angle" modifier is. Blender remaps those onto the
+    running installation: MEASURED 2026-08-04 under
+    `/opt/blender-5.2.0-linux-x64` with `/usr/share/blender` bind-mounted empty,
+    `is_missing` came back False and the sibling brushes library was rewritten
+    to the `/opt` install. The instance carries `/workspace/blender/5.2/
+    datafiles/assets/`, so they resolve there too.
+
+    A gate that refused these would reject thirteen scenes that render
+    correctly, and a gate with false refusals gets switched off. The negative
+    half matters just as much: a project directory that merely happens to be
+    called `assets` must not inherit the exemption.
+    """
+    from . import blendlibs, scenes
+
+    def ref(p: str) -> "blendlibs.LibRef":
+        return blendlibs.LibRef(stored=p, path=Path(p), exists=False,
+                                linker=Path("/scene/x.blend"))
+
+    for path in (
+        "/usr/share/blender/5.2/datafiles/assets/nodes/geometry_nodes_essentials.blend",
+        "/workspace/blender/5.2/datafiles/assets/brushes/essentials_brushes-mesh_sculpt.blend",
+        "/opt/blender-5.2.0-linux-x64/5.2/datafiles/assets/nodes/shading_nodes_essentials.blend",
+    ):
+        check(f"bundled: {path[:46]}", scenes.is_bundled_essentials(ref(path)))
+
+    for path in (
+        "/home/zany/f1-round2/render/world/assembly/r2/assembly9.blend",
+        "/home/zany/f1-round2/datafiles/assets/grandstand.blend",
+        "/home/zany/project/assets/datafiles/assets/thing.blend",
+    ):
+        check(f"NOT bundled: {path[:46]}", not scenes.is_bundled_essentials(ref(path)))
+
+
 def report() -> int:
     width = max(len(n) for _, n, _ in results) + 2
     print()
@@ -3071,6 +3360,129 @@ def test_load_versus_render_time_is_accounted() -> None:
               f"load {f.load_sec}s of {total}s")
         check("the ratio names the case worth acting on",
               f.load_sec > f.render_sec, "load exceeds render")
+
+
+def test_per_instance_counters_cannot_outlive_their_instance() -> None:
+    """A reset that only runs on the clean path is not a reset.
+
+    Measured 2026-08-03. Instance 46705078 was torn down during a vast.ai DNS
+    outage, so its stop call could not resolve console.vast.ai; the destroy
+    took the ERROR path and `_forget_vanished` — which is where load_sec,
+    render_sec, fetch_samples and switch_cost were zeroed — never ran. Its
+    3660 s of load and 1008 s of render survived into instance 46712525, whose
+    own figures were 492 s and 2923 s. `rq status` therefore printed
+    `load 4152s (52%)  <- more time loading than rendering` for a box actually
+    running at 14 % load. The sum 3660 + 492 = 4152 is exactly how the
+    contamination was proved, and it sent a coordinator and an agent after a
+    scene-thrash defect that did not exist.
+
+    The same shape has bitten this project before: `assert_levelled` sat inside
+    `if not a.no_rig:` and a rig-less build shipped un-relit. So the fix is not
+    another reset on another path — it is that the values are KEYED by the
+    instance id that earned them, and a read for a different id cannot reach
+    them at all.
+
+    fetch_samples matters as much as the timings: a stale median condemns a
+    healthy replacement on its predecessor's link, or hides a bad one.
+    """
+    f = Fleet.__new__(Fleet)
+    f.instance_id = 46705078
+    f.load_sec += 3660.0
+    f.render_sec += 1008.0
+    f.fetch_samples.append(1_040_000.0)
+    f.switch_cost["fb3a34ec"] = 178.8
+    check("the box that earned them can read its own numbers",
+          (f.load_sec, f.render_sec) == (3660.0, 1008.0)
+          and len(f.fetch_samples) == 1 and len(f.switch_cost) == 1,
+          f"load {f.load_sec} render {f.render_sec}")
+
+    # The instance dies through the error path. No teardown, no reset — the
+    # next instance id is simply adopted, exactly as it was on 2026-08-03.
+    f.instance_id = 46712525
+    check("a new instance starts at zero even though no reset ever ran",
+          (f.load_sec, f.render_sec) == (0.0, 0.0), f"{f.load_sec} {f.render_sec}")
+    check("a stale link median cannot condemn or flatter the new box",
+          f.fetch_samples == [] and f.switch_cost == {},
+          f"{f.fetch_samples} {f.switch_cost}")
+
+    # The real figures for 46712525, and the ratio they should have shown.
+    f.load_sec += 262.4          # deploy, incl. the first 4.77 GB push
+    f.load_sec += 26.0           # redeploy onto a warm cache
+    f.load_sec += 203.6          # the 5.22 GB scene switch
+    f.render_sec += 2923.0
+    pct = 100 * f.load_sec / (f.load_sec + f.render_sec)
+    check("the uncontaminated ratio is the healthy one that was masked",
+          f.load_sec == 492.0 and 14 <= round(pct) <= 15,
+          f"load {f.load_sec}s = {pct:.1f}%")
+
+    # And the old numbers are gone, not parked somewhere reachable: re-adopting
+    # the dead id must not resurrect them.
+    f.instance_id = 46705078
+    check("re-adopting a dead instance id does not resurrect its numbers",
+          (f.load_sec, f.render_sec) == (0.0, 0.0), f"{f.load_sec} {f.render_sec}")
+
+
+def test_the_cache_budget_is_derived_from_the_disk_present() -> None:
+    """A ceiling sized for a disk we might migrate to, applied to the one we have.
+
+    Measured 2026-08-03 on instance 46712525: a 32.2 GB volume with 20.8 GB
+    free logged "scene cache will exceed its 8.0 GB budget (4.77 GB cached +
+    5.22 GB incoming)" while a third of the disk sat unused. The 8 GB was
+    correct once — it was chosen so the largest assembly then known (3.9 GB)
+    fitted beside the loaded one on a 16 GB volume — and scenes then grew to
+    5.22 GB, which is 34 % past what it was sized around. Two current scenes
+    could no longer coexist BY CONSTRUCTION.
+
+    Raising the constant would buy one more year of the same bug, so the budget
+    is derived from the measured disk instead. Addressing the class, not the
+    instance.
+    """
+    GB = 10 ** 9
+    res = int(config.DISK_RESERVE_GB * GB)
+
+    def disk(total_gb, other_gb, cache_gb):
+        scenes = ((remote.SceneEntry("s", int(cache_gb * GB), 1.0),)
+                  if cache_gb else ())
+        used = int((other_gb + cache_gb) * GB)
+        return remote.DiskState(ok=True, total=int(total_gb * GB), used=used,
+                                free=int(total_gb * GB) - used, scenes=scenes)
+
+    big = disk(32.2, 1.48, 5.22)      # the box that hit it
+    small = disk(16, 1.7, 0)          # the volume the old constant was for
+
+    check("the disk that was two-thirds empty now gets a budget that fits it",
+          remote.cache_budget(big, res) > 20 * GB,
+          f"{remote.cache_budget(big, res) / GB:.1f}G")
+    check("the two scenes that could not coexist under 8 GB now can",
+          remote.cache_budget(big, res) >= int(9.99 * GB),
+          f"{remote.cache_budget(big, res) / GB:.1f}G vs 9.99G needed")
+    check("a 16 GB volume still gets a 16 GB-shaped answer, not the big one",
+          9 * GB <= remote.cache_budget(small, res) <= 10 * GB,
+          f"{remote.cache_budget(small, res) / GB:.1f}G")
+
+    # The property that makes it stable: `other_bytes` excludes the cache, so
+    # filling the cache must not lower the ceiling that permitted the fill. A
+    # budget derived from FREE space would chase its own tail.
+    ceilings = {remote.cache_budget(disk(32.2, 1.48, c), res) for c in (0, 5, 10, 20)}
+    check("the budget does not shrink as the cache it governs fills",
+          len(ceilings) == 1, f"{sorted(round(c / GB, 1) for c in ceilings)}")
+
+    # Physics still outranks policy, and an explicit pin still wins.
+    tiny = disk(6, 1.7, 0)
+    check("a floor may not conjure disk that is not there",
+          remote.cache_budget(tiny, res) <= remote.cache_room(tiny, res),
+          f"{remote.cache_budget(tiny, res) / GB:.1f}G of {remote.cache_room(tiny, res) / GB:.1f}G")
+    pinned = config.SCENE_CACHE_GB
+    try:
+        config.SCENE_CACHE_GB = 8.0
+        check("an explicit SCENE_CACHE_GB is still honoured as a ceiling",
+              remote.cache_budget(big, res) == 8 * GB,
+              f"{remote.cache_budget(big, res) / GB:.1f}G")
+    finally:
+        config.SCENE_CACHE_GB = pinned
+    check("and the derived value is printable, so it is never a magic number",
+          "derived" in remote.describe_cache_budget(big, res),
+          remote.describe_cache_budget(big, res))
 
 
 def test_a_slow_link_is_a_health_signal() -> None:
@@ -3850,6 +4262,8 @@ OFFLINE_TESTS = (
     "test_priority_cannot_starve_a_scene",
     "test_batching_never_becomes_starvation",
     "test_load_versus_render_time_is_accounted",
+    "test_per_instance_counters_cannot_outlive_their_instance",
+    "test_the_cache_budget_is_derived_from_the_disk_present",
     "test_queued_scenes_are_evicted_last_not_first",
     "test_drain_grace_holds_a_scene_for_a_serial_client",
     "test_scene_zstd_level_never_recompresses_a_compressed_scene",
@@ -3894,6 +4308,9 @@ OFFLINE_TESTS = (
     "test_wait_does_not_hold_the_fleet_lock",
     "test_thread_supervision", "test_jobs_survive_a_restart",
     "test_exec_queue_and_bundles",
+    "test_missing_asset_patterns_see_libraries",
+    "test_unresolved_libraries_are_refused",
+    "test_bundled_essentials_are_not_refused",
 )
 
 

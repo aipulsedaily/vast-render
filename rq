@@ -710,6 +710,29 @@ def progress_str(job: dict) -> str:
         eta = job.get("prog_remaining")
         when = f", ~{fmt_dur(eta)} remaining" if eta else ""
         bits.append(f"{fmt_dur(job['prog_elapsed'])} elapsed{when}")
+    # Every number above is a SNAPSHOT, and nothing in it says how old the
+    # snapshot is. On 2026-08-04 the rented box's container was restarted
+    # mid-frame; progress.json stopped being written and this line reprinted
+    # "tile 1/4, sample 304/512 (15%)  1m41s elapsed, ~1m37s remaining"
+    # identically for five minutes while the GPU sat at 0% and no Blender
+    # process existed. A frozen counter and a slow render looked the same.
+    #
+    # `prog_advanced` is the broker's own clock at the last poll where the
+    # sample counter actually MOVED — not merely the last poll, which would be
+    # the status line watching its own polling. It is written by the same code
+    # that writes the counters, so it can never disagree with them. The broker
+    # runs on this machine, so time.time() is the same clock.
+    stale = job.get("prog_advanced")
+    if bits and stale:
+        age = time.time() - float(stale)
+        # Progress is polled every PROGRESS_INTERVAL (15 s). Renders here move
+        # the sample counter far faster than that, so a couple of minutes of no
+        # movement is already abnormal — but a frame that starts with a long
+        # scene sync legitimately shows no samples for a while, hence 180 s
+        # rather than something tighter.
+        if age > 180:
+            bits.append(f"** NOT MOVED IN {fmt_dur(age)} — counters above are that "
+                        f"stale, the render may be dead **")
     return "  ".join(bits)
 
 
@@ -787,12 +810,23 @@ def cmd_status(a: argparse.Namespace) -> int:
     # at 14 KB/s down on 2026-08-03 rendered perfectly and could not return the
     # frames — and passed every health check, because they all count failures
     # and a slow link never fails.
+    #
+    # Says FRAME DOWNLOAD, and the words are load-bearing. This is the rate
+    # results come back at; the `sending` line below is scene upload. On
+    # 2026-08-03 the two sat on one screen reading 1040 KB/s and 27.7 MB/s and
+    # were read as one number contradicting itself, when they are opposite
+    # directions of different transfers. (The 1040 KB/s was ALSO stale — it had
+    # carried over from a destroyed instance, which `_PerInstance` now makes
+    # structurally impossible. Both halves of that confusion are fixed here.)
     kbps, n = fleet.get("fetch_kbps"), fleet.get("fetch_samples") or 0
     if kbps is not None:
         warn = "   <- TOO SLOW to return frames" if kbps < 200 else ""
-        print(f"fetch    {kbps:.0f} KB/s down (median of {n} real fetch(es)){warn}")
+        rate = (f"{kbps / 1000.0:.1f} MB/s" if kbps >= 1000 else f"{kbps:.0f} KB/s")
+        print(f"fetch    {rate} frame download "
+              f"(median of {n} fetch(es) on this instance){warn}")
     elif n:
-        print(f"fetch    {n} sample(s), not enough to judge yet")
+        print(f"fetch    {n} frame download sample(s) on this instance, "
+              f"not enough to judge yet")
     load, render = fleet.get("load_sec") or 0.0, fleet.get("render_sec") or 0.0
     if load or render:
         total = load + render
