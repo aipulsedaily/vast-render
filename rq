@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import http.client
 import json
 import os
 import socket
@@ -88,6 +89,32 @@ GET_DIR = os.environ.get("VASTRENDER_GET_DIR") or os.path.join(
 # dead broker is still an error rather than a hang.
 CONNECT_RETRY_S = float(os.environ.get("VASTRENDER_CONNECT_RETRY_S", "60"))
 
+# WHAT COUNTS AS "THE OBSERVER FAILED, NOT THE JOB".
+#
+# `urlopen` does NOT wrap everything in URLError. `http.client.RemoteDisconnected`
+# — the server closing a keep-alive connection, which a broker restart does by
+# construction — propagates as itself, so the retry loop below never saw it and
+# the call raised straight through the caller.
+#
+# That is not a cosmetic gap. Measured 2026-08-04: an item gate submitted a job
+# (`707c2a92ba76 queued depth 15`), its POLL died on RemoteDisconnected, and the
+# gate reported ITEM_REJECTED with `witness_frame_valid: false`. The job was
+# fine. A verdict about a module was manufactured by a dropped socket, and the
+# output is indistinguishable from a real rejection unless someone reads the
+# sub-field.
+#
+# So the retry set is every transport failure that can happen to a healthy
+# broker: connection refused (restart window), reset, dropped keep-alive, DNS,
+# and read timeout. An HTTPError is NOT here and must not be — a 4xx/5xx is the
+# broker answering, and re-offering a request it already judged would turn a
+# refusal into a retry storm.
+TRANSIENT = (
+    urllib.error.URLError,      # includes connection refused / DNS
+    http.client.HTTPException,  # includes RemoteDisconnected, BadStatusLine
+    ConnectionError,            # reset, aborted, broken pipe
+    TimeoutError,               # read timeout (socket.timeout is an alias)
+)
+
 
 def call(method: str, path: str, payload: Optional[dict] = None, timeout: float = 400) -> Any:
     data = json.dumps(payload).encode() if payload is not None else None
@@ -111,10 +138,10 @@ def call(method: str, path: str, payload: Optional[dict] = None, timeout: float 
                 return {"error": json.loads(body), "status": exc.code}
             except json.JSONDecodeError:
                 return {"error": body, "status": exc.code}
-        except urllib.error.URLError as exc:
+        except TRANSIENT as exc:
             # Kept in a plain local: Python unbinds the `as` name at the end of
             # the except block, so the failure message below cannot use `exc`.
-            reason = exc.reason
+            reason = getattr(exc, "reason", None) or exc
             # A RESTART WINDOW is not a dead farm, and "refused" is the one
             # network failure it is provably safe to re-offer.
             #

@@ -350,6 +350,14 @@ class ExecServer:
     def __init__(self, root: str, bundles: str, slots: int, blender: str,
                  min_free_gb: float, min_free_mem_gb: float = 0.0) -> None:
         self.root = os.path.realpath(root)
+        # WHERE THE SCENE CACHE LIVES, which is NOT under this server's root.
+        # `--root` is the EXEC root (/workspace/exec); the render path fills
+        # /workspace/scenes, a sibling. Deriving it from the parent rather than
+        # joining onto self.root, because the first version did the latter,
+        # looked for /workspace/exec/scenes/<digest>/.complete, and reported a
+        # scene that was demonstrably resident as "not completely staged" —
+        # a wrong path wearing the error message of a corrupt push.
+        self.scenes = os.path.join(os.path.dirname(self.root), "scenes")
         self.bundles = os.path.realpath(bundles)
         self.blender = blender
         self.min_free = int(min_free_gb * 1e9)
@@ -414,7 +422,7 @@ class ExecServer:
         missing = EXEC_REQUIRED - spec.keys()
         if missing:
             raise ValueError(f"incomplete exec spec, missing: {sorted(missing)}")
-        unknown = spec.keys() - EXEC_REQUIRED - {"cmd"}
+        unknown = spec.keys() - EXEC_REQUIRED - EXEC_OPTIONAL - {"cmd"}
         if unknown:
             raise ValueError(
                 f"unknown exec spec field(s): {sorted(unknown)} — this server holds "
@@ -539,8 +547,8 @@ class ExecServer:
             digest = plan["scene_digest"]
             if not DIGEST_RE.fullmatch(digest):
                 raise ValueError(f"scene_digest {digest!r} is not a digest")
-            src = os.path.join(self.root, "scenes", digest, plan["scene_name"])
-            marker = os.path.join(self.root, "scenes", digest, ".complete")
+            src = os.path.join(self.scenes, digest, plan["scene_name"])
+            marker = os.path.join(self.scenes, digest, ".complete")
             if not os.path.isfile(marker):
                 raise ValueError(
                     f"scene {digest} is not completely staged on this instance "
