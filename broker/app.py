@@ -95,6 +95,15 @@ class JobRefused(RuntimeError):
 
 
 class Broker:
+
+    # Class-level defaults so EVERY construction path has them, including
+    # `Broker.__new__` — which `test_broker.stub_broker` uses deliberately to
+    # build a broker without a fleet or a network. Setting these only in
+    # __init__ would make the veto bookkeeping an AttributeError under exactly
+    # the harness that is supposed to prove it works.
+    _veto_scene: Optional[str] = None
+    _veto_since: float = 0.0
+    _veto_promised: float = 0.0
     def __init__(self) -> None:
         config.ensure_dirs()
         self.db = DB(config.DB_PATH, default_scene=str(config.SCENE))
@@ -132,6 +141,12 @@ class Broker:
         # Consecutive jobs served for the currently loaded scene, bounding how
         # long one scene can hold the worker. See next_job.
         self.scene_batch = 0
+        # `cheaper_to_finish` veto bookkeeping: which scene it is
+        # currently vetoing for, when that began, and the drain it
+        # promised at the time. See config.SCENE_VETO_GRACE.
+        self._veto_scene: Optional[str] = None
+        self._veto_since = 0.0
+        self._veto_promised = 0.0
         # Offers/machines that failed to come up, restored from the database so
         # a restart does not walk straight back into the host that just failed.
         self._blacklist_seen: dict = {"offers": {}, "machines": {}}
@@ -382,7 +397,8 @@ class Broker:
         cost = self.fleet.reload_cost_sec()
         return max(floor, float(config.SCENE_SWITCH_PAYBACK) * cost)
 
-    def cheaper_to_finish(self, current: Optional[str]) -> Optional[float]:
+    def cheaper_to_finish(self, current: Optional[str],
+                          waiting: Optional[float] = None) -> Optional[float]:
         """Seconds to drain the loaded scene, if that beats leaving and coming
         back. None when preempting is the better trade.
 
@@ -411,13 +427,38 @@ class Broker:
         """
         if not current:
             return None
-        queued = self.db.depth_by_scene().get(current, 0)
-        if queued <= 0:
+        # THE VETO IS BOUNDED. Past SCENE_VETO_MAX_SEC of waiting, the loaded
+        # scene stops being allowed to look cheap: an unbounded veto is the
+        # "starvation cap that bounded nothing" in a second costume, and this
+        # one really did bound nothing, because SCENE_BATCH_MAX counts only
+        # CONSECUTIVE jobs and two alternating scenes reset it forever.
+        # Priced by job class, not by job COUNT. A sequence job is worth its
+        # remaining frames, not one still -- see db.pending_work_sec.
+        drain = self.db.pending_work_sec(current)
+        if drain <= 0:
+            self._veto_scene = None
             return None
-        per = self.db.mean_render_sec() or config.SCENE_RELOAD_BASE_SEC
-        drain = queued * float(per)
         round_trip = float(config.SCENE_SWITCH_PAYBACK) * self.fleet.reload_cost_sec()
-        return drain if drain <= round_trip else None
+        if drain > round_trip:
+            self._veto_scene = None
+            return None
+        # THE VETO IS BOUNDED BY ITS OWN PROMISE. It just claimed this scene can
+        # be drained in `drain` seconds; if it is still saying so long after
+        # that, the scene was replenished and the claim was false. The promise
+        # recorded is the FIRST one, so topping the scene up cannot extend the
+        # grace. Floored at SCENE_STARVE_SEC so a tiny drain still gets a fair
+        # chance to actually finish.
+        now = time.time()
+        if self._veto_scene != current:
+            self._veto_scene = current
+            self._veto_since = now
+            self._veto_promised = drain
+        else:
+            grace = max(self._veto_promised * float(config.SCENE_VETO_GRACE),
+                        float(config.SCENE_STARVE_SEC))
+            if now - self._veto_since > grace:
+                return None
+        return drain
 
     def next_job(self) -> Optional[dict]:
         """Pick the next job, batching by scene without starving any scene.
@@ -453,7 +494,7 @@ class Broker:
             starving = waiting is not None and waiting > threshold
             # ...unless finishing here is quicker than the round trip, in which
             # case yielding costs the waiting scene more than it saves it.
-            finish = self.cheaper_to_finish(current) if starving else None
+            finish = self.cheaper_to_finish(current, waiting) if starving else None
             if finish is not None:
                 starving = False
             capped = self.scene_batch >= config.SCENE_BATCH_MAX

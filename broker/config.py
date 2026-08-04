@@ -255,6 +255,30 @@ SCENE_PRIO_BOOST_SEC = _env("SCENE_PRIO_BOOST_SEC", 20.0)
 # and `test_priority_cannot_starve_a_scene` fails if it is exceeded.
 SCENE_PRIO_BOOST_MAX_SEC = _env("SCENE_PRIO_BOOST_MAX_SEC", 1800.0)
 
+# THE BOUND ON `cheaper_to_finish`, and why it is a bound on the PROMISE.
+#
+# `cheaper_to_finish` vetoes the starvation switch by claiming the loaded scene
+# can be drained for less than a round trip costs. That claim was unbounded: its
+# docstring names SCENE_BATCH_MAX as the backstop, but the batch counter only
+# counts CONSECUTIVE jobs from one scene, so two other scenes alternating reset
+# it forever and the cap is never reached. Measured 2026-08-04: r2451 waited
+# 6,250 s (104 min) and its scene had never been uploaded at all, while short
+# stills from two scenes traded the GPU between them.
+#
+# A FIXED bound on the waiting scene's wait does NOT work, and the existing test
+# says why. `test_cheaper_to_finish_*` seeds a rival that has waited 2,400 s
+# against a loaded scene holding 42 s of work behind a 180 s round trip —
+# draining is genuinely right there, and a fixed 1800 s cap re-creates the
+# every-job trading that produced 89 % overhead on 2026-08-03.
+#
+# The difference between the two cases is not how long the rival waited. It is
+# that in the legitimate case the work RUNS OUT, and in the starvation case the
+# scene is continuously REPLENISHED. So the bound is on the veto's own promise:
+# it said the scene could be drained in `drain` seconds, and if it is still
+# vetoing well after that, the promise was false. Replenishment cannot extend
+# the grace, because the promise recorded is the FIRST one.
+SCENE_VETO_GRACE = _env("SCENE_VETO_GRACE", 3.0)
+
 # The `prio` a job gets when nobody says otherwise; the zero point of the boost.
 DEFAULT_PRIO = _env("DEFAULT_PRIO", 100)
 

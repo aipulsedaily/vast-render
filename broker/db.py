@@ -813,6 +813,47 @@ class DB:
         ).fetchone()
         return row["a"]
 
+    def pending_work_sec(self, scene: str) -> float:
+        """Seconds of GPU work still queued for `scene`, priced by JOB CLASS.
+
+        WHY THIS EXISTS. `cheaper_to_finish` used to price the loaded scene as
+        `queued_job_count * mean_render_sec()`, and `mean_render_sec` counts
+        STILLS ONLY -- deliberately, because averaging a sequence job's
+        hours-long `render_sec` into a per-still mean wrecks the queue ETA.
+
+        The consequence was that a sequence job worth ~30 GPU-hours was priced
+        at one still, roughly 53 s. Twenty-two of them priced at 1,159 s against
+        a ~6,200 s round trip, so "cheaper to finish" was TRUE and the
+        starvation switch was vetoed -- at any priority, because this gate sits
+        downstream of the effective-age ranking and does not consult it.
+
+        A work estimator wrong by ~170x on the only job class that matters is
+        not a tuning problem. Price each job as what it actually is:
+
+            sequence job : frames still to render  x  mean seconds per FRAME
+            still        : mean seconds per still
+        """
+        now = time.time()
+        rows = self.conn.execute(
+            "SELECT frames_total, frames_done, seq FROM jobs "
+            "WHERE kind='render' AND scene IS ? AND (state='queued' OR "
+            "(state='running' AND lease < ?))", (scene, now),
+        ).fetchall()
+        if not rows:
+            return 0.0
+        per_still = self.mean_render_sec() or config.SCENE_RELOAD_BASE_SEC
+        per_frame = None
+        total = 0.0
+        for r in rows:
+            if r["frames_total"]:
+                if per_frame is None:
+                    per_frame = (self.mean_frame_sec(r["seq"])
+                                 or self.mean_frame_sec() or per_still)
+                total += max(0, r["frames_total"] - (r["frames_done"] or 0)) * per_frame
+            else:
+                total += per_still
+        return total
+
     def mean_frame_sec(self, seq: Optional[str] = None) -> Optional[float]:
         """Mean seconds per rendered FRAME, optionally for one sequence.
 
