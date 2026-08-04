@@ -5,6 +5,76 @@ thing it first looked like. Newest first.
 
 ---
 
+## A recurring shape: a comment describing a path the code's own ordering makes unreachable
+
+**Not an exec bug. A class.** Logged separately because the exec instance is the
+third time this project has paid for it, and the first two looked like entirely
+different problems:
+
+* a `ranked` safeguard that was **documented and never implemented**;
+* a guard that was implemented but sat **inside `if not a.no_rig:`**, so it ran
+  only when the thing it guarded against was already switched off;
+* and now `ExecService.ensure_ready` (2026-08-04), below.
+
+### The shape
+
+Someone writes a comment stating what a call does *in the case they care about*.
+The statement is true of the function's body. It is false of the function's
+**entry**, because a guard, a branch or an early return sits in front of it. The
+comment then documents an intent the ordering has already made unreachable, and
+because it reads as a design note rather than a claim, nobody re-derives it.
+
+Every instance so far has been **invisible in the passing case**. That is what
+makes it expensive: the code works whenever the guard happens not to fire, so it
+survives review, survives testing, and fails only under the exact conditions it
+was written to handle.
+
+### The exec instance, in full
+
+```python
+# The scene the render worker already holds, so this is the no-op
+# fast path of ensure_ready rather than a scene switch. An exec job
+# must never restart the render worker.
+scene = self.fleet.scene_path or config.SCENE
+ep = self.fleet.ensure_ready(Path(scene))
+```
+
+Both sentences are true. The conclusion does not follow, because
+`Fleet.ensure_ready` opens like this:
+
+```python
+def ensure_ready(self, scene: Path) -> Endpoint:
+    with self.lock:
+        self._refuse_if_rendering()          # <-- FIRST statement
+        if self.ep and self.last_ready and self._worker_alive():
+            if self.scene_hash == remote.scene_hash(scene):
+                return self.ep               # <-- the "no-op fast path"
+```
+
+The fast path is real and the caller reached it constantly — **whenever no frame
+was rendering**. The one condition under which an exec job needed it was the one
+condition under which `_refuse_if_rendering` fired first. So exec was refused for
+asking a question it already knew the answer to, and the comment asserting
+otherwise was three lines above the call.
+
+### What actually catches it
+
+Not review: three reviewers read that comment and agreed with it, because it *is*
+a correct description of the intent. Two things do:
+
+1. **Read the callee's first statements, not its docstring**, whenever a comment
+   claims a call is cheap, a no-op, or takes a fast path. "Fast path" is a claim
+   about ordering, and ordering is only visible at the top of the callee.
+2. **Ask which branch runs in the case the comment is about.** Every instance
+   here was found by asking "when this actually matters, is this line reached?"
+   — the exec one by noticing the failures happened *only* while rendering,
+   which is precisely when the fast path was claimed to apply.
+
+The general lesson has a sibling already in this file, from the rent-time guards:
+**a guarantee written at one point in a flow says nothing about a different entry
+into that flow.** `adopt_or_reap` bypassed `gpu_frac`; `_refuse_if_rendering`
+preceded the fast path. Same failure, opposite directions.
+
 ## 2026-08-04 — OPEN DEFECTS: a sequence never yields, and `rq exec` refuses instead of queueing
 
 Both are **open**. Both were worked around on 2026-08-04 by adding a second
