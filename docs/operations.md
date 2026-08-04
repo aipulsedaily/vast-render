@@ -934,6 +934,60 @@ network — which at 63 MB per scene upload buys about two seconds.
 sm_120 cubin for Blackwell, and the render either fails or silently falls back
 to CPU.
 
+### `gpu_frac` — are we alone on the card? (added 2026-08-04)
+
+**`gpu_frac` is the fraction of a machine's GPUs an offer covers, it was
+queryable the entire life of this broker, and nobody asked for it.** The offers
+we had been renting read:
+
+```
+gpu_frac 0.125    cpu 32/256      <- one eighth of a box. Seven strangers.
+```
+
+That is not a billing detail. It is **R2-382**, and it cost an afternoon:
+
+> A co-tenant held a fixed **17,737 MiB**, constant to the megabyte across 40+
+> minutes, while our Blender swung 518 → 13,432 MiB against a 32,607 MiB card.
+> **Cycles under VRAM exhaustion returns a zero-filled buffer that becomes a
+> structurally perfect PNG** — correct dimensions, correct sha256, no picture.
+> Six OOMs on one 4K frame, then success on the seventh with nothing changed.
+> Four dud instances and two wrong diagnoses, because **co-tenancy is invisible
+> from inside the container**.
+
+`build_query` now asks for `gpu_frac>=0.99` and `search_offers` runs two passes.
+Probe both with `scripts/probe_offers.py`, which grew a `frac` column for
+exactly this reason.
+
+**It is a PREFERENCE, not a requirement.** Supply, measured 2026-08-04 across
+the full production filter:
+
+| pass | offers | machines |
+|---|---|---|
+| shared (no `gpu_frac` term) | 19 | 19 |
+| **exclusive (`gpu_frac>=0.99`)** | **8** | **8** |
+
+Eight machines is thin, `bad_machines` persists for 24 h, and a hard filter that
+matches nothing does not degrade — it **raises**, stranding every queued job.
+That is the failure `_rent` already refuses to walk into when it clears its own
+blacklist rather than deadlock. So the fallback exists, and **the fallback is
+loud**: it prints a block-capital warning naming the offer, its `gpu_frac`, and
+the instruction to check `nvidia-smi` for a second compute process before
+re-diagnosing black frames as a scene fault. Co-tenancy was never dangerous
+because it was likely. It was dangerous because it was silent.
+
+**Exclusivity costs money — about 8 %.** At the `cpu_cores_effective>=32` floor,
+cheapest exclusive is **$0.455/hr** against the **$0.4203/hr** shared card we
+were on. Cheaper exclusive hosts exist (~$0.394) but they are small boxes —
+8–20 cores — and fail the CPU floor. **Do not "fix" that by dropping
+`MIN_CPU_CORES_EFFECTIVE`**; that floor is itself an incident fix, and a 23-CPU
+cgroup is what made the remote-exec A/B measure the wrong thing.
+
+**`reliability2` is the sound field; ignore the number on the web page.** Offer
+`46354162` shows **94.6 %** in vast's UI and `reliability2: 0.9920577` over the
+API. They are different statistics, the API field is the one `build_query`
+filters on, and it is the one to quote. **A screenshot is not evidence about a
+host** — settle this from `probe_offers.py`, not from the console.
+
 ## Running a worker
 
 Locally, against the 1070:

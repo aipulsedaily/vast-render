@@ -2038,12 +2038,23 @@ class Fleet:
         for offer in fresh[: vastctl.MAX_OFFER_ATTEMPTS]:
             offer_id = int(offer["id"])
             machine_id = int(offer.get("machine_id") or 0)
+            # Exclusivity is stated on EVERY rent, not only on the shared ones.
+            # `gpu_frac` was queryable for the whole life of this broker and was
+            # never asked for or reported, so a card we shared with seven
+            # strangers logged identically to one we owned — and R2-382 cost an
+            # afternoon, four dud instances and two wrong diagnoses to work out
+            # from the inside what one field would have said up front.
+            exclusive = offer.get("_exclusive")
             log.info(
                 "renting offer %s (machine %s) — $%.3f/hr, rel %.3f, est $%.2f/8h, "
-                "up %s Mbps, direct ports %s",
+                "up %s Mbps, direct ports %s, %s",
                 offer_id, machine_id or "?", offer.get("dph_total", 0),
                 offer.get("reliability2", 0), offer["_est"],
                 int(offer.get("inet_up", 0)), offer.get("direct_port_count", "?"),
+                f"EXCLUSIVE (gpu_frac={offer.get('gpu_frac')}, whole machine)"
+                if exclusive else
+                f"*** SHARED (gpu_frac={offer.get('gpu_frac')}) — a co-tenant can "
+                f"take VRAM mid-render; black frames here mean nvidia-smi FIRST ***",
             )
 
             # An offer that cannot be created is not a reason to stop renting.

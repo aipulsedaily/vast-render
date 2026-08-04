@@ -594,7 +594,34 @@ STALL_WARN_SEC = _env("STALL_WARN_SEC", 600.0)
 REATTACH_SEC = _env("REATTACH_SEC", 5400.0)
 JOB_LEASE_SEC = _env("JOB_LEASE", 3600.0)
 MAX_ATTEMPTS = _env("MAX_ATTEMPTS", 3)
-DISK_GB = _env("DISK_GB", 30)
+
+# Volume size requested from vast.ai at `create`. NOT what the filesystem turns
+# out to be — every disk decision downstream measures with `df` on the instance
+# instead (see DISK_RESERVE_GB), because the two have disagreed.
+#
+# Raised 30 -> 60 on 2026-08-04, and the reason is the working set, not a guess:
+#
+#     largest scene on disk        5.22 GB   (render/film9_breach.blend)
+#     film-scene family            ~5.0 GB   each, eight of them
+#     measured live on a 32.2 GB volume:  22.3 GB used (69%),
+#         cache 20.84 GB in 13 scenes against a derived 23.0 GB budget
+#
+# So the 30 GB volume was already running at 69 % with the eviction loop
+# working continuously to stay there. 60 GB doubles the headroom, and the
+# supply cost of asking for it is ZERO: measured across the full production
+# filter on 2026-08-04, `disk_space>45`, `>75` and `>135` all returned the
+# same 19 shared / 8 exclusive machines. Nothing is excluded by asking.
+#
+# The money is negligible at this size — storage runs $0.13-0.40/GB/month, so
+# 60 GB is roughly $0.008-0.033/hr against a ~$0.42/hr box.
+#
+# **This is sized for ONE resident scene, not eight.** A multi-worker instance
+# pins one scene per worker, so eight workers is 8 x 5.2 GB = 41.6 GB of
+# unevictable cache before Blender, the image, frames in flight and the
+# reserve — and `protected_scenes()` would make every one of them unevictable
+# at once. That build needs ~300 GB and it needs to raise this deliberately;
+# do not discover it mid-master. See docs/multi-gpu.md.
+DISK_GB = _env("DISK_GB", 60)
 
 # Deploy retries, per dispatch pass and per instance.
 #

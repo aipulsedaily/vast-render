@@ -285,10 +285,36 @@ MAX_INET_COST_PER_GB = MAX_INET_COST_PER_TB / 1000.0        # 0.004
 # Ask for the cores.
 MIN_CPU_CORES_EFFECTIVE = 32.0
 
+# EXCLUSIVITY. `gpu_frac` is the fraction of a machine's GPUs an offer covers,
+# and it is the field that decides whether anyone else can be on our card.
+#
+# This was queryable the whole time and nobody asked. Measured 2026-08-04, the
+# offers this broker had been renting read `gpu_frac: 0.125` with `cpu 32/256`
+# — one eighth of a box, seven strangers alongside us. That is not a billing
+# detail. It is R2-382:
+#
+#   A co-tenant held a fixed 17,737 MiB, constant to the megabyte across 40+
+#   minutes, while our Blender swung 518 -> 13,432 MiB against a 32,607 MiB
+#   card. Cycles under VRAM exhaustion returns a ZERO-FILLED BUFFER that
+#   becomes a structurally perfect PNG — correct dimensions, correct sha256,
+#   no picture. Six OOMs on one 4K frame, then success on the seventh with
+#   nothing changed. Four dud instances and two wrong diagnoses before the
+#   cause was found, because co-tenancy is invisible from inside the container.
+#
+# `gpu_frac>=0.99` makes that failure STRUCTURALLY IMPOSSIBLE rather than
+# merely unlikely, at any GPU count, because there is no second tenant to take
+# the memory. It is the cheapest guard in this file.
+#
+# 0.99 rather than == 1.0: a float equality against a server-side computed
+# ratio is the kind of thing that silently matches nothing after a schema
+# change, and nothing between 0.5 and 1.0 exists to be caught by the gap.
+EXCLUSIVE_GPU_FRAC = 0.99
+
 
 def build_query(min_reliability: float = 0.98, disk_gb: int = DEFAULT_DISK_GB,
                 max_inet_cost: float = MAX_INET_COST_PER_GB,
-                min_cpu: float = MIN_CPU_CORES_EFFECTIVE) -> str:
+                min_cpu: float = MIN_CPU_CORES_EFFECTIVE,
+                exclusive: bool = True) -> str:
     """A 5090 with a driver new enough for Blackwell Cycles kernels.
 
     cuda_vers>=12.8 is not optional: below it Cycles ships no sm_120 cubin and
@@ -297,9 +323,15 @@ def build_query(min_reliability: float = 0.98, disk_gb: int = DEFAULT_DISK_GB,
     `max_inet_cost` caps BOTH directions in $/GB. Filtered server-side here and
     re-checked client-side in search_offers(), because a silently-ignored query
     term would put us straight back on an expensive host.
+
+    `exclusive` asks for the whole machine's GPUs (see EXCLUSIVE_GPU_FRAC). It
+    is a PREFERENCE, not a requirement — search_offers falls back and says so
+    loudly, because exclusive supply is thin enough to strand the queue. See
+    that function for the measurement behind the choice.
     """
+    frac = f"gpu_frac>={EXCLUSIVE_GPU_FRAC} " if exclusive else ""
     return (
-        f"gpu_name=RTX_5090 num_gpus=1 cuda_vers>=12.8 "
+        f"gpu_name=RTX_5090 num_gpus=1 {frac}cuda_vers>=12.8 "
         f"reliability>{min_reliability} inet_down>400 inet_up>400 "
         f"inet_up_cost<={max_inet_cost} inet_down_cost<={max_inet_cost} "
         f"cpu_cores_effective>={min_cpu} "
@@ -339,25 +371,18 @@ def estimate_cost(offer: dict, hours: float, disk_gb: int,
     return gpu + disk + net
 
 
-def search_offers(
-    client: VastAI,
-    hours: float = 8.0,
-    disk_gb: int = DEFAULT_DISK_GB,
-    min_reliability: float = 0.98,
-    limit: int = 20,
-) -> list[dict]:
-    """Candidate offers, cheapest projected total first."""
-    offers = client.search_offers(
-        query=build_query(min_reliability, disk_gb),
-        type="on-demand",
-        order="dph_total",
-        limit=limit,
-    )
-    # RE-CHECK THE CEILING CLIENT-SIDE. A query term the API silently ignores
-    # looks exactly like a term it honoured, and the failure mode is landing on
-    # a host that costs 4x per GB while the log says the filter was applied.
-    # This project has been bitten repeatedly by checks that reported success
-    # without measuring anything; belt and braces is cheap here.
+def _within_bandwidth_ceiling(offers: list[dict]) -> tuple[list[dict], list[tuple]]:
+    """Split offers on the $/GB ceiling. Returns (kept, dropped).
+
+    RE-CHECK THE CEILING CLIENT-SIDE. A query term the API silently ignores
+    looks exactly like a term it honoured, and the failure mode is landing on a
+    host that costs 4x per GB while the log says the filter was applied. This
+    project has been bitten repeatedly by checks that reported success without
+    measuring anything; belt and braces is cheap here.
+
+    Split out of search_offers when the exclusivity fallback arrived, so both
+    passes are filtered by the same code rather than by two copies that drift.
+    """
     kept, dropped = [], []
     for o in offers:
         up = o.get("inet_up_cost") or 0.0
@@ -366,6 +391,60 @@ def search_offers(
             dropped.append((o.get("id"), up, down))
             continue
         kept.append(o)
+    return kept, dropped
+
+
+def search_offers(
+    client: VastAI,
+    hours: float = 8.0,
+    disk_gb: int = DEFAULT_DISK_GB,
+    min_reliability: float = 0.98,
+    limit: int = 20,
+) -> list[dict]:
+    """Candidate offers, cheapest projected total first, EXCLUSIVE ones first.
+
+    Two passes. The first asks for whole-machine hosts (`gpu_frac>=0.99`), which
+    is what makes the R2-382 co-tenant VRAM exhaustion structurally impossible
+    — see EXCLUSIVE_GPU_FRAC. The second drops that term and is reached only
+    when the first found nothing rentable.
+
+    **Why a preference and not a hard requirement**, measured 2026-08-04 across
+    the full production filter:
+
+        shared    (no gpu_frac term)   19 offers / 19 machines
+        exclusive (gpu_frac>=0.99)      8 offers /  8 machines
+
+    Eight machines is thin. `bad_offers` and `bad_machines` persist for 24 h, so
+    a bad day that condemns three of them leaves five — and a hard filter that
+    returns nothing does not degrade, it RAISES, stranding every queued job
+    behind an empty candidate list. That is the same failure the blacklist code
+    already refuses to walk into: `_rent` clears its own bans rather than
+    deadlock, and `stalled_machines` is dropped "when it is the difference
+    between renting and not renting". Availability wins over preference here for
+    the same reason it wins there.
+
+    **The fallback is LOUD, and that is the actual guard.** Co-tenancy was never
+    dangerous because it was likely; it was dangerous because it was INVISIBLE —
+    nothing in the container, the broker log or `rq status` said another tenant
+    held 17,737 MiB of our card. A shared rental is acceptable. A shared rental
+    nobody was told about is what cost the afternoon.
+    """
+    exclusive = client.search_offers(
+        query=build_query(min_reliability, disk_gb, exclusive=True),
+        type="on-demand", order="dph_total", limit=limit,
+    )
+    kept, dropped = _within_bandwidth_ceiling(exclusive)
+
+    shared_fallback = False
+    if not kept:
+        shared_fallback = True
+        offers = client.search_offers(
+            query=build_query(min_reliability, disk_gb, exclusive=False),
+            type="on-demand", order="dph_total", limit=limit,
+        )
+        kept, more_dropped = _within_bandwidth_ceiling(offers)
+        dropped += more_dropped
+
     if dropped:
         print(f"[vastctl] dropped {len(dropped)} offer(s) over the "
               f"${MAX_INET_COST_PER_TB:.2f}/TB bandwidth ceiling: "
@@ -374,11 +453,35 @@ def search_offers(
     if not kept:
         raise VastError(
             f"no 5090 offer met the ${MAX_INET_COST_PER_TB:.2f}/TB bandwidth "
-            f"ceiling ({len(dropped)} candidate(s) exceeded it). Raise "
-            f"MAX_INET_COST_PER_TB deliberately, or wait for cheaper stock — "
-            f"do not silently rent an expensive host.")
+            f"ceiling ({len(dropped)} candidate(s) exceeded it), exclusive or "
+            f"shared. Raise MAX_INET_COST_PER_TB deliberately, or wait for "
+            f"cheaper stock — do not silently rent an expensive host.")
+
+    # Annotated on every offer, not just the fallback ones, so the rent log line
+    # states exclusivity in BOTH directions. A field that only appears when
+    # something is wrong leaves "exclusive" and "the check did not run" looking
+    # identical from the outside — the exact hole the blank gate fell into.
     for o in kept:
+        frac = o.get("gpu_frac")
+        o["_exclusive"] = frac is not None and float(frac) >= EXCLUSIVE_GPU_FRAC
         o["_est"] = estimate_cost(o, hours, disk_gb)
+
+    if shared_fallback:
+        cheapest = min(kept, key=lambda o: o["_est"])
+        print(
+            f"[vastctl] *** RENTING A SHARED GPU — NO EXCLUSIVE HOST WAS "
+            f"AVAILABLE *** No offer with gpu_frac>={EXCLUSIVE_GPU_FRAC} passed "
+            f"the filter, so this falls back to a host we SHARE with other "
+            f"tenants. The cheapest candidate is offer {cheapest.get('id')} at "
+            f"gpu_frac={cheapest.get('gpu_frac')} "
+            f"(cpu {cheapest.get('cpu_cores_effective')}/{cheapest.get('cpu_cores')}). "
+            f"A co-tenant can take VRAM out from under a render at any moment, "
+            f"and Cycles answers VRAM exhaustion with a structurally perfect "
+            f"all-black PNG (R2-382: 17,737 MiB held by a stranger, six OOMs on "
+            f"one 4K frame). If black frames appear on this instance, CHECK "
+            f"`nvidia-smi` FOR A SECOND COMPUTE PROCESS FIRST — do not re-diagnose "
+            f"it as a scene fault."
+        )
     return sorted(kept, key=lambda o: o["_est"])
 
 
