@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import glob
 import http.client
 import json
 import os
@@ -88,6 +89,12 @@ GET_DIR = os.environ.get("VASTRENDER_GET_DIR") or os.path.join(
 # restores the old fail-immediately behaviour; the bound exists so a genuinely
 # dead broker is still an error rather than a hang.
 CONNECT_RETRY_S = float(os.environ.get("VASTRENDER_CONNECT_RETRY_S", "60"))
+
+# How many files one --include glob may match before `rq exec` refuses it. Set
+# above the legitimate narrow cases (a handful of named manifests, a small
+# family of items) and well below a directory sweep: the bundle that kept
+# dying was 96 files.
+WIDE_INCLUDE_MAX = int(os.environ.get("VASTRENDER_WIDE_INCLUDE_MAX", "12"))
 
 # WHAT COUNTS AS "THE OBSERVER FAILED, NOT THE JOB".
 #
@@ -450,6 +457,53 @@ def import_closure(root: str, entry: str) -> list[str]:
     return sorted(os.path.relpath(p, root_p) for p in order)
 
 
+def check_include_width(root: str, patterns: list, allow_wide: bool) -> None:
+    """Refuse a directory-shaped `--include` that drags in a whole tree.
+
+    WHY THIS IS A REFUSAL AND NOT A NOTE IN THE DOCS. The failure it prevents —
+    a bundle wide enough that an unrelated agent's save between submit and
+    dispatch fails the job with StaleBundle — was already documented, with the
+    measurement, in `docs/incidents.md` and in `--closure`'s own help text. The
+    author of that documentation then killed his own submission with
+    `--include 'world/*.json'` THREE COMMITS LATER. Nobody reads a pathology
+    note while composing a command line. They read the error.
+
+    The test is a glob that matches many files, not a glob as such: `--include
+    'world/*.json'` is the shape that fails, `--include docs/beat_sheet.json`
+    is fine and so is a wildcard that happens to match three files. Data files
+    still need naming — no import graph can see a runtime JSON read — so the
+    narrow case must stay frictionless.
+
+    Escapable on purpose, and loudly. A wave that genuinely wants a whole
+    directory is a real thing; being made to say so is the point.
+    """
+    if allow_wide:
+        return
+    wide = []
+    for pat in patterns:
+        if not any(ch in pat for ch in "*?["):
+            continue
+        hits = glob.glob(os.path.join(root, pat), recursive=True)
+        files = [h for h in hits if os.path.isfile(h)]
+        if len(files) > WIDE_INCLUDE_MAX:
+            wide.append((pat, len(files),
+                         sum(os.path.getsize(f) for f in files)))
+    if not wide:
+        return
+    lines = [f"    {pat}  ->  {n} files, {b/1e6:.1f} MB" for pat, n, b in wide]
+    raise SystemExit(
+        "rq exec: refusing a directory-shaped --include:\n"
+        + "\n".join(lines)
+        + f"\n\n  A bundle this wide is a moving target. Its digest is recomputed at\n"
+          f"  dispatch, so ANY unrelated save in those directories between now and\n"
+          f"  then fails the job with StaleBundle — measured, repeatedly, on a tree\n"
+          f"  eight agents are editing.\n\n"
+          f"  Use --closure instead: it derives the bundle from --entry's transitive\n"
+          f"  imports (96 files / 38.3 MB -> 11 files / 1.12 MB on a real build), and\n"
+          f"  it composes with --include for the data files no import graph can see.\n\n"
+          f"  If you really do want the whole directory, pass --wide-include.")
+
+
 def cmd_exec(a: argparse.Namespace) -> int:
     """Queue one `blender -b -P <entry>` run on the rented box's CPUs.
 
@@ -487,6 +541,7 @@ def cmd_exec(a: argparse.Namespace) -> int:
             print(f"    {rel}", file=sys.stderr)
     if not patterns:
         raise SystemExit("rq exec: give --include, or --closure, or both")
+    check_include_width(a.root, a.include or [], a.wide_include)
     body = {"spec": spec, "agent": a.agent, "prio": a.prio,
             "bundle_root": a.root, "bundle_patterns": patterns}
     if a.scene:
@@ -1267,6 +1322,11 @@ def main() -> int:
                         "the render path already holds costs nothing to reuse. "
                         "It appears in the job directory as `scene.blend` — pass "
                         "that name, not this path, to --arg/--blender-arg")
+    x.add_argument("--wide-include", action="store_true",
+                   help="permit an --include glob matching more than "
+                        f"{WIDE_INCLUDE_MAX} files. Needed rarely; the refusal "
+                        "exists because a wide bundle dies to StaleBundle when "
+                        "anyone else saves a file")
     x.add_argument("--closure", action="store_true",
                    help="derive the bundle from --entry's transitive imports "
                         "(the module and what it imports, nothing else). "
