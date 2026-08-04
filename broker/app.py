@@ -38,6 +38,10 @@ from .db import DB, TERMINAL
 from .fleet import Fleet
 from .lock import BrokerAlreadyRunning, SingleInstanceLock
 
+# Safe here and only here: importing .fleet above has already put vastctl/ on
+# sys.path. Used by /teardown to name the cards this broker cannot see.
+import vastctl  # noqa: E402
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-7s %(name)-9s %(message)s",
@@ -2465,7 +2469,33 @@ async def teardown():
     broker having died, the symptom this whole investigation started from.
     """
     await asyncio.to_thread(broker.fleet.teardown, "api request")
-    return broker.fleet.snapshot()
+    snap = broker.fleet.snapshot()
+    # NAME THE CARDS THIS TEARDOWN DID NOT TOUCH. Label scoping is what stops
+    # two brokers reaping each other, and its unavoidable cost is that neither
+    # can see the other's spend — so the obvious action reports success while
+    # half the money keeps running. Reported, never destroyed: a sibling
+    # broker's box may have a frame in flight, and cross-broker destruction is
+    # the precise bug the label split exists to prevent.
+    try:
+        others = await asyncio.to_thread(vastctl.other_instances, broker.fleet.client)
+    except Exception as exc:                                   # pragma: no cover
+        snap["others_error"] = remote.diagnose(exc)
+        log.warning("teardown: could not check for other instances: %s",
+                    remote.diagnose(exc))
+        return snap
+    if others:
+        snap["still_billing"] = [
+            {"id": i.id, "label": i.label, "dph": round(i.dph, 4)} for i in others
+        ]
+        total = sum(i.dph for i in others)
+        log.warning(
+            "TEARDOWN IS PARTIAL — %d other instance(s) on this account are "
+            "STILL BILLING at $%.4f/hr combined: %s. They carry a different "
+            "label, so this broker can neither see nor destroy them. Tear each "
+            "one down through its own broker.",
+            len(others), total,
+            ", ".join(f"{i.id} ({i.label}) ${i.dph:.4f}/hr" for i in others))
+    return snap
 
 
 def main() -> None:

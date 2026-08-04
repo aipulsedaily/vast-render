@@ -20,13 +20,54 @@ import argparse
 import contextlib
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
 BASE = os.environ.get("VASTRENDER_URL", "http://127.0.0.1:8760")
+
+# BULK SEQUENCE WORK GOES TO THE BULK BROKER BY DEFAULT.
+#
+# The two brokers do not share a queue, so the split between them is a ROUTING
+# decision, and a routing decision nobody makes is made wrong. The numbers are
+# not close (measured 2026-08-04, see docs/multi-gpu.md):
+#
+#   bulk, one scene   one ~5 GB push amortised over a 21 h pass   0.4 % overhead
+#   short stills      five ~300 s pushes to enable ~750 s render  2.8x MORE
+#                     upload than render — slower than the queue it relieves
+#
+# So `anim` and `seq` default here and everything else stays on 8760. This is a
+# default, not a policy: an explicit VASTRENDER_URL always wins, and if the bulk
+# broker is not listening the job falls back to 8760 with a note rather than
+# failing. Nobody is ever blocked by this being switched on.
+BULK_URL = os.environ.get("VASTRENDER_BULK_URL", "http://127.0.0.1:8761")
+BULK_COMMANDS = {"anim", "seq"}
+
+
+def route(command: str) -> None:
+    """Point BASE at the bulk broker for bulk work, if one is actually there."""
+    global BASE
+    if os.environ.get("VASTRENDER_URL") or command not in BULK_COMMANDS:
+        return
+    if BULK_URL.rstrip("/") == BASE.rstrip("/"):
+        return
+    parsed = urllib.parse.urlsplit(BULK_URL)
+    try:
+        with socket.create_connection(
+                (parsed.hostname, parsed.port or 80), timeout=1.5):
+            pass
+    except (OSError, ValueError, TypeError):
+        print(f"  bulk broker {BULK_URL} is not listening — sending this "
+              f"{command} to {BASE} instead. That card pays a full scene push "
+              f"per scene; see docs/multi-gpu.md.", file=sys.stderr)
+        return
+    BASE = BULK_URL
+    print(f"  routing this {command} to the bulk broker at {BASE} "
+          f"(VASTRENDER_URL overrides)", file=sys.stderr)
 AGENT = os.environ.get("VASTRENDER_AGENT", os.environ.get("USER", "anon"))
 
 # Where a `get` with no -o puts the file. It used to be a bare "<job>.png",
@@ -817,9 +858,21 @@ def cmd_status(a: argparse.Namespace) -> int:
         print(f"waiting  {per}")
     print(f"queue    {q.get('counts')}  depth={q.get('depth')}  idle={q.get('idle_sec')}s")
     mean = q.get("mean_render_sec")
+    # EXCLUSIVITY BELONGS NEXT TO THE PRICE, because without it the price
+    # actively misleads: the shared card cost 12 % less and rendered 1.64x
+    # slower per frame. `gpu_frac` is only checked when an offer is RENTED, so
+    # an adopted card carries whatever it was born with, forever, and nothing
+    # here used to say which. See fleet._log_exclusivity.
+    frac = fleet.get("gpu_frac")
+    if frac is None:
+        excl = "  gpu_frac=? (exclusivity unknown)" if fleet.get("instance_id") else ""
+    elif frac >= 0.99:
+        excl = "  exclusive"
+    else:
+        excl = f"  !! SHARED gpu_frac={frac:.3f} (~1/{round(1/frac)} of the box, co-tenants)"
     print(f"gpu      {fleet.get('status')}  instance={fleet.get('instance_id')} "
           f"${fleet.get('dph')}/hr  up={fleet.get('uptime_sec')}s  "
-          f"spend=${fleet.get('spend_usd')}")
+          f"spend=${fleet.get('spend_usd')}{excl}")
     # WHERE THE MONEY WENT. Loading a scene is paid GPU time that renders
     # nothing, and on 2026-08-03 this instance spent more of its life loading
     # scenes than rendering with them — a 4.5 GB scene costs ~22 minutes on
@@ -916,7 +969,31 @@ def cmd_cancel(a: argparse.Namespace) -> int:
 
 
 def cmd_teardown(a: argparse.Namespace) -> int:
-    print(json.dumps(call("POST", "/teardown"), indent=2))
+    reply = call("POST", "/teardown")
+    print(json.dumps(reply, indent=2))
+    # A PARTIAL TEARDOWN MUST NOT LOOK LIKE A CLEAN ONE. Each broker is scoped
+    # to its own label so the two cannot reap each other; the cost is that
+    # neither can see the other's bill, and "destroy the GPU now" reported
+    # success while a second card kept charging. Loud on stderr AND non-zero,
+    # so a human reading a terminal and a script checking $? both find out.
+    still = (reply or {}).get("still_billing") or []
+    if still:
+        total = sum(float(i.get("dph") or 0) for i in still)
+        print(f"\n!! TEARDOWN IS PARTIAL — {len(still)} other instance(s) are "
+              f"STILL BILLING at ${total:.4f}/hr combined:", file=sys.stderr)
+        for i in still:
+            print(f"     {i.get('id')}  {i.get('label')}  ${i.get('dph')}/hr",
+                  file=sys.stderr)
+        print("   They carry a different label, so THIS broker can neither see "
+              "nor destroy them.\n   Tear each one down through its own broker, "
+              "e.g. VASTRENDER_URL=http://127.0.0.1:8761 rq teardown",
+              file=sys.stderr)
+        return 1
+    if (reply or {}).get("others_error"):
+        print(f"\n!! could not check for other instances: "
+              f"{reply['others_error']} — VERIFY BY HAND at console.vast.ai",
+              file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1106,6 +1183,9 @@ def main() -> int:
     # silently becomes a block is indistinguishable from "no results yet".
     if getattr(a, "out", None) and getattr(a, "out_implies_wait", False):
         a.wait = True
+    # After parsing, before any call: bulk work goes to the bulk broker unless
+    # VASTRENDER_URL says otherwise. See BULK_URL.
+    route(sys.argv[1] if len(sys.argv) > 1 else "")
     return a.func(a)
 
 

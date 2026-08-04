@@ -77,6 +77,15 @@ export VASTRENDER_DISK_GB=80
 # bounds the pair; this one is deliberately small.
 export VASTRENDER_MAX_BATCH_USD=12
 
+# HIBERNATE LONGER THAN THE DEFAULT, BECAUSE THIS BOX'S VALUE IS ITS CACHE.
+# Idle-down is unchanged at 300 s: stopping is good, it drops billing to
+# storage and KEEPS THE DISK, so the ~5 GB resident scene survives. What the
+# default 3600 s destroys is that scene — and re-pushing it costs 230-460 s on
+# an unresumable stream, far more than 4 h of stopped-instance storage
+# (80 GB at $0.20/GB/month is ~$0.02/hr, and a stopped box pays only that).
+# A bulk worker between passes should wait, not evaporate.
+export VASTRENDER_HIBERNATE=14400
+
 export VASTRENDER_LOG="$ROOT/state2/broker.log"
 export VASTRENDER_BROKERD_LOCK="$ROOT/state2/brokerd.lock"
 

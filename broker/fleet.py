@@ -309,6 +309,9 @@ class Fleet:
         self.tunnel: Optional[subprocess.Popen] = None
         self.instance_id: Optional[int] = None
         self.dph: float = 0.0
+        # Fraction of the box's GPUs this card is. None until an instance is
+        # rented or adopted; < 0.99 means co-tenants. See _log_exclusivity.
+        self.gpu_frac: Optional[float] = None
         self.started_at: Optional[float] = None
         self.scene_hash: Optional[str] = None
         # The .blend the worker currently has loaded. The dispatcher batches by
@@ -468,6 +471,10 @@ class Fleet:
             "status": self.status,
             "instance_id": self.instance_id,
             "dph": round(self.dph, 4),
+            # Surfaced because the headline price is actively misleading
+            # without it: the shared card cost 12 % less and rendered 1.64x
+            # slower. None means the instance never reported it.
+            "gpu_frac": self.gpu_frac,
             "uptime_sec": round(self.uptime, 1),
             "hibernated_sec": round(self.hibernated_for, 1),
             "gpu_usd": round(self.spend, 4),
@@ -757,6 +764,27 @@ class Fleet:
 
     # --- startup reconciliation -----------------------------------------
 
+    def _log_exclusivity(self, inst) -> None:
+        """Record whether the card we just took is ours alone. Never silent."""
+        frac = inst.gpu_frac
+        self.gpu_frac = frac
+        if frac is None:
+            log.warning("instance %s does not report gpu_frac — exclusivity "
+                        "UNKNOWN, treat as shared until measured", inst.id)
+        elif frac >= vastctl.EXCLUSIVE_GPU_FRAC:
+            log.info("instance %s is EXCLUSIVE (gpu_frac %.3f) — no co-tenant "
+                     "can take VRAM or GPU time on this card", inst.id, frac)
+        else:
+            log.warning(
+                "instance %s is SHARED: gpu_frac %.3f — about 1/%.0f of the "
+                "box, with co-tenants on our card. This is the R2-382 class "
+                "(a co-tenant held 17,737 MiB while Cycles returned "
+                "zero-filled buffers) and it measured 1.64x SLOWER PER FRAME "
+                "than an exclusive 5090 on identical work. The gpu_frac>=0.99 "
+                "filter runs at RENT time only, so adoption cannot fix this — "
+                "destroy the instance and let dispatch rent a fresh one.",
+                inst.id, frac, 1.0 / frac if frac else 0)
+
     def adopt_or_reap(self) -> Optional[int]:
         """Take over one healthy instance from a previous run; destroy the rest.
 
@@ -772,6 +800,15 @@ class Fleet:
             if adopted is None and state in ("running", "cold"):
                 self.instance_id = inst.id
                 self.dph = inst.dph
+                # SAY WHAT WE ARE ADOPTING. The gpu_frac>=0.99 filter runs at
+                # RENT time and adoption bypasses it forever — see
+                # vastctl.Instance.gpu_frac for the measurement. A shared card
+                # is not a billing detail: it is the R2-382 co-tenant class,
+                # and it measured 1.64x slower per frame than an exclusive
+                # 5090 on identical work. Adoption cannot refuse it — there may
+                # be a frame in flight on it, and stranding the queue to
+                # re-rent is worse — but it must never be SILENT again.
+                self._log_exclusivity(inst)
                 # Carry the host across adoption, or a broker restart loses the
                 # ability to blacklist the machine it is about to condemn — and
                 # blacklists are per-session, so a restart is exactly when the
@@ -984,6 +1021,9 @@ class Fleet:
                 log.warning("could not bank spend: %s", remote.diagnose(exc))
         self.ep = None
         self.instance_id = None
+        # Per-instance, like gpu_seconds. Carrying a dead box's exclusivity
+        # onto its replacement is exactly the silence this field exists to end.
+        self.gpu_frac = None
         self.started_at = None
         self.stopped_at = None
         self.gpu_seconds = 0.0
@@ -2074,6 +2114,16 @@ class Fleet:
                 continue
             self.instance_id = instance_id
             self.dph = float(offer.get("dph_total") or 0.0)
+            # Carried from the OFFER, which is where exclusivity was actually
+            # decided. `search_offers` already annotates `_exclusive`, but the
+            # raw fraction is what `rq status` shows and what a later adoption
+            # will compare against.
+            raw_frac = offer.get("gpu_frac")
+            self.gpu_frac = None if raw_frac is None else float(raw_frac)
+            if self.gpu_frac is not None and self.gpu_frac < vastctl.EXCLUSIVE_GPU_FRAC:
+                log.warning("rented a SHARED card: gpu_frac %.3f on instance %s "
+                            "— the exclusive pass found nothing rentable",
+                            self.gpu_frac, instance_id)
             self.started_at = time.time()
             # Freshly minted: nothing has ever run on it, so it provably holds
             # no render. Cleared here rather than at teardown alone so the flag
@@ -2648,6 +2698,9 @@ class Fleet:
             )
         self.ep = None
         self.instance_id = None
+        # Per-instance, like gpu_seconds. Carrying a dead box's exclusivity
+        # onto its replacement is exactly the silence this field exists to end.
+        self.gpu_frac = None
         self.started_at = None
         self.stopped_at = None
         self.gpu_seconds = 0.0

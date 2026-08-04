@@ -660,7 +660,19 @@ MAX_ATTEMPTS = _env("MAX_ATTEMPTS", 3)
 # reserve — and `protected_scenes()` would make every one of them unevictable
 # at once. That build needs ~300 GB and it needs to raise this deliberately;
 # do not discover it mid-master. See docs/multi-gpu.md.
-DISK_GB = _env("DISK_GB", 60)
+#
+# RAISED 60 -> 80 on 2026-08-04, from the eviction record rather than headroom
+# arithmetic. Over one 7.6 h instance life on the 30 GB volume, scene switching
+# cost 2,975 s and 8 of the 19 switches over 100 s were RE-PUSHES OF A SCENE
+# THE BOX ALREADY HAD — evicted only because the working set does not fit. The
+# `film14_breach_*` family alone is ~20 GB of that set.
+#
+# The trade is lopsided. Disk runs $0.13-0.40/GB/month, so the extra 20 GB is
+# ~$0.004-0.011/hr; ONE re-push of a 5 GB scene costs 230-460 s of a ~$0.45/hr
+# card, or roughly $0.03-0.06, and the eviction loop was paying that several
+# times an hour. Supply cost remains zero: measured 2026-08-04, `disk_space>45`,
+# `>75` and `>95` all returned the same 8 exclusive machines.
+DISK_GB = _env("DISK_GB", 80)
 
 # Deploy retries, per dispatch pass and per instance.
 #

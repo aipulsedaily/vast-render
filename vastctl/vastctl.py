@@ -80,12 +80,14 @@ except ModuleNotFoundError:
 # word: "ladderbroker", not "renderbroker-ladder".
 LABEL_PREFIX = os.environ.get("VASTRENDER_LABEL") or "renderbroker"
 
-# Disk is rented per instance and sized here. 30 GB leaves a ~23 GB scene cache
-# after Blender and the image, which is SMALLER THAN THE LIVE WORKING SET —
-# measured 2026-08-04, five ~5 GB film scenes rotating through a 23 GB budget
-# evicted and re-pushed each other all afternoon. Overridable so a box rented
-# for one bulk sequence, or for a working set that does not fit, can pay the
-# ~$0.02/hr that a 100 GB disk costs instead of re-uploading 5 GB at a time.
+# CLI AND PROBE DEFAULT ONLY — NOT WHAT THE BROKER RENTS. `Fleet._rent` passes
+# `config.DISK_GB` explicitly to `search_offers`, `build_query` and `create`, so
+# this value is reached only by `vastctl.py` run by hand and by
+# scripts/probe_offers.py. Do not "fix" a rental size here; it will look like it
+# worked and change nothing. See broker/config.py:DISK_GB, which is 80.
+#
+# Kept env-overridable so a hand-run probe can ask the market the same question
+# the broker will ask.
 DEFAULT_DISK_GB = int(os.environ.get("VASTRENDER_DISK_GB") or 30)
 # `base`, not `devel`: Blender 5.2 ships precompiled sm_120 cubins and never
 # invokes nvcc, so the ~5 GB toolkit in the devel image buys nothing and cost
@@ -529,6 +531,28 @@ class Instance:
         return float(self.raw.get("dph_total") or 0.0)
 
     @property
+    def gpu_frac(self) -> Optional[float]:
+        """Fraction of the machine's GPUs this instance holds, or None.
+
+        THE EXCLUSIVITY GUARD IS RENT-TIME ONLY, AND THIS IS HOW YOU SEE PAST
+        THAT. `build_query` filters offers on `gpu_frac>=0.99`, but
+        `Fleet.adopt_or_reap` never re-asks: a card rented before the guard
+        existed, or taken on the loud shared fallback, is re-adopted unchecked
+        by every subsequent restart, forever, and nothing in the log or in
+        `rq status` distinguishes it from an exclusive one.
+
+        Measured 2026-08-04, which is exactly how it went: instance 46780377
+        was rented 10:15:25 from an offer with `gpu_frac 0.125` — one eighth of
+        a box — under code written before the guard landed at 13:01:19. The
+        broker then restarted at 15:31, 16:03 and 16:22 WITH the guard loaded,
+        and adopted the same shared card all three times. It measured 1.64x
+        slower per frame than an exclusive 5090 on identical work, and the only
+        number anyone saw was a $0.4203/hr headline that looked like a bargain.
+        """
+        raw = self.raw.get("gpu_frac")
+        return None if raw is None else float(raw)
+
+    @property
     def uptime_hours(self) -> float:
         mins = self.raw.get("duration") or 0
         return float(mins) / 3600.0 if mins else 0.0
@@ -644,6 +668,28 @@ def our_instances(client: VastAI) -> list[Instance]:
         Instance(r)
         for r in client.show_instances()
         if (r.get("label") or "").startswith(LABEL_PREFIX)
+    ]
+
+
+def other_instances(client: VastAI) -> list[Instance]:
+    """Instances on this account that are NOT ours — a second broker's cards.
+
+    THE OTHER HALF OF THE BILL. `our_instances` is scoped to `LABEL_PREFIX`
+    precisely so two brokers cannot reap each other, and the cost of that
+    isolation is that neither can SEE the other's spend. `rq teardown`
+    therefore destroys one card, reports success, and leaves the other billing
+    — the obvious action, reporting success, with half the money still running.
+
+    This is not `our_instances`' inverse by accident: teardown must never
+    DESTROY these (there may be a frame in flight on a sibling broker's box,
+    and cross-broker destruction is the exact bug the label split prevents).
+    It must only ever NAME them, so nobody walks away believing the farm is
+    down when it is half up.
+    """
+    return [
+        Instance(r)
+        for r in client.show_instances()
+        if not (r.get("label") or "").startswith(LABEL_PREFIX)
     ]
 
 
