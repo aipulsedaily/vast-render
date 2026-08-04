@@ -110,6 +110,26 @@ class ExecError(ValueError):
     """Rejected exec submission. Message is safe to hand back over HTTP."""
 
 
+class StaleBundle(ValueError):
+    """The code changed between submit and dispatch. TERMINAL ON SIGHT.
+
+    Its own class purely so `_run_guarded` can tell it apart from a real error,
+    because the retry budget is the wrong instrument for it in BOTH directions.
+
+    Retrying cannot help: the digest is recomputed from the same tree on every
+    attempt, so it will differ every time, and three attempts buy three
+    identical refusals. Worse, it was reached with attempts ALREADY SPENT on
+    something that was nobody's fault — on 2026-08-04 an instance replacement
+    burned two, and the bundle check then reported `3/3` as though the job had
+    been tried and found wanting. It had never run once.
+
+    So: fail immediately, with the verdict rather than an attempt count, and
+    say what to do about it. The refusal itself stays exactly as it was —
+    building new code and filing it under a request for the old code is the
+    silent-wrong-output class this project keeps paying for.
+    """
+
+
 def resolve_bundle_root(raw: str) -> Path:
     if not raw or not str(raw).strip():
         raise ExecError("bundle_root is required — an exec job's input is a code tree")
@@ -184,6 +204,85 @@ class ExecService:
 
     # --- readiness -------------------------------------------------------
 
+    def endpoint_without_disturbing_the_worker(self) -> remote.Endpoint:
+        """A box to run exec work on, WITHOUT asking the render worker anything.
+
+        THIS IS THE FIX FOR `rq exec` FAILING `WorkerBusy` BEHIND A RENDER.
+
+        The old code called `fleet.ensure_ready(the_scene_already_loaded)` and
+        described it as "the no-op fast path ... an exec job must never restart
+        the render worker". The intent was right and the call was wrong:
+        `Fleet.ensure_ready` runs `self._refuse_if_rendering()` as its FIRST
+        statement, *before* the fast path it was being trusted to reach. So the
+        no-op could not be reached while a frame was rendering — the guard fired
+        first, every time, and exec was refused for asking a question it already
+        knew the answer to. Measured 2026-08-04: three exec jobs from the
+        circuit-surface agent died this way in thirty minutes, one of them on a
+        box that was four minutes old.
+
+        `_refuse_if_rendering` is correct and stays. It protects DEPLOYS — a
+        worker restart that discards a frame in flight, which is how a
+        40-minute 8K render was once thrown away. Exec is not a deploy. It
+        needs an instance that is up; it does not need the render worker idle,
+        it does not need a scene loaded, and it does not need `Fleet.lock`.
+
+        WHY THIS CANNOT DISTURB A RENDER, structurally rather than by intent:
+
+          * The exec server is a SEPARATE PROCESS on a SEPARATE PORT (8800)
+            reached through a SEPARATE TUNNEL, with its own slots.
+          * `stop_exec_server` kills by the pattern `{root}/exec_server.py`;
+            `WORKER_PIDS` uses `{root}/server.py`. Neither string contains the
+            other, so `pgrep -f` cannot cross them. Exec has no code path that
+            can signal the render worker at all.
+
+        AND WHY IT CANNOT STARVE. The whole point is that it does not wait: a
+        14-hour sequence pass keeps `ep`, `last_ready` and a live box, which is
+        exactly the condition this returns on immediately. Exec no longer
+        queues behind the render worker because it no longer asks it anything.
+
+        The slow branch is only reached when there is genuinely no usable box —
+        no instance, hibernated, or a deploy that never completed. In every one
+        of those states there is no render in flight to protect, so going
+        through `Fleet` is both necessary and safe.
+        """
+        fleet = self.fleet
+        ep = fleet.ep
+        # DELIBERATELY NOT GATED ON `last_ready`. That flag means "the RENDER
+        # WORKER came up", which is a question exec does not ask and must not
+        # wait on. Gating on it cost a hot requeue loop the first time this
+        # shipped: after a restart that ADOPTS a running instance, `ep` is set
+        # immediately but `last_ready` stays False until the first render
+        # dispatch completes, so every queued exec job fell to the slow branch,
+        # raised, requeued and was re-claimed — measured at roughly ten
+        # requeues per second until a render happened to finish.
+        #
+        # An endpoint that is not `stopped_at` is an instance this broker owns
+        # and can reach. If it turns out not to be deployed, `start_exec_server`
+        # below says so loudly against the real box, which is a far better
+        # answer than this function guessing from a flag about a different
+        # process.
+        if ep is not None and not fleet.stopped_at:
+            return ep
+
+        # No usable box. Exec needs one deployed, and `Fleet.ensure_ready` is
+        # the only thing that may rent or wake one — but it insists on a scene,
+        # because the render path always has one.
+        scene = fleet.scene_path or (config.SCENE if config.SCENE.exists() else None)
+        if scene is None:
+            # Do NOT raise FileNotFoundError here. It is not in the transport
+            # class, so it would burn an attempt and fail the job outright —
+            # which is what happened at 18:38:00 when `config.SCENE` pointed at
+            # a scene.blend that has never existed. "There is no box yet" is a
+            # WAIT, not a verdict on the build: FleetUnavailable requeues
+            # without spending an attempt, so exec simply waits for the first
+            # render job to bring a box up.
+            raise remote.FleetUnavailable(
+                f"exec needs a deployed instance and there is none: no scene is "
+                f"loaded and the default scene {config.SCENE} does not exist, so "
+                f"there is nothing to deploy with. Queue a render, or set "
+                f"VASTRENDER_SCENE to a real .blend.")
+        return fleet.ensure_ready(Path(scene))
+
     def ensure_ready(self) -> None:
         """An instance, an exec server on it, and a live forward to that server.
 
@@ -193,11 +292,7 @@ class ExecService:
         because it is a process on a container that was stopped.
         """
         with self.ready_lock:
-            # The scene the render worker already holds, so this is the no-op
-            # fast path of ensure_ready rather than a scene switch. An exec job
-            # must never restart the render worker.
-            scene = self.fleet.scene_path or config.SCENE
-            ep = self.fleet.ensure_ready(Path(scene))
+            ep = self.endpoint_without_disturbing_the_worker()
 
             if self.tunnel is not None and self.tunnel.poll() is not None:
                 log.warning("exec tunnel exited %s — reopening", self.tunnel.returncode)
@@ -318,6 +413,25 @@ class ExecService:
         except Exception as exc:
             log.debug("exec purge skipped: %s", remote.diagnose(exc))
 
+    def _wait_out_the_frame(self) -> float:
+        """Sleep off a busy render worker, HOLDING THIS JOB'S EXEC SLOT.
+
+        Holding the slot is the point, not a side effect. Requeueing straight
+        away puts the row back on a queue the dispatcher re-reads in
+        milliseconds, so the job is re-claimed, refused and requeued again —
+        measured at roughly ten times a second. Staying `inflight` across the
+        wait means one retry per backoff period, and it is honest: the job
+        really is occupying capacity, waiting for the box.
+
+        The other eleven slots stay free, so this never blocks exec work that
+        could run. Interruptible so a broker shutdown is not held up for 90 s.
+        """
+        deadline = time.time() + float(config.EXEC_BUSY_BACKOFF_SEC)
+        started = time.time()
+        while time.time() < deadline and self.broker.running:
+            time.sleep(min(2.0, deadline - time.time()))
+        return time.time() - started
+
     def _run_guarded(self, job: dict, spec: dict) -> None:
         job_id = job["id"]
         try:
@@ -329,7 +443,17 @@ class ExecService:
             # failed — the broker merely lost the box. Requeue without spending
             # an attempt, exactly as the render path refunds a pass that lost
             # its transport rather than its render.
-            if isinstance(exc, remote.DiskFull):
+            if isinstance(exc, StaleBundle):
+                # Terminal on sight, and NOT by exhausting a budget. See
+                # StaleBundle: retrying recomputes the same differing digest,
+                # and the attempts it would spend were often already gone to a
+                # fleet failure that had nothing to do with this job.
+                self.db.fail_terminal(job_id, why)
+                log.error("exec job %s FAILED on a STALE BUNDLE and will NOT be "
+                          "retried — the code moved under it, which no number of "
+                          "attempts can fix. Resubmit to build the new code: %s",
+                          job_id, why)
+            elif isinstance(exc, remote.DiskFull):
                 # Terminal, and deliberately not retried — the same rule the
                 # render path applies. The preflight measured the disk, evicted
                 # what it could and found it still does not fit; three more
@@ -338,6 +462,25 @@ class ExecService:
                 self.db.fail_terminal(job_id, why)
                 log.error("exec job %s FAILED on DISK and will NOT be retried — %s",
                           job_id, why)
+            elif isinstance(exc, (remote.WorkerBusy, remote.FleetUnavailable)):
+                # A WAIT, NOT A VERDICT. `WorkerBusy` says "a frame is in flight
+                # right now" — a condition that clears on its own, usually
+                # within a minute. Failing the job for it is answering "not yet"
+                # with "never": three escalating attempts inside four seconds
+                # and then a terminal failure, measured 2026-08-04.
+                #
+                # After `endpoint_without_disturbing_the_worker` this should be
+                # unreachable for exec, because exec no longer asks the render
+                # worker anything. It is kept as the safety net for the one race
+                # that remains — the render dispatcher holding `Fleet.lock`
+                # mid-scene-switch while the previous frame is still finishing —
+                # and it must not consume an attempt, or a busy afternoon would
+                # exhaust the retries of a job that never got to run once.
+                waited = self._wait_out_the_frame()
+                self.db.requeue(job_id, f"{why} [worker busy, attempt refunded]")
+                log.info("exec job %s waited %.0fs and was requeued WITHOUT "
+                         "spending an attempt — a render is in flight and that "
+                         "is a WAIT, not a failure: %s", job_id, waited, why)
             elif isinstance(exc, (remote.ConnectionDropped, remote.SshError,
                                   remote.WorkerUnreachable, remote.FleetUnavailable)):
                 self.db.requeue(job_id, f"{why} [transport, attempt refunded]")
@@ -369,7 +512,7 @@ class ExecService:
         # paying for, so it is refused rather than accommodated.
         bundle = plan_bundle(spec["bundle_root"], spec["bundle_patterns"])
         if bundle.digest != job["bundle"]:
-            raise ValueError(
+            raise StaleBundle(
                 f"the input bundle changed between submit and dispatch: this job "
                 f"was queued against {job['bundle']} and {spec['bundle_root']} now "
                 f"hashes to {bundle.digest}. Resubmit if the new code is what you "

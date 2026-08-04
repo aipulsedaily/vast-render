@@ -781,6 +781,32 @@ def worker_ready_budget(scene_bytes: int) -> float:
 # Admission control. Dedup is deliberately absent — two agents asking for the
 # same frame get two renders, because a params hash cannot see scene state and
 # would silently serve stale frames across a reassembly.
+# HOW LONG AN EXEC JOB WAITS OUT A BUSY RENDER WORKER, AND WHY IT IS A SLEEP.
+#
+# `Fleet.ensure_ready` refuses to deploy over a frame in flight — correctly; it
+# is what stops a worker restart discarding hours of GPU time. An exec job that
+# meets that refusal has not failed, it has arrived at the wrong moment, and the
+# moment passes. Before this existed, the refusal spent one of MAX_ATTEMPTS and
+# the three retries fired within four seconds, so the whole budget expired
+# INSIDE A SINGLE 39 s FRAME. Measured 2026-08-04: four exec jobs from the
+# circuit-surface agent died that way in twenty minutes, every one at 3/3.
+#
+# Two properties matter and both come from waiting IN THE WORKER THREAD, which
+# holds its exec slot across the sleep rather than requeueing immediately:
+#
+#   * NO SPIN. A bare requeue is re-claimed on the next loop iteration in
+#     milliseconds. The first version of this fix shipped without the wait and
+#     produced ~10 requeues per second until a render happened to finish.
+#   * LONGER THAN A FRAME. Backing off for less than one frame guarantees the
+#     retry lands inside the next one. 90 s against measured 38.99-40.02 s
+#     frames is two frames of margin.
+#
+# Note this is a different mechanism from the ladder's ≤62-frame chunking, and
+# chunking does not help here: chunk boundaries are ~40 minutes apart while the
+# retry budget expired in under two minutes. Chunking bounds how long a job
+# waits for the SCHEDULER; this bounds how long it waits for the DEPLOY GUARD.
+EXEC_BUSY_BACKOFF_SEC = _env("EXEC_BUSY_BACKOFF", 90.0)
+
 MAX_QUEUE_DEPTH = _env("MAX_QUEUE_DEPTH", 200)
 MAX_PER_AGENT_QUEUED = _env("MAX_PER_AGENT", 25)
 

@@ -62,6 +62,65 @@ whose own worker is busy still refuses; it has no idea the other card is idle.
 Routing exec to the bulk broker (`VASTRENDER_URL=http://127.0.0.1:8761 rq exec`)
 is a workaround that happens to land on an idle box, not a fix.
 
+**FIXED 2026-08-04**, after it killed four jobs in twenty minutes, every one at
+`attempts 3/3`. Two things were wrong and only one of them was the scheduler.
+
+*The verdict was wrong.* `WorkerBusy` fell through to `db.fail(..., MAX_ATTEMPTS)`
+and the three retries fired within four seconds, so **the whole retry budget
+expired inside a single 39 s frame**. It now requeues without spending an
+attempt, after waiting `EXEC_BUSY_BACKOFF_SEC` (90 s, more than two frames) **in
+the worker thread, holding its exec slot**. Holding the slot is the point: a
+bare requeue is re-claimed in milliseconds, and the first version of this fix
+shipped without the wait and produced ~10 requeues per second.
+
+*Chunking does not help here, and that is worth stating because it looks like it
+should.* The ladder's <=62-frame chunks are ~40 minutes apart; the retry budget
+expired in under two. **Chunking bounds how long a job waits for the SCHEDULER;
+this bounds how long it waits for the DEPLOY GUARD.** Two mechanisms, and only
+one was covered.
+
+*The question was wrong too.* `ExecService.ensure_ready` asked
+`Fleet.ensure_ready` for an endpoint, calling it "the no-op fast path". It is
+not: `Fleet.ensure_ready` runs `_refuse_if_rendering()` as its FIRST statement,
+before the fast path, so the no-op could never be reached while a frame was in
+flight. `endpoint_without_disturbing_the_worker` now returns `fleet.ep`
+directly whenever the box is up. Exec needs an instance; it does not need the
+render worker idle, a scene loaded, or `Fleet.lock`. This cannot disturb a
+render structurally, not by intention: `stop_exec_server` kills by
+`{root}/exec_server.py` and `WORKER_PIDS` by `{root}/server.py`, and neither
+string contains the other, so `pgrep -f` cannot cross them.
+
+Do NOT gate that fast path on `fleet.last_ready`. It means "the RENDER WORKER
+came up", which exec does not ask; gating on it made every queued exec job spin
+after a restart that ADOPTS a running instance, because `ep` is set immediately
+and `last_ready` stays False until the first render dispatch finishes.
+
+*Verified live, bracketed by two consecutive frames of a running pass:*
+
+```
+18:50:34  sequence r2beat1 frame 740 done
+18:51:44  exec job 0ba1bd361c0e DONE - 0.7 s on the box, attempts=1, no WorkerBusy
+18:51:58  sequence r2beat1 frame 741 done
+```
+
+### A retry budget is the wrong instrument for "nobody's fault"
+
+Same pass, same principle. `the input bundle changed between submit and
+dispatch` was raised as a bare `ValueError` and went through
+`db.fail(..., MAX_ATTEMPTS)`. Retrying cannot help - the digest is recomputed
+from the same moving tree every time - and it was typically reached with
+attempts already spent on something unrelated (an instance replacement burned
+two on 2026-08-04), so it reported `3/3` for a job that had never run once.
+It is now `StaleBundle`, terminal on sight, reported as a verdict with what to
+do about it. The refusal itself is unchanged and correct.
+
+**A live consequence, for whoever owns `r2651-occ-full`.** Its bundle is 96
+files / 38.3 MB drawn from `world/*.py`, `world/items/*` and friends - files
+eight agents are actively editing. Every second between submit and dispatch is
+a chance for the digest to move, and the 90 s busy-backoff *widens that window*.
+The fix stops `WorkerBusy` killing the job; it cannot stop the tree moving under
+it. **Narrow `--include` to the files the script actually reads.**
+
 ## 2026-08-03 — the stray inode that destroyed a healthy instance, and the fix that ate the evidence
 
 `mkdir -p /workspace/scenes/139698d62abee3bf` (relief_2light_A2.blend) failed
