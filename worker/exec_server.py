@@ -228,6 +228,79 @@ def memory_available() -> Optional[int]:
     return None
 
 
+# --- processes ------------------------------------------------------------
+#
+# Everything below reads /proc and never guesses. Each function answers exactly
+# one question about one pid, and every one of them treats "the process went
+# away while I was looking at it" as a normal answer rather than an error — a
+# reaper races with the thing it is reaping by definition.
+
+
+def proc_alive(pid: int) -> bool:
+    """Is this pid still running — and NOT a zombie?
+
+    A zombie answers `kill(pid, 0)` and appears in /proc, but it has already
+    exited: its memory is freed and the entry survives only until someone waits
+    on it. Counting one as alive makes the reaper wait out its full SIGKILL
+    grace and then report the kill as having FAILED, which is the opposite of
+    what happened. That matters because the surviving-orphan warning is meant
+    to be believed.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return False
+    # The comm field is parenthesised and may itself contain spaces and
+    # parentheses, so split after the LAST ')' — the usual /proc/stat trap.
+    tail = raw.rpartition(b")")[2].split()
+    if not tail:
+        return True                          # unparseable: assume alive
+    return tail[0] not in (b"Z", b"X", b"x")
+
+
+def proc_rss(pid: int) -> int:
+    """Resident bytes, or 0 if it cannot be read.
+
+    Reported only so the log can say what the reap gave back — the whole reason
+    orphans matter here is the memory they hold against the cgroup gate.
+    """
+    try:
+        with open(f"/proc/{pid}/statm") as fh:
+            pages = int(fh.read().split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+    return pages * os.sysconf("SC_PAGE_SIZE")
+
+
+def proc_cwd_in(pid: int, root: str) -> Optional[str]:
+    """This pid's cwd if it sits inside `root`, else None.
+
+    A DELETED cwd still identifies its process: the kernel renders the link as
+    "<path> (deleted)". The suffix is stripped before the containment test
+    precisely so a job directory that `sweep_stale` already removed does not
+    hide the process that was using it — that is the state the seven hand-reaped
+    orphans were found in.
+
+    The suffix is stripped only when what remains is an absolute path, because
+    a directory legitimately named "x (deleted)" is a path a caller controls and
+    this must not become a way to point the reaper at an arbitrary process.
+    """
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return None                          # gone, or another user's process
+    probe = cwd
+    if probe.endswith(" (deleted)"):
+        stripped = probe[: -len(" (deleted)")]
+        if stripped.startswith("/"):
+            probe = stripped
+    root = os.path.realpath(root)
+    if probe != root and not probe.startswith(root + os.sep):
+        return None
+    return cwd
+
+
 # --- paths ----------------------------------------------------------------
 
 
@@ -370,11 +443,113 @@ class ExecServer:
         self.started = time.time()
         self.jobs = 0
         self.failures = 0
+        # Filled by serve(); reported by ping() so the broker can see that a
+        # restart leaked, without anyone having to be logged into the instance
+        # at the moment it happened.
+        self.orphans_reaped: dict = {"count": 0, "rss_bytes": 0, "pids": []}
         self._count_lock = threading.Lock()
         os.makedirs(self.root, exist_ok=True)
         os.makedirs(self.bundles, exist_ok=True)
 
     # --- lifecycle ------------------------------------------------------
+
+    def reap_orphans(self) -> dict:
+        """Kill the CHILDREN a previous exec server left running. Nothing else did.
+
+        `sweep_stale` deletes the job *directories*. It never looked at the
+        processes still using them, and an exec server that is restarted —
+        `shutdown`, SIGKILL, a redeploy, the supervisor replacing it — does not
+        take its children with it. `run_child` starts every child with
+        `start_new_session=True` precisely so a timeout can kill a whole tree,
+        and that same call is what makes the tree survive its parent: the child
+        is its own session leader, so it is re-parented to init and keeps
+        running with nobody waiting on it.
+
+        Measured on the live box: **seven orphaned Blender processes holding
+        ~35 GB** had to be reaped by hand. They are not merely wasteful. They
+        are counted in `memory.current`, which is the number `memory_available`
+        subtracts from `memory.max` — so the orphans are *invisible* to the
+        memory gate as a cause while being fully visible to it as pressure. The
+        gate then holds legitimate work at the door, forever, waiting for
+        memory that nothing will ever release. A defect that silently converts
+        the safety mechanism into the outage is worth more than the 35 GB.
+
+        HOW AN ORPHAN IS IDENTIFIED, and why not by name. `pkill -f blender`
+        would kill the render worker holding a multi-gigabyte warm scene — the
+        exact process this file's OOM comment exists to protect, and the same
+        kill-by-pattern class as the stale-worker bug already logged in the
+        broker. The honest signal is the working directory: `run_child` runs
+        every child with `cwd=<exec root>/<job_id>`, and no other process on
+        the box has a cwd inside the exec root. That test is unambiguous
+        whether or not the directory still exists, because a deleted cwd still
+        reads as its old path with " (deleted)" appended — which is why this
+        runs BEFORE `sweep_stale` rather than after: intact paths first, and
+        the deleted form only as the fallback it should be.
+
+        A fresh server owns no children, so everything this finds is an orphan
+        by construction — the same argument `sweep_stale` makes about
+        directories, applied to the processes that were using them.
+        """
+        me = os.getpid()
+        try:
+            my_pgid = os.getpgid(0)
+        except OSError:                                     # pragma: no cover
+            my_pgid = None
+        victims: list[tuple[int, Optional[int], int, str]] = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == me:
+                continue
+            cwd = proc_cwd_in(pid, self.root)
+            if cwd is None:
+                continue
+            try:
+                pgid = os.getpgid(pid)
+            except OSError:
+                pgid = None
+            # NEVER killpg our own group. If a child somehow shares it, signal
+            # the pid alone: a group kill here would take out this server, and
+            # a reaper whose failure mode is suicide is worse than the leak.
+            if pgid is not None and my_pgid is not None and pgid == my_pgid:
+                pgid = None
+            victims.append((pid, pgid, proc_rss(pid), cwd))
+
+        if not victims:
+            return {"count": 0, "rss_bytes": 0, "pids": []}
+
+        rss = sum(v[2] for v in victims)
+        for pid, pgid, bytes_, cwd in victims:
+            log(f"orphan from a previous exec server: pid {pid} "
+                f"rss {bytes_ / 1e9:.2f}G cwd {cwd} — killing")
+        for sig, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
+            alive = [v for v in victims if proc_alive(v[0])]
+            if not alive:
+                break
+            for pid, pgid, _, _ in alive:
+                try:
+                    if pgid is not None:
+                        os.killpg(pgid, sig)
+                    else:
+                        os.kill(pid, sig)
+                except OSError as exc:
+                    if exc.errno != errno.ESRCH:
+                        log(f"reaping {pid}: kill {sig} failed: {exc}")
+            deadline = time.time() + grace
+            while time.time() < deadline and any(proc_alive(v[0]) for v in alive):
+                time.sleep(0.2)
+
+        survived = [v[0] for v in victims if proc_alive(v[0])]
+        if survived:
+            # Say it rather than swallow it: unkillable orphans mean the memory
+            # they hold is not coming back, and the gate below will refuse work
+            # for a reason this line is the only record of.
+            log(f"WARNING {len(survived)} orphan(s) survived SIGKILL: {survived} — "
+                f"their memory stays charged to this cgroup and the memory gate "
+                f"will keep holding jobs at the door because of it")
+        return {"count": len(victims), "rss_bytes": rss,
+                "pids": [v[0] for v in victims], "survived": survived}
 
     def sweep_stale(self) -> int:
         """Delete every job directory left by a previous exec server.
@@ -866,6 +1041,7 @@ class ExecServer:
             "disk": {"total": usage.total, "free": usage.free},
             "mem_available": memory_available(),
             "mem_floor": self.min_free_mem,
+            "orphans_reaped": self.orphans_reaped,
             "blender": self.blender,
             "root": self.root,
         }
@@ -932,6 +1108,18 @@ class ExecServer:
                 pass
 
     def serve(self, port: int, host: str = "127.0.0.1") -> None:
+        # PROCESSES BEFORE DIRECTORIES. Both are stale for the same reason, but
+        # the reap identifies its victims by a cwd inside the exec root, and
+        # sweeping first turns every one of those into the "(deleted)" form.
+        # It still works — proc_cwd_in handles it — but the intact path is the
+        # stronger evidence, so take it while it is there.
+        orphans = self.reap_orphans()
+        self.orphans_reaped = orphans
+        if orphans["count"]:
+            log(f"reaped {orphans['count']} orphaned child process(es) holding "
+                f"{orphans['rss_bytes'] / 1e9:.2f}G from a previous exec server — "
+                f"that memory was charged to this cgroup and the memory gate was "
+                f"refusing work because of it")
         swept = self.sweep_stale()
         if swept:
             log(f"swept {swept} stale job director(ies) — a fresh exec server is by "

@@ -27,6 +27,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -377,6 +378,63 @@ def run_checks(h: Harness) -> None:
     except RuntimeError as exc:
         check("REFUSED: a job when free disk is below the floor",
               "free" in str(exc), str(exc)[:70])
+
+    # --- orphan reaping ---------------------------------------------------
+    #
+    # The leak this covers: an exec server that is restarted does NOT take its
+    # children with it — `start_new_session=True` makes each one a session
+    # leader, so it is re-parented to init and keeps running. Seven of them
+    # holding ~35 GB were reaped by hand on the live box. The memory is charged
+    # to the same cgroup `memory_available` reads, so the orphans are invisible
+    # to the memory gate as a cause and fully visible to it as pressure: the
+    # gate then refuses legitimate work forever, waiting on memory that nothing
+    # will release.
+    #
+    # The second check is the important one. `pkill -f blender` would also have
+    # cleared the orphans — and taken the render worker holding a warm
+    # multi-gigabyte scene with it. Reaping must be decided by cwd, not by name.
+    def spawn_at(cwd: Path) -> subprocess.Popen:
+        cwd.mkdir(parents=True, exist_ok=True)
+        return subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(600)"],
+            cwd=str(cwd), start_new_session=True, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def fresh_server() -> "X.ExecServer":
+        return X.ExecServer(str(h.root), str(h.bundles), slots=1,
+                            blender=h.blender, min_free_gb=0.0)
+
+    inside = spawn_at(h.root / "orphanjob")
+    outside = spawn_at(h.outside / "innocent")
+    time.sleep(0.4)
+    reaped = fresh_server().reap_orphans()
+    inside.poll()
+    check("an orphan whose cwd is inside the exec root is reaped",
+          inside.poll() is not None and inside.pid in reaped["pids"],
+          f"count={reaped['count']} rss={reaped['rss_bytes']}")
+    check("a process outside the exec root is left alone",
+          outside.poll() is None and outside.pid not in reaped["pids"],
+          "kill-by-pattern would have taken the render worker instead")
+    check("the reap reports the memory it gave back, and no survivors",
+          reaped["rss_bytes"] > 0 and not reaped["survived"],
+          f"{reaped['rss_bytes']} bytes")
+
+    # The state the seven were actually found in: the job directory had already
+    # been swept, so the cwd link reads "<path> (deleted)". An identification
+    # that only matched intact paths would have missed every one of them.
+    gone_dir = h.root / "deletedjob"
+    gone = spawn_at(gone_dir)
+    time.sleep(0.4)
+    shutil.rmtree(gone_dir)
+    reaped2 = fresh_server().reap_orphans()
+    gone.poll()
+    check("an orphan whose job directory was already deleted is still found",
+          gone.poll() is not None and gone.pid in reaped2["pids"],
+          "cwd reads '<path> (deleted)'")
+    check("a fresh root with nothing running reaps nothing",
+          fresh_server().reap_orphans()["count"] == 0)
+    outside.kill()
+    outside.wait(timeout=10)
 
     # --- the wire ---------------------------------------------------------
     port = 8899
