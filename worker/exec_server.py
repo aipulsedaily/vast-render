@@ -480,7 +480,12 @@ class ExecServer:
         kill-by-pattern class as the stale-worker bug already logged in the
         broker. The honest signal is the working directory: `run_child` runs
         every child with `cwd=<exec root>/<job_id>`, and no other process on
-        the box has a cwd inside the exec root. That test is unambiguous
+        the box has a cwd inside the exec root — checked, not assumed: both
+        `remote.worker_launch_cmd` and `execremote.exec_launch_cmd` open with
+        `cd {root}`, so the render worker and this server itself both sit at
+        /workspace while the exec root is /workspace/exec. The render worker is
+        therefore out of reach of this function by construction, not by
+        carefulness. That test is unambiguous
         whether or not the directory still exists, because a deleted cwd still
         reads as its old path with " (deleted)" appended — which is why this
         runs BEFORE `sweep_stale` rather than after: intact paths first, and
