@@ -518,6 +518,34 @@ class Fleet:
             "mb_per_sec": round(t["bytes"] / 1e6 / elapsed, 2) if elapsed > 1 else None,
         }
 
+    def staging_digest(self) -> Optional[str]:
+        """The scene THIS fleet is pushing right now, by content, or None.
+
+        For the exec dispatcher, which stages scenes of its own into the same
+        content-addressed cache and must not start a second copy of a push that
+        is already in flight. Both halves are 8 GB and both go up the same
+        uplink; the second one does not get half the bandwidth, it gets a
+        `Connection timed out`.
+
+        Measured on instance 47040457, 2026-08-07: `Fleet._deploy` began pushing
+        film16_breach.blend at 03:27:14 and finished at 03:31:52 (277.6 s, 28.7
+        MB/s). `ExecService.ensure_scene_staged` started pushing THE SAME DIGEST
+        at 03:30:23 and died twenty seconds later —
+
+          TransferError: scene push failed after 20.0s ... 7969670247 bytes to
+          move: ssh: connect to host ... Connection timed out
+
+        — which was then charged to the exec job as a build failure. The bytes
+        it wanted were 89 seconds from being on the box already.
+
+        Local state only: no SSH, nothing that blocks, nothing that can fail.
+        `None` is the honest answer for "nothing in flight" and for "in flight
+        but from an older broker that did not record a digest", and both mean
+        the caller should go and ask the instance itself.
+        """
+        t = self.transfer
+        return (t or {}).get("digest") or None
+
     def disk_report(self) -> dict:
         """The instance's disk, for `rq status`. Never blocking, never invented.
 
@@ -2372,8 +2400,13 @@ class Fleet:
                           if line.strip() and line.strip() != STRAY_MARK))
         self.status = "uploading-scene"
         log.info("pushing scene %s (%.0f MB) hash=%s", scenes.label(scene), size / 1e6, digest)
+        # The digest is carried alongside the label so ANOTHER dispatcher can
+        # recognise this push as the one it was about to start. See
+        # `Fleet.staging_digest` and `ExecService.ensure_scene_staged`: the
+        # label is for humans and two different assemblies can share a filename,
+        # which is the exact confusion `scene_hash` exists to prevent.
         self.transfer = {"what": scenes.label(scene), "bytes": size,
-                         "began": time.time()}
+                         "began": time.time(), "digest": digest}
         try:
             elapsed = remote.push_scene(ep, scene, remote_path=final + ".part")
         finally:

@@ -528,6 +528,33 @@ class ExecService:
         if remote.scene_cached(ep, digest, size, name):
             remote.touch_scene(ep, digest)
             return
+        # THE RENDER PATH MAY ALREADY BE PUSHING THESE EXACT BYTES. Checked
+        # after `scene_cached` and before anything expensive, because it is the
+        # cheapest possible answer — one dict lookup of local state, no SSH.
+        #
+        # A PRECONDITION IN PREFERENCE TO A RETRY. The failure it replaces is
+        # not a classification problem, it is two 8 GB streams contending for
+        # one uplink: on 2026-08-07 `Fleet._deploy` was 189 s into pushing
+        # film16_breach.blend when this method started pushing the same digest,
+        # and the second stream was reset in twenty seconds
+        # (`ssh: connect to host ... Connection timed out`). Refunding that
+        # attempt is right and is now done, but the push should never have been
+        # started: the bytes were 89 s from being resident, and the duplicate
+        # was also stealing bandwidth from the deploy it was waiting on.
+        #
+        # `FleetUnavailable` rather than a local sleep, so the wait is visible in
+        # the queue and bounded by the backoff every other wait uses. Content
+        # addressing is what makes this safe to skip on: a matching digest is
+        # the same assembly, so the push in flight is not merely similar work,
+        # it is THIS work.
+        staging = self.fleet.staging_digest()
+        if staging == digest:
+            raise remote.FleetUnavailable(
+                f"the render path is already pushing scene {name} "
+                f"({digest[:12]}) to {ep} — this exec job wants the same bytes, "
+                f"by content, and a second stream up the same uplink does not "
+                f"halve the bandwidth, it times out. Waiting for the push in "
+                f"flight to land, which is not a verdict on this build.")
         source = Path(spec["scene_path"])
         if not source.is_file():
             raise remote.FleetUnavailable(
@@ -564,10 +591,26 @@ class ExecService:
         The other eleven slots stay free, so this never blocks exec work that
         could run. Interruptible so a broker shutdown is not held up for 90 s.
         """
-        deadline = time.time() + float(config.EXEC_BUSY_BACKOFF_SEC)
+        return self._hold_the_slot_and_wait(float(config.EXEC_BUSY_BACKOFF_SEC))
+
+    def _hold_the_slot_and_wait(self, seconds: float) -> float:
+        """Back off for `seconds` without giving up this job's exec slot.
+
+        Factored out of `_wait_out_the_frame` so the TRANSPORT branch can have
+        it too, because a refund without a backoff is not a fix — it is a
+        different bug. `db.requeue` puts the row straight back on a queue
+        `loop()` re-reads every second, so an immediately-requeued job is
+        re-claimed, meets the same unfinished deploy, and requeues again. That
+        spin is already documented at `config.EXEC_BUSY_BACKOFF_SEC` and was
+        measured at ~10 requeues per second the first time the busy path shipped
+        without a wait; the transport path shipped without one from the start
+        and only escaped the same fate because it was, until now, nearly
+        unreachable.
+        """
+        deadline = time.time() + max(seconds, 0.0)
         started = time.time()
         while time.time() < deadline and self.broker.running:
-            time.sleep(min(2.0, deadline - time.time()))
+            time.sleep(min(2.0, max(deadline - time.time(), 0.0)))
         return time.time() - started
 
     def _run_guarded(self, job: dict, spec: dict) -> None:
@@ -627,11 +670,53 @@ class ExecService:
                 log.info("exec job %s waited %.0fs and was requeued WITHOUT "
                          "spending an attempt — this is a WAIT, not a verdict "
                          "on the build: %s", job_id, waited, why)
-            elif isinstance(exc, (remote.ConnectionDropped, remote.SshError,
-                                  remote.WorkerUnreachable, remote.FleetUnavailable)):
+            elif isinstance(exc, remote.RemoteError):
+                # EVERYTHING `remote` RAISES IS ABOUT THE BOX OR THE WIRE, AND
+                # NOTHING IT RAISES IS ABOUT THE CALLER'S CODE. That is the rule,
+                # and it is stated as THE BASE CLASS on purpose.
+                #
+                # This branch used to name four subclasses, and on 2026-08-07 the
+                # two conditions that actually occurred were not among them:
+                #
+                #   * A bare `RemoteError`. `execremote` raises the base class at
+                #     six sites — the exec server exiting immediately after
+                #     launch, a survivor of `stop_exec_server`, a port still
+                #     bound, a tunnel that exited or never bound, a server that
+                #     never answered a ping. Every one of those is the box, and
+                #     every one of them fell through to `fail()`. Job
+                #     b0d427488e0f, 03:26:41-03:26:53: three attempts in twelve
+                #     seconds against a Blender bundle that was still uploading,
+                #     `failed` at 3/3 having never executed a line of its own
+                #     code. The install finished seventeen seconds later.
+                #   * `TransferError` — a dropped bulk push, or a fetch that came
+                #     back the wrong length or the wrong bytes. Also unlisted.
+                #     Job 88de1f4d5faf, 03:30:44: `scene push failed after 20.0s`,
+                #     charged to the build. "A failed transfer must not destroy
+                #     the instance" is already law here; a failed transfer must
+                #     not destroy the job's retry budget either, and for exactly
+                #     the same reason — THE TRANSFER IS NOT THE WORK.
+                #
+                # An allowlist of subclasses is the wrong shape for this. It
+                # fails OPEN, in the expensive direction, every time a failure
+                # mode is given a type of its own or raised as the base — and the
+                # cost of failing open is a terminal verdict on somebody's build.
+                # The base class fails CLOSED: a new transport type is refunded
+                # the day it is invented.
+                #
+                # Nothing that IS the build's fault can reach here as a
+                # `RemoteError`. A child that came back `ok: false` is raised by
+                # `run_one` as a plain `RuntimeError` carrying the tail of its
+                # log, and `worker_call` returns non-ok replies rather than
+                # raising on them. The two `RemoteError`s that are NOT waits are
+                # handled above this line and stay there: `DiskFull`, because
+                # retrying cannot create space, and `StaleBundle`, because
+                # retrying recomputes the same differing digest.
+                waited = self._hold_the_slot_and_wait(
+                    float(config.EXEC_TRANSPORT_BACKOFF_SEC))
                 self.db.requeue(job_id, f"{why} [transport, attempt refunded]")
-                log.warning("exec job %s requeued WITHOUT spending an attempt — "
-                            "this is transport, not the build: %s", job_id, why)
+                log.warning("exec job %s waited %.0fs and was requeued WITHOUT "
+                            "spending an attempt — this is the box or the wire, "
+                            "not the build: %s", job_id, waited, why)
             else:
                 state = self.db.fail(job_id, why, config.MAX_ATTEMPTS)
                 log.error("exec job %s %s: %s", job_id, state, why)

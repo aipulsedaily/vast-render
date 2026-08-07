@@ -851,6 +851,26 @@ def worker_ready_budget(scene_bytes: int) -> float:
 # waits for the SCHEDULER; this bounds how long it waits for the DEPLOY GUARD.
 EXEC_BUSY_BACKOFF_SEC = _env("EXEC_BUSY_BACKOFF", 90.0)
 
+# THE SAME MECHANISM FOR A TRANSPORT REFUND, AND WHY IT IS A DIFFERENT NUMBER.
+#
+# An exec job whose SSH, tunnel, bundle push or scene push failed has not failed;
+# the broker lost the wire. `_run_guarded` refunds the attempt — but a refund
+# without a backoff is a different bug wearing the same clothes: `db.requeue`
+# marks the row `queued` and `loop()` re-claims it within a second, so the job
+# meets the identical unfinished deploy and requeues again. That spin is not
+# theoretical, it is what the busy path did before EXEC_BUSY_BACKOFF_SEC existed,
+# measured at ~10 requeues per second.
+#
+# Shorter than the busy backoff because it is waiting on a DIFFERENT clock. 90 s
+# is two frames of margin — the right size for "a render is in flight", which is
+# the only thing that clears the busy condition. A transport condition is not
+# tied to a frame: a flapping link recovers in seconds, and a deploy that has not
+# installed Blender yet takes minutes. 30 s costs at most one wasted round trip
+# against the first and, against the second, retries ten times over a five-minute
+# deploy instead of three hundred — while holding ONE of twelve slots, so eleven
+# stay free for work that can actually run.
+EXEC_TRANSPORT_BACKOFF_SEC = _env("EXEC_TRANSPORT_BACKOFF", 30.0)
+
 # HOW MUCH FREE MEMORY A SCENE-OPENING EXEC JOB REQUIRES, AS A MULTIPLE OF THE
 # SCENE'S SIZE ON DISK — and why refusing is better than trying.
 #

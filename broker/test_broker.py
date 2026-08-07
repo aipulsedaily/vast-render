@@ -2489,6 +2489,190 @@ def test_http() -> bool:
     return True
 
 
+def test_exec_transport_is_a_wait_and_never_spends_an_attempt() -> None:
+    """`_run_guarded`'s classification, against the exceptions really raised.
+
+    The defect this pins, observed live on instance 47040457 on 2026-08-07:
+    the transport branch named four `RemoteError` SUBCLASSES, and the two
+    conditions that actually happened were neither of them —
+
+      * `execremote.start_exec_server` raises the BASE `RemoteError` for "the
+        server exited immediately after launch", which is what a Blender bundle
+        that is still uploading looks like. Job b0d427488e0f: three attempts in
+        twelve seconds, `failed` at 3/3, having never executed a line of its own
+        code, seventeen seconds before the box was ready for it.
+      * `TransferError`, for a dropped push. Job 88de1f4d5faf: `scene push
+        failed after 20.0s`, charged to the build.
+
+    So this test is written against the TYPES THE CODE RAISES rather than
+    against the list the handler happens to check, and the last check walks
+    `execremote` for `raise` sites so a new one cannot quietly reopen the hole.
+    """
+    from . import execremote
+
+    class StubBroker:
+        running = True
+        paused = False
+        last_work = 0.0
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = DB(Path(tmpdir) / "exec.db")
+        svc = execservice.ExecService.__new__(execservice.ExecService)
+        svc.broker = StubBroker()
+        svc.db = db
+        svc.fleet = None
+        svc.slots = 12
+        svc.inflight = {}
+        svc.lock = threading.Lock()
+        svc.last_error = ""
+
+        # The backoff is asserted by recording it, not by sleeping through it.
+        backoffs: list[float] = []
+        svc._hold_the_slot_and_wait = lambda s: (backoffs.append(s), 0.0)[1]
+
+        def outcome(exc: Exception) -> tuple[str, int]:
+            """Run one job that dies with `exc`, and report state and attempts.
+
+            The row is cancelled on the way out. A refunded requeue leaves it
+            `queued`, and `claim_exec` takes the OLDEST queued row — so without
+            this, every later case in this test claims the first case's job and
+            measures the wrong row. (Which is itself a small demonstration that
+            the refund really does put the job back on the queue.)
+            """
+            jid = db.submit({"entry": "tools/x.py"}, agent="a", kind="exec",
+                            bundle="0123456789abcdef")
+            claimed = db.claim_exec(600)          # attempts -> 1, state -> running
+            assert claimed is not None and claimed["id"] == jid, "claimed the wrong row"
+            def boom(job, spec):
+                raise exc
+            svc.run_one = boom
+            svc._run_guarded({"id": jid}, {})
+            row = db.get(jid)
+            db.cancel(jid)
+            return row["state"], row["attempts"]
+
+        # The exact string `start_exec_server` produced on the live farm, at the
+        # exact type it produced it: the BASE class, not a subclass.
+        state, attempts = outcome(remote.RemoteError(
+            "exec server on 192.0.2.14:45716 exited immediately after launch. "
+            "exec.log: env: '/workspace/blender/blender': No such file or directory"))
+        check("a bare RemoteError — an exec server that could not start — is a "
+              "WAIT: requeued with the attempt refunded",
+              (state, attempts) == ("queued", 0), f"{state} {attempts}/3")
+
+        state, attempts = outcome(remote.TransferError(
+            "scene push", "192.0.2.14:45716", "connection timed out", 20.0,
+            expected=7969670247))
+        check("a dropped transfer is a WAIT: the transfer is not the work, so "
+              "it costs the instance nothing and the retry budget nothing",
+              (state, attempts) == ("queued", 0), f"{state} {attempts}/3")
+
+        for label, exc in (
+            ("a dead job socket", remote.ConnectionDropped("forward died")),
+            ("an unreachable worker", remote.WorkerUnreachable("no answer")),
+            ("no usable box", remote.FleetUnavailable("blender not installed yet")),
+        ):
+            state, attempts = outcome(exc)
+            check(f"{label} is a WAIT: requeued with the attempt refunded",
+                  (state, attempts) == ("queued", 0), f"{state} {attempts}/3")
+
+        check("every refunded wait backs off first, because a requeue with no "
+              "backoff is re-claimed within a second and spins",
+              len(backoffs) >= 5 and all(b > 0 for b in backoffs), str(backoffs))
+
+        # The two RemoteErrors that are NOT waits must stay terminal, which is
+        # the ordering half of the fix: `DiskFull` IS a `RemoteError`, so a
+        # branch placed before it would silently start retrying a full disk.
+        state, attempts = outcome(remote.DiskFull("7.97 GB will not fit"))
+        check("DiskFull stays TERMINAL even though it is a RemoteError — "
+              "retrying cannot create space",
+              state == "failed", f"{state} {attempts}/3")
+        state, attempts = outcome(execservice.StaleBundle("the code moved"))
+        check("a stale bundle stays terminal", state == "failed",
+              f"{state} {attempts}/3")
+
+        # And the thing the whole budget exists for still spends it: a child
+        # that ran and came back `ok: false` is the caller's own code failing.
+        jid = db.submit({"entry": "tools/x.py"}, agent="a", kind="exec",
+                        bundle="0123456789abcdef")
+        for n in range(1, config.MAX_ATTEMPTS + 1):
+            db.claim_exec(600)
+            def boom(job, spec):
+                raise RuntimeError("exec job failed: NameError: name 'foo' is not defined")
+            svc.run_one = boom
+            svc._run_guarded({"id": jid}, {})
+            row = db.get(jid)
+            check(f"a real error in the caller's script spends attempt {n}",
+                  row["attempts"] == n, f"{row['state']} {row['attempts']}")
+        check("and terminates the job once the budget is gone",
+              db.get(jid)["state"] == "failed", db.get(jid)["state"])
+
+        # THE GUARD AGAINST THIS REGRESSING. The bug was an allowlist that did
+        # not cover what was raised, so the durable assertion is about the net,
+        # not about today's list: everything `execremote` raises must be under
+        # the base class the handler now catches.
+        src = Path(execremote.__file__).read_text()
+        raised = set(re.findall(r"raise\s+(?:remote\.)?(\w+)\(", src))
+        unclassified = sorted(
+            name for name in raised
+            if not (name in ("ValueError",) or
+                    issubclass(getattr(remote, name, type(None)), remote.RemoteError))
+        )
+        check("every failure execremote raises is a RemoteError (or a caller "
+              "input error), so the transport net cannot be reopened by adding "
+              "one more type", not unclassified, str(unclassified))
+
+
+def test_exec_never_duplicates_a_scene_push_already_in_flight() -> None:
+    """Two 8 GB streams up one uplink is not half the bandwidth, it is a reset.
+
+    `Fleet._deploy` pushed film16_breach.blend from 03:27:14 to 03:31:52 on
+    2026-08-07. `ExecService.ensure_scene_staged` began pushing THE SAME DIGEST
+    at 03:30:23 and was reset twenty seconds later. Content addressing is what
+    makes the overlap detectable and what makes skipping it safe: a matching
+    digest is not similar work, it is the same bytes.
+    """
+    fleet = Fleet.__new__(Fleet)
+    fleet.transfer = None
+    check("nothing in flight reports no staging digest",
+          fleet.staging_digest() is None)
+    fleet.transfer = {"what": "film16_breach.blend", "bytes": 7969670247,
+                      "began": time.time(), "digest": "1e8d5440c349fe51"}
+    check("a scene push in flight is reported BY CONTENT, not by filename — "
+          "two assemblies can share a name, which is why scene_hash exists",
+          fleet.staging_digest() == "1e8d5440c349fe51", str(fleet.staging_digest()))
+    fleet.transfer = {"what": "x.blend", "bytes": 1, "began": time.time()}
+    check("a transfer recorded without a digest reports None rather than "
+          "inventing one — the caller must go and ask the instance",
+          fleet.staging_digest() is None)
+
+    class StubFleet:
+        def staging_digest(self):
+            return "1e8d5440c349fe51"
+        def protected_scenes(self):
+            return set()
+
+    svc = execservice.ExecService.__new__(execservice.ExecService)
+    svc.fleet = StubFleet()
+    spec_ = {"scene_digest": "1e8d5440c349fe51", "scene_name": "film16_breach.blend",
+             "scene_bytes": 7969670247, "scene_path": "/nonexistent/film16_breach.blend"}
+    cached_calls: list = []
+
+    real_cached = remote.scene_cached
+    remote.scene_cached = lambda *a, **k: (cached_calls.append(a), False)[1]
+    try:
+        try:
+            svc.ensure_scene_staged("EP", spec_)
+            check("REFUSED: staging a scene the render path is already pushing",
+                  False, "it went ahead and pushed a second copy")
+        except remote.FleetUnavailable as exc:
+            check("REFUSED: staging a scene the render path is already pushing — "
+                  "and as a WAIT, which _run_guarded refunds",
+                  True, str(exc)[:70])
+    finally:
+        remote.scene_cached = real_cached
+
+
 def test_exec_queue_and_bundles() -> None:
     """The EXEC job type: kind separation, bundle containment, digest sensitivity.
 
@@ -4390,6 +4574,8 @@ OFFLINE_TESTS = (
     "test_wait_does_not_hold_the_fleet_lock",
     "test_thread_supervision", "test_jobs_survive_a_restart",
     "test_exec_queue_and_bundles",
+    "test_exec_transport_is_a_wait_and_never_spends_an_attempt",
+    "test_exec_never_duplicates_a_scene_push_already_in_flight",
     "test_missing_asset_patterns_see_libraries",
     "test_unresolved_libraries_are_refused",
     "test_bundled_essentials_are_not_refused",
