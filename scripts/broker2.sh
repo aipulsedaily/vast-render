@@ -38,7 +38,8 @@
 #   * `rq status`, `rq budget`, `rq teardown` are PER BROKER. `rq teardown` on
 #     8760 destroys broker 1's card and reports success while this one keeps
 #     billing. Tear both down.
-#   * `MAX_BATCH_USD` is per broker. Set low here on purpose.
+#   * `MAX_BATCH_USD` is per broker, and the DB value set by `rq budget --set`
+#     outranks the export below. Read `rq budget`, never this file.
 #   * vast.ai credit is account-wide, so `rq budget`'s `credit` line is the one
 #     figure that already counts both.
 #
@@ -74,8 +75,22 @@ export VASTRENDER_EXEC_LOCAL_PORT=8795
 export VASTRENDER_DISK_GB=80
 
 # Its own cap. The two brokers cannot see each other's spend, so neither cap
-# bounds the pair; this one is deliberately small.
-export VASTRENDER_MAX_BATCH_USD=12
+# bounds the pair.
+#
+# THIS IS A FALLBACK, NOT THE CAP. `Broker.spend_cap` reads `max_batch_usd`
+# from the DB and only falls back to this when the key is absent or garbage —
+# so once `rq budget --set` has been run, editing this line changes nothing and
+# reading it tells you the wrong number. It said 12 while the live cap was 150.
+# Check `rq budget`, not this file.
+#
+# Raised from 12 on 2026-08-07. The cap must never bind before the MONEY does:
+# a limit that stops work while credit remains is the class of guard this
+# project keeps logging, one whose number stopped tracking what it protected.
+# The crossover is (this broker's cumulative spend) + (all remaining credit),
+# because the worst case is one broker spending the whole balance — $8.33 +
+# $72.63 = $81 today, and ~$121 if the pending ~$40 top-up lands. 150 clears
+# both, so vast.ai's prepaid credit is the only ceiling. Autobilling is off.
+export VASTRENDER_MAX_BATCH_USD=150
 
 # HIBERNATE LONGER THAN THE DEFAULT, BECAUSE THIS BOX'S VALUE IS ITS CACHE.
 # Idle-down is unchanged at 300 s: stopping is good, it drops billing to
