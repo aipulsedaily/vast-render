@@ -375,6 +375,43 @@ MIN_CPU_CORES_EFFECTIVE = float(os.environ.get("VASTRENDER_MIN_CPU") or 32.0)
 # all and reads as "no capacity" rather than as a malformed query.
 MIN_CPU_RAM_GB = float(os.environ.get("VASTRENDER_MIN_RAM_GB") or 50.0)
 
+# HOW MANY GPUs THE BOX HAS — and why this was invisible.
+#
+# `num_gpus=1` was hardcoded in the query string. Not a default, not a
+# parameter: a literal. **The broker has never seen a multi-GPU machine**, so
+# every survey of "the market" this project has ever run was a survey of one
+# eighth of it, and the doc that priced multi-GPU (docs/multi-gpu.md) had to get
+# its offers by hand.
+#
+# It is the same shape as the CPU floor above and the RAM floor below it: a term
+# nobody questioned, silently excluding the best option. Three in one file.
+#
+# WHAT IT COSTS, measured against the live market 2026-08-07, exclusive only
+# (gpu_frac>=0.99) and only counting offers that carry >=42 GB RAM and >=8
+# effective cores PER GPU — i.e. offers that could actually run N concurrent
+# renders:
+#
+#     1x   $0.4014/hr   $0.4014/GPU-hr    15 of 21 offers qualify
+#     2x   $0.7767/hr   $0.3883/GPU-hr     5 of 5
+#     4x   $1.8681/hr   $0.4670/GPU-hr     1 of 1     <- n=1, noise not shape
+#     8x   $2.6703/hr   $0.3338/GPU-hr    12 of 12
+#
+# **$/GPU-hr is the only honest denominator.** A 2x box at $0.78/hr is not
+# "expensive" beside a 1x at $0.40; it is $0.39/GPU-hr, and it is the GPU-hour
+# that renders a frame.
+NUM_GPUS = int(os.environ.get("VASTRENDER_NUM_GPUS") or 1)
+
+# CORES ARE A PER-BOX FLOOR **AND** A PER-GPU ONE, AND THEY ARE NOT THE SAME
+# REQUIREMENT. `MIN_CPU_CORES_EFFECTIVE` is a BUILD constant — 12 concurrent
+# `rq exec` Blender processes on one box — so it does not multiply by GPU count.
+# What does multiply is the render side: one Blender per GPU, each wanting a
+# handful of cores to load and sync a scene. The query asks for whichever is
+# larger, so N=1 is bit-for-bit what it was.
+#
+# Expressing the build floor per GPU would be actively wrong: 32 x 8 = 256 cores
+# would exclude the 192-core 8x box that is the cheapest GPU-hour on the market.
+MIN_CPU_CORES_PER_GPU = float(os.environ.get("VASTRENDER_MIN_CPU_PER_GPU") or 8.0)
+
 # EXCLUSIVITY. `gpu_frac` is the fraction of a machine's GPUs an offer covers,
 # and it is the field that decides whether anyone else can be on our card.
 #
@@ -405,6 +442,7 @@ def build_query(min_reliability: float = 0.98, disk_gb: int = DEFAULT_DISK_GB,
                 max_inet_cost: float = MAX_INET_COST_PER_GB,
                 min_cpu: float = MIN_CPU_CORES_EFFECTIVE,
                 min_ram_gb: float = MIN_CPU_RAM_GB,
+                num_gpus: int = NUM_GPUS,
                 exclusive: bool = True) -> str:
     """A 5090 with a driver new enough for Blackwell Cycles kernels.
 
@@ -419,14 +457,29 @@ def build_query(min_reliability: float = 0.98, disk_gb: int = DEFAULT_DISK_GB,
     is a PREFERENCE, not a requirement — search_offers falls back and says so
     loudly, because exclusive supply is thin enough to strand the queue. See
     that function for the measurement behind the choice.
+
+    `num_gpus` is the box width. **RAM scales with it and disk does not**, and
+    that asymmetry is the whole argument for one N-GPU box over N boxes:
+
+      * RAM is per concurrent Blender — ~42 GB for this project's 7.97 GB
+        scene, measured — so N workers need N x that. Per-GPU is the correct
+        expression of a per-process requirement.
+      * The scene cache is CONTENT-ADDRESSED on a shared filesystem
+        (`/workspace/scenes/{digest}/`), so ONE push serves every worker on the
+        box. N instances would pay N pushes of 7.97 GB. Disk stays per-box.
+      * `collect` deletes each frame the moment its fetch verifies, so output
+        does not accumulate with width either.
     """
     frac = f"gpu_frac>={EXCLUSIVE_GPU_FRAC} " if exclusive else ""
+    n = max(1, int(num_gpus))
+    # Per-box build floor vs per-GPU render floor — see MIN_CPU_CORES_PER_GPU.
+    cores = max(min_cpu, MIN_CPU_CORES_PER_GPU * n)
     return (
-        f"gpu_name=RTX_5090 num_gpus=1 {frac}cuda_vers>=12.8 "
+        f"gpu_name=RTX_5090 num_gpus={n} {frac}cuda_vers>=12.8 "
         f"reliability>{min_reliability} inet_down>400 inet_up>400 "
         f"inet_up_cost<={max_inet_cost} inet_down_cost<={max_inet_cost} "
-        f"cpu_cores_effective>={min_cpu} "
-        f"cpu_ram>={min_ram_gb:g} "
+        f"cpu_cores_effective>={cores:g} "
+        f"cpu_ram>={min_ram_gb * n:g} "
         f"direct_port_count>=2 "
         f"disk_space>{disk_gb + 15} rentable=true verified=true"
     )
@@ -492,6 +545,7 @@ def search_offers(
     disk_gb: int = DEFAULT_DISK_GB,
     min_reliability: float = 0.98,
     limit: int = 20,
+    num_gpus: int = NUM_GPUS,
 ) -> list[dict]:
     """Candidate offers, cheapest projected total first, EXCLUSIVE ones first.
 
@@ -522,7 +576,8 @@ def search_offers(
     nobody was told about is what cost the afternoon.
     """
     exclusive = client.search_offers(
-        query=build_query(min_reliability, disk_gb, exclusive=True),
+        query=build_query(min_reliability, disk_gb,
+                          num_gpus=num_gpus, exclusive=True),
         type="on-demand", order="dph_total", limit=limit,
     )
     kept, dropped = _within_bandwidth_ceiling(exclusive)
@@ -531,7 +586,8 @@ def search_offers(
     if not kept:
         shared_fallback = True
         offers = client.search_offers(
-            query=build_query(min_reliability, disk_gb, exclusive=False),
+            query=build_query(min_reliability, disk_gb,
+                              num_gpus=num_gpus, exclusive=False),
             type="on-demand", order="dph_total", limit=limit,
         )
         kept, more_dropped = _within_bandwidth_ceiling(offers)
@@ -557,6 +613,14 @@ def search_offers(
         frac = o.get("gpu_frac")
         o["_exclusive"] = frac is not None and float(frac) >= EXCLUSIVE_GPU_FRAC
         o["_est"] = estimate_cost(o, hours, disk_gb)
+        # THE NUMBER TO COMPARE ACROSS WIDTHS, and never the one to sort on
+        # here: `_est` is what THIS broker will spend, and a broker running one
+        # worker on an 8-GPU box pays for eight and uses one. `_dph_per_gpu`
+        # only becomes the deciding figure once there is a worker per card.
+        o["_dph_per_gpu"] = float(o.get("dph_total") or 0.0) / max(
+            1, int(o.get("num_gpus") or 1))
+        o["_ram_gb_per_gpu"] = (float(o.get("cpu_ram") or 0.0) / 1024.0
+                                / max(1, int(o.get("num_gpus") or 1)))
 
     if shared_fallback:
         cheapest = min(kept, key=lambda o: o["_est"])
