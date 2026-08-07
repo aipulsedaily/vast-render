@@ -1109,7 +1109,13 @@ def cmd_status(a: argparse.Namespace) -> int:
     if frac is None:
         excl = "  gpu_frac=? (exclusivity unknown)" if fleet.get("instance_id") else ""
     elif frac >= 0.99:
-        excl = "  exclusive"
+        # SAY THE NUMBER, not just the word. The shared branch below prints its
+        # fraction and the exclusive one used to print a bare "exclusive", so
+        # the two cases were not comparable at a glance and the good case was
+        # the one carrying no evidence. `gpu_frac` is the whole basis of the
+        # claim; a reader checking that the farm is genuinely exclusive should
+        # be able to read the measurement, not be asked to trust the adjective.
+        excl = f"  exclusive (gpu_frac={frac:.3f})"
     else:
         excl = f"  !! SHARED gpu_frac={frac:.3f} (~1/{round(1/frac)} of the box, co-tenants)"
     print(f"gpu      {fleet.get('status')}  instance={fleet.get('instance_id')} "
