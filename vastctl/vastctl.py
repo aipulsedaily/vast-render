@@ -309,7 +309,36 @@ MAX_INET_COST_PER_GB = MAX_INET_COST_PER_TB / 1000.0        # 0.004
 # Blender build work is single-threaded Python per process, so throughput here
 # is very close to linear in cores until memory or the host's own load binds.
 # Ask for the cores.
-MIN_CPU_CORES_EFFECTIVE = 32.0
+#
+# BUT THIS IS A FLOOR FOR `rq exec` BUILD WORK, AND IT IS PRICING RENDER-ONLY
+# RENTALS OUT OF THE CHEAPEST QUARTER OF THE MARKET.
+#
+# Every justification above is about BUILD throughput — items/h, concurrent
+# Blender processes, slots. A GPU render is the opposite shape: one Blender
+# process, Cycles on the GPU, `denoise_gpu: true`, and the scene loaded once
+# under `persistent_data`. Measured on instance 47039886 (32 effective cores),
+# the entire CPU-bound part of a bulk pass is `load 341s` against `render
+# 17730s` — 1.9 %. Even if an 8-core host tripled the load phase it would add
+# ~0.6 % to a master, and the scene loads ONCE across all 2,978 frames.
+#
+# What the floor costs, measured on the live market 2026-08-07:
+#
+#     cpu_cores_effective>=32   cheapest EXCLUSIVE offer   $0.4547/hr
+#     cpu_cores_effective>=8    cheapest EXCLUSIVE offer   $0.3356/hr   -26 %
+#
+# Both are `gpu_frac=1.0`, so this is NOT the R2-382 co-tenancy trade — the
+# cheap cards are whole machines, verified, reliability 0.993-0.997, direct
+# ports, and inside the $4/TB bandwidth ceiling. The only thing they have less
+# of is CPU, which this workload does not use. On a 4K master that spread is
+# ~$15 — the difference between fitting in prepaid credit and not.
+#
+# So it stays 32 by DEFAULT (nothing that runs `rq exec` changes behaviour, and
+# the broker that serves builds must keep its cores), and becomes overridable
+# per broker for the render-only case — same mechanism as VASTRENDER_DISK_GB
+# above, set alongside it in the launcher script. A broker that rents on a
+# lowered floor MUST NOT be sent `rq exec` build work; that is the whole reason
+# this is a per-process env knob and not a new default.
+MIN_CPU_CORES_EFFECTIVE = float(os.environ.get("VASTRENDER_MIN_CPU") or 32.0)
 
 # EXCLUSIVITY. `gpu_frac` is the fraction of a machine's GPUs an offer covers,
 # and it is the field that decides whether anyone else can be on our card.
