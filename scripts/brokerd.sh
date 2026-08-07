@@ -105,6 +105,25 @@ supervise() {
     }
     trap on_stop TERM INT
 
+    # `python -m broker.app` resolves `broker` from the CURRENT DIRECTORY, so
+    # until this line existed the supervisor only worked when whoever ran it
+    # happened to be standing in $ROOT. Everything else in this script is
+    # absolute — $PY, $LOG, $SUP_LOCK, $ROOT itself — which made the one
+    # remaining cwd dependency invisible and made the failure look like a
+    # broken virtualenv rather than a wrong pwd:
+    #
+    #   /home/zany/vast-render/.venv/bin/python: Error while finding module
+    #   specification for 'broker.app' (ModuleNotFoundError: No module named
+    #   'broker')
+    #
+    # Observed 2026-08-07 04:03: an agent restarted the broker from its own
+    # session directory, and the supervisor did exactly what it is built to do
+    # — restarted the broker four times, with backoff, faithfully, into the
+    # same error — while a rented 5090 sat idle with a full queue. A supervisor
+    # that exists to own the broker's lifetime must not inherit the ambient
+    # directory of whoever started it.
+    cd "$ROOT" || { say ERROR "cannot cd to $ROOT — refusing to start"; exit 5; }
+
     say INFO "supervisor up (pid $$, scene ${scene:-default})"
 
     while :; do
