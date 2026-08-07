@@ -617,9 +617,16 @@ class ExecService:
                 # exhaust the retries of a job that never got to run once.
                 waited = self._wait_out_the_frame()
                 self.db.requeue(job_id, f"{why} [worker busy, attempt refunded]")
+                # Do not name the cause here — this branch covers three of
+                # them. "A render is in flight" was hardcoded, and it was
+                # already wrong for ExecMemoryShort (the box is short of
+                # memory) and is wrong again for FleetUnavailable (Blender is
+                # not installed yet, because the deploy is still running). The
+                # honest sentence is the one about the VERDICT, which is the
+                # same for all three; `why` carries which.
                 log.info("exec job %s waited %.0fs and was requeued WITHOUT "
-                         "spending an attempt — a render is in flight and that "
-                         "is a WAIT, not a failure: %s", job_id, waited, why)
+                         "spending an attempt — this is a WAIT, not a verdict "
+                         "on the build: %s", job_id, waited, why)
             elif isinstance(exc, (remote.ConnectionDropped, remote.SshError,
                                   remote.WorkerUnreachable, remote.FleetUnavailable)):
                 self.db.requeue(job_id, f"{why} [transport, attempt refunded]")

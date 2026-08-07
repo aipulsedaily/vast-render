@@ -469,6 +469,37 @@ def stop_exec_server(ep: Endpoint) -> None:
 def start_exec_server(ep: Endpoint, slots: int = EXEC_SLOTS) -> None:
     """Push exec_server.py, replace any running one, confirm it came up."""
     root = config.REMOTE_ROOT
+    exe = f"{root}/blender/blender"
+
+    # IS THERE A BLENDER TO RUN IT UNDER YET? An exec job that arrives while the
+    # render path is still provisioning a fresh instance reaches a box that has
+    # an ssh endpoint and no Blender — the install is a later step of the same
+    # deploy. Launching anyway produced, on 2026-08-07 and at another agent's
+    # expense:
+    #
+    #   RemoteError: exec server ... exited immediately after launch.
+    #   exec.log: env: '/workspace/blender/blender': No such file or directory
+    #
+    # which lands in `_run_exec`'s `else` branch — `db.fail`, an attempt spent
+    # each time, and a terminal failure after MAX_ATTEMPTS. That is answering
+    # "not yet" with "never" about a condition that clears by itself in a couple
+    # of minutes, and it is the same mistake already fixed twice in this file's
+    # neighbours: a busy render worker is a WAIT, an OOM kill is a WAIT.
+    #
+    # `FleetUnavailable` is the honest type and it is already in the wait list,
+    # so the attempt is refunded and the job simply comes round again. Checked
+    # BEFORE the push, because pushing 30 KB and launching a doomed process to
+    # discover this from a log tail is three round trips to learn what one
+    # `test -x` answers.
+    present = probe(ep, f"test -x {shlex.quote(exe)} && echo YES || echo NO",
+                    timeout=60)
+    if present.ok and present.out.strip().endswith("NO"):
+        raise remote.FleetUnavailable(
+            f"exec cannot start on {ep}: {exe} is not installed yet. The render "
+            f"path installs Blender as part of a deploy that is evidently still "
+            f"running, so this is a WAIT — the box is coming up, the build is "
+            f"fine, and nothing about this job has been judged.")
+
     src = Path(__file__).resolve().parent.parent / "worker" / "exec_server.py"
     remote.push_file(ep, src, f"{root}/exec_server.py")
     stop_exec_server(ep)
