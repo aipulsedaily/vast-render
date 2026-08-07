@@ -782,6 +782,29 @@ class ExecService:
             renew.set()
 
         if not reply.get("ok"):
+            # THE FAR SIDE IS ALLOWED TO SAY "NOT YET". `wait: true` means the
+            # exec server refused ADMISSION — it never staged the bundle and
+            # never forked a child, so there is no verdict on the caller's code
+            # to report, only a box that could not afford the job at that
+            # moment. See `worker/exec_server.py:ResourceWait`.
+            #
+            # Believing the far side, exactly as `adopt_slots` does with the
+            # slot count. Everything the broker knows about what happened on the
+            # box comes from this reply, and a distinction the server drew and
+            # this line discarded is a distinction that does not exist. Job
+            # 88de1f4d5faf and job 2a7e2a119e60, 03:43 on 2026-08-07: both
+            # charged an attempt for `waited 602s for 20.0G of free memory and
+            # only 3.7G was ever available`, which was the render worker and
+            # eleven sibling builds holding the box, and was nothing whatever to
+            # do with either build.
+            #
+            # An OLDER exec server does not send this field. It reads as absent,
+            # the job spends an attempt exactly as it does today, and nothing
+            # regresses — the field only ever turns a failure into a wait.
+            if reply.get("wait"):
+                raise ExecMemoryShort(
+                    f"exec job {job_id} was not admitted by the exec server: "
+                    f"{reply.get('error') or 'no reason given'}")
             tail = (reply.get("log") or "").strip().splitlines()[-12:]
             raise RuntimeError(
                 f"exec job {job_id} failed: {reply.get('error') or 'no reason given'}"

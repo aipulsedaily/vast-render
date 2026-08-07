@@ -2623,6 +2623,109 @@ def test_exec_transport_is_a_wait_and_never_spends_an_attempt() -> None:
               "one more type", not unclassified, str(unclassified))
 
 
+def test_exec_server_saying_not_yet_is_not_the_build_failing() -> None:
+    """`wait: true` on a non-ok reply must survive into the retry decision.
+
+    The exec server's memory gate calls itself "a WAIT rather than a
+    rejection", and it was — right up to serialisation. Every refusal left as
+    `{"ok": false, "error": ...}`, `run_one` turned any non-ok reply into a
+    plain `RuntimeError`, and a plain `RuntimeError` is the broker's word for
+    "the caller's script is broken". Jobs 88de1f4d5faf and 2a7e2a119e60,
+    03:43 on 2026-08-07, were both charged an attempt for `waited 602s for
+    20.0G of free memory and only 3.7G was ever available` — memory held by the
+    render worker and eleven sibling builds. The gate runs before `stage` and
+    `run_child`, so neither had a child process, let alone a verdict.
+
+    Driven through the REAL `run_one` and the REAL `_run_guarded`, because the
+    bug lived exactly in the seam between them.
+    """
+    from . import execremote
+
+    class StubBroker:
+        running = True
+        paused = False
+        last_work = 0.0
+
+    class StubFleet:
+        ep = remote.Endpoint(host="h", port=1, instance_id=1)
+        def protected_scenes(self):
+            return set()
+        def staging_digest(self):
+            return None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = DB(Path(tmpdir) / "exec.db")
+        svc = execservice.ExecService.__new__(execservice.ExecService)
+        svc.broker, svc.db, svc.fleet = StubBroker(), db, StubFleet()
+        svc.slots, svc.inflight, svc.lock, svc.last_error = 12, {}, threading.Lock(), ""
+        svc._hold_the_slot_and_wait = lambda s: 0.0
+        # Everything between the claim and the exec_call is exercised by other
+        # tests; what is under test here is what happens to the REPLY.
+        svc.ensure_ready = lambda: None
+        svc.refuse_if_memory_is_short = lambda spec: None
+        svc.ensure_scene_staged = lambda ep, spec: None
+
+        root = Path(tmpdir) / "project"
+        (root / "tools").mkdir(parents=True)
+        (root / "tools" / "build.py").write_text("pass\n")
+        os.environ["VASTRENDER_BUNDLE_ROOTS"] = str(root)
+        real_push = execremote.push_bundle
+        execremote.push_bundle = lambda ep, bundle, **k: {"cached": True}
+        real_call = execremote.exec_call
+        try:
+            bundle = execservice.plan_bundle(str(root), ["tools/*.py"])
+            job_spec = {"bundle_root": str(root), "bundle_patterns": ["tools/*.py"],
+                        "entry": "tools/build.py", "timeout_s": 60}
+
+            def run(reply: dict) -> tuple[str, int]:
+                jid = db.submit(job_spec, agent="a", kind="exec",
+                                bundle=bundle.digest)
+                claimed = db.claim_exec(600)
+                assert claimed is not None and claimed["id"] == jid
+                execremote.exec_call = lambda payload, **k: (
+                    reply if payload.get("cmd") is None else {"ok": True})
+                svc._run_guarded({"id": jid, "bundle": bundle.digest}, job_spec)
+                row = db.get(jid)
+                db.cancel(jid)
+                return row["state"], row["attempts"]
+
+            state, attempts = run({
+                "ok": False, "wait": True,
+                "error": "ResourceWait: waited 602s for 20.0G of free memory and "
+                         "only 3.7G was ever available"})
+            check("an exec server that would not ADMIT the job is a WAIT: the "
+                  "attempt is refunded, because no child ever ran",
+                  (state, attempts) == ("queued", 0), f"{state} {attempts}/3")
+
+            state, attempts = run({
+                "ok": False,
+                "error": "child exited 1",
+                "log": "NameError: name 'foo' is not defined"})
+            check("a child that RAN and failed still spends the attempt — the "
+                  "marker distinguishes, it does not blanket",
+                  (state, attempts) == ("queued", 1), f"{state} {attempts}/3")
+
+            # An exec server predating the marker sends no `wait` field at all.
+            state, attempts = run({"ok": False, "error": "child exited 1"})
+            check("a reply from an OLDER exec server, with no marker, behaves "
+                  "exactly as it does today",
+                  (state, attempts) == ("queued", 1), f"{state} {attempts}/3")
+        finally:
+            execremote.push_bundle = real_push
+            execremote.exec_call = real_call
+            os.environ.pop("VASTRENDER_BUNDLE_ROOTS", None)
+
+    # And the two sides agree about the name of the field, which is the whole
+    # contract. Read from the worker rather than restated, for the same reason
+    # `WORKER_FIELDS` is.
+    worker_src = (Path(execservice.__file__).resolve().parent.parent /
+                  "worker" / "exec_server.py").read_text()
+    check("the exec server marks its waits with the field the broker reads",
+          'reply["wait"] = True' in worker_src and
+          'class ResourceWait' in worker_src,
+          "worker/exec_server.py")
+
+
 def test_exec_never_duplicates_a_scene_push_already_in_flight() -> None:
     """Two 8 GB streams up one uplink is not half the bandwidth, it is a reset.
 
@@ -4576,6 +4679,7 @@ OFFLINE_TESTS = (
     "test_exec_queue_and_bundles",
     "test_exec_transport_is_a_wait_and_never_spends_an_attempt",
     "test_exec_never_duplicates_a_scene_push_already_in_flight",
+    "test_exec_server_saying_not_yet_is_not_the_build_failing",
     "test_missing_asset_patterns_see_libraries",
     "test_unresolved_libraries_are_refused",
     "test_bundled_essentials_are_not_refused",

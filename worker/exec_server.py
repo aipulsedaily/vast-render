@@ -202,6 +202,34 @@ MEM_MAX = "/sys/fs/cgroup/memory.max"
 MEM_CURRENT = "/sys/fs/cgroup/memory.current"
 
 
+class ResourceWait(RuntimeError):
+    """The box could not afford this job right now. THE WORK NEVER STARTED.
+
+    Its own class so the fact survives the wire. `await_memory` already calls
+    itself "a WAIT rather than a rejection — the work is fine, the moment is
+    not", and that was true right up to the point where the reply was
+    serialised: every failure leaves here as `{"ok": false, "error": "..."}`,
+    the broker's `run_one` turns any non-ok reply into a plain `RuntimeError`,
+    and a plain `RuntimeError` is the broker's word for "the caller's script is
+    broken" — so it spends an attempt and, three times, fails the job.
+
+    Measured on instance 47040457 on 2026-08-07, 03:43:14 and 03:43:29, on two
+    jobs at once:
+
+      RuntimeError: 88de1f4d5faf waited 602s for 20.0G of free memory and only
+      3.7G was ever available — the container cap is memory.max, not `free`
+
+    Both were charged an attempt for a memory shortage caused by the render
+    worker and eleven sibling builds. Neither had executed a line of its own
+    code: `await_memory` sits in front of `stage` and `run_child`, so at the
+    moment this is raised there is not even a child process.
+
+    A classification that cannot cross the wire is not a classification. This
+    one crosses as `wait: true` on the reply, and the broker turns it back into
+    the wait it always was.
+    """
+
+
 def memory_available() -> Optional[int]:
     """Bytes this container may still allocate, or None if it cannot be known.
 
@@ -981,11 +1009,17 @@ class ExecServer:
                 if available >= self.min_free_mem:
                     break
                 if time.time() > deadline:
-                    raise RuntimeError(
+                    # ResourceWait, not RuntimeError. See the class: this is
+                    # raised BEFORE `stage` and `run_child`, so there is not
+                    # even a child process yet — nothing about the caller's code
+                    # has been tried, let alone found wanting.
+                    raise ResourceWait(
                         f"{job_id} waited {time.time() - began:.0f}s for "
                         f"{self.min_free_mem / 1e9:.1f}G of free memory and only "
                         f"{available / 1e9:.1f}G was ever available — the container "
-                        f"cap is {MEM_MAX}, not the host's `free`"
+                        f"cap is {MEM_MAX}, not the host's `free`. The build was "
+                        f"never started, so this is a WAIT: the render worker and "
+                        f"the sibling builds have to give the memory back first"
                     )
                 if not warned:
                     warned = True
@@ -1103,6 +1137,12 @@ class ExecServer:
                 traceback.print_exc()
                 reply = {"ok": False, "job_id": spec.get("job_id"),
                          "error": f"{type(exc).__name__}: {exc}"}
+                # THE ONE BIT THAT MAKES A WAIT SURVIVE SERIALISATION. Without
+                # it every refusal looks identical to a broken script on the
+                # broker's side, and the broker's only reasonable reading of
+                # "your job did not run" is to spend an attempt on it.
+                if isinstance(exc, ResourceWait):
+                    reply["wait"] = True
             conn.sendall(json.dumps(reply).encode() + b"\n")
         except Exception as exc:
             log(f"connection dropped: {type(exc).__name__}: {exc}")

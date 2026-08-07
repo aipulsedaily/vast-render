@@ -484,6 +484,53 @@ def run_checks(h: Harness) -> None:
     check("a real job over the socket returns ok with its output",
           good["ok"] and good["outputs"][0]["bytes"] > 0)
 
+    # --- a refusal to ADMIT must not read as a verdict on the build ------
+    #
+    # `await_memory` calls itself "a WAIT rather than a rejection", and that was
+    # true until the reply was serialised: every failure left as
+    # `{"ok": false, "error": ...}`, and the broker's only reading of that is
+    # "the caller's script is broken" — an attempt spent, three times, then
+    # failed. Two jobs died that way on instance 47040457 on 2026-08-07 at
+    # 03:43, for memory the render worker was holding. The gate runs BEFORE
+    # `stage` and `run_child`, so at the moment it fires there is not even a
+    # child process; there is nothing to have a verdict about.
+    #
+    # Asserted OVER THE WIRE, because the wire is where the distinction was
+    # being lost. A unit test on the exception type would have passed
+    # throughout the entire life of the bug.
+    starved_port = port + 1
+    starved = X.ExecServer(str(h.root), str(h.bundles), slots=2,
+                           blender=h.blender, min_free_gb=0.0,
+                           min_free_mem_gb=10000.0)
+    real_mem = X.memory_available
+    X.memory_available = lambda: 1_000_000_000        # 1 GB, deterministically short
+    try:
+        threading.Thread(target=starved.serve, args=(starved_port,),
+                         daemon=True).start()
+        time.sleep(0.5)
+        with socket.create_connection(("127.0.0.1", starved_port), timeout=30) as sock:
+            sock.settimeout(120)
+            sock.sendall(json.dumps(
+                h.spec(timeout_s=1, argv=["--out", "out/r.txt"])).encode() + b"\n")
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        starved_reply = json.loads(buf)
+    finally:
+        X.memory_available = real_mem
+    check("a job the box cannot afford is refused, not run",
+          not starved_reply["ok"] and "free memory" in starved_reply.get("error", ""),
+          starved_reply.get("error", "")[:70])
+    check("and the refusal crosses the wire MARKED as a wait, so the broker "
+          "cannot mistake it for a broken script",
+          starved_reply.get("wait") is True, str(starved_reply.get("wait")))
+    check("a genuine child failure is NOT marked as a wait — the marker must "
+          "distinguish, not blanket",
+          send(h.spec(entry="tools/boom.py")).get("wait") is None)
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
