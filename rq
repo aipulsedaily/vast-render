@@ -648,6 +648,42 @@ def cmd_anim(a: argparse.Namespace) -> int:
     else:
         print(f"          cost unknown: {est.get('note')}")
 
+    # HOW LONG THIS ONE JOB HOLDS THE WORKER.
+    #
+    # A sequence is ONE row in the queue. `run_sequence` renders the whole range
+    # without returning, and the dispatcher's fairness — scene starvation, the
+    # batch cap, agent fair-share — is evaluated strictly BETWEEN jobs. So the
+    # hold is the full range, and nothing in the broker bounds it.
+    #
+    # Measured on the live farm 2026-08-04: two `r1full` submissions consumed
+    # 7,461 s and 2,739 s — 10,200 s, 37 % of a 7.6 h instance life — during
+    # which seven agents' 60 s verification renders could not run at all. The
+    # queue read as depth 11 with 4,086 s waits against ~660 s of outstanding
+    # work: a 6:1 wait-to-work ratio, which is the signature of blocking rather
+    # than of insufficient capacity.
+    #
+    # The mitigation is to submit in chunks of <= 62 frames. `--name` is the
+    # resume key, so chunks of one sequence cost nothing extra: the scene stays
+    # resident and only absent frames render. Until now that discipline lived
+    # in an operator's head and in a doc, which is why it is being said here,
+    # at the moment the range is chosen, by the tool that knows the number.
+    todo = resp.get("to_render") or 0
+    hold_h = est.get("wall_hours") if est.get("known") else None
+    if todo > 62 and (hold_h is None or hold_h > 0.25):
+        held = f"~{hold_h:.1f}h" if hold_h is not None else "an unmeasured time"
+        print(f"          !! ONE JOB, {todo} FRAMES — this holds a worker for {held} "
+              f"and nothing")
+        print(f"          !! preempts it: run_sequence does not yield, and the "
+              f"dispatcher only re-evaluates")
+        print(f"          !! fairness BETWEEN jobs. Two such submissions once held "
+              f"the farm for 10,200 s")
+        print(f"          !! while seven agents' 60 s renders could not run.")
+        print(f"          !! Submit in chunks of <=62 frames under this same "
+              f"--name (it is the resume key,")
+        print(f"          !! so chunks cost nothing and the scene stays resident), "
+              f"or send the whole")
+        print(f"          !! range to a broker that has no other clients.")
+
     # Disk, on THIS machine. Printed next to the money because it is the same
     # kind of fact and fails the same way if nobody looks: the instance deletes
     # each frame as it is fetched, so a long batch cannot fill it — every byte
