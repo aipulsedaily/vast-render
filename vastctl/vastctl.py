@@ -340,6 +340,41 @@ MAX_INET_COST_PER_GB = MAX_INET_COST_PER_TB / 1000.0        # 0.004
 # this is a per-process env knob and not a new default.
 MIN_CPU_CORES_EFFECTIVE = float(os.environ.get("VASTRENDER_MIN_CPU") or 32.0)
 
+# SYSTEM RAM FLOOR — and the reason the CPU floor above appeared to work.
+#
+# `cpu_cores_effective>=32` was never a RAM term, but it behaved like one.
+# Measured against the live market 2026-08-07, adding `cpu_ram>=50` to the
+# 32-core exclusive query drops ZERO offers: every >=32-core 5090 on sale
+# carries 60-126 GB. Lowering the floor to 8 does not merely buy fewer cores —
+# it changes hardware class, from server boards to consumer desktops, and every
+# single $0.3356/hr offer in that tier is the same SKU: Ryzen 7 7800X3D,
+# 8C/16T, **30.5 GB of RAM**.
+#
+# 30.5 GB is not enough to open this project's scene. `EXEC_SCENE_MEM_FACTOR`
+# already carries the measurement — 22 GB resident for a 4.17 GB .blend, 5.3x —
+# and film16_breach.blend is 7.97 GB, so it needs about 42 GB. MEASURED on
+# instance 47064284 (offer 39904635, $0.3356/hr, 30.5 GB): the worker reported
+# ready, the render started, and then the box went into swap so hard that sshd
+# could not complete a banner exchange while ping stayed clean at 205 ms and
+# TCP connected instantly. Nine minutes on a frame the 61.6 GB anchor renders in
+# 151 s, no progress, no frame.
+#
+# THIS IS THE FAILURE MODE THE CPU FLOOR WAS ACCIDENTALLY PREVENTING, and it is
+# worse than a slow render: the box does not fail, it goes catatonic. Every
+# probe the broker has — heartbeat, progress, disk — travels over the same ssh
+# that is being starved, so a thrashing host looks exactly like a network fault
+# and gets diagnosed as one.
+#
+# Default 50 rather than 0. It is behaviour-preserving where the old floor
+# already applied (nothing at >=32 cores is excluded by it), and it is the guard
+# that makes lowering MIN_CPU safe rather than a trap. A floor that only exists
+# when someone remembers to set it is the floor that was not there.
+#
+# NOTE THE UNITS: the vast.ai query language takes `cpu_ram` in GB, while the
+# offer dict returns it in MB. Asking for `cpu_ram>=50000` matches nothing at
+# all and reads as "no capacity" rather than as a malformed query.
+MIN_CPU_RAM_GB = float(os.environ.get("VASTRENDER_MIN_RAM_GB") or 50.0)
+
 # EXCLUSIVITY. `gpu_frac` is the fraction of a machine's GPUs an offer covers,
 # and it is the field that decides whether anyone else can be on our card.
 #
@@ -369,6 +404,7 @@ EXCLUSIVE_GPU_FRAC = 0.99
 def build_query(min_reliability: float = 0.98, disk_gb: int = DEFAULT_DISK_GB,
                 max_inet_cost: float = MAX_INET_COST_PER_GB,
                 min_cpu: float = MIN_CPU_CORES_EFFECTIVE,
+                min_ram_gb: float = MIN_CPU_RAM_GB,
                 exclusive: bool = True) -> str:
     """A 5090 with a driver new enough for Blackwell Cycles kernels.
 
@@ -390,6 +426,7 @@ def build_query(min_reliability: float = 0.98, disk_gb: int = DEFAULT_DISK_GB,
         f"reliability>{min_reliability} inet_down>400 inet_up>400 "
         f"inet_up_cost<={max_inet_cost} inet_down_cost<={max_inet_cost} "
         f"cpu_cores_effective>={min_cpu} "
+        f"cpu_ram>={min_ram_gb:g} "
         f"direct_port_count>=2 "
         f"disk_space>{disk_gb + 15} rentable=true verified=true"
     )
