@@ -5,6 +5,166 @@
 next person to price it does not re-derive it, and so the one thing that would
 make it a *regression* is written down before anyone starts.
 
+> **SUPERSEDED 2026-08-07 — READ THE CORRECTION IMMEDIATELY BELOW BEFORE
+> ANYTHING ELSE ON THIS PAGE.** The N-worker build this document approves is
+> **not recommended any more**: it was measured, and it is dearer and slower
+> than eight separate single-GPU boxes, which need no code at all. The original
+> text is kept intact because its *reasoning* about couplings and hazards is
+> still correct and still worth reading; its numbers and its verdict are not.
+
+---
+
+# CORRECTION 2026-08-07 — THE HEADLINE IS FALSE. BOTH WAYS ROUND.
+
+**This document's conclusion was "the dollar case does not exist, the time case
+does". Measured on rented hardware today, BOTH halves are wrong:**
+
+* **The time case is real and it is FREE — but it does not come from a wide
+  box.** Eight *separate* single-GPU boxes, driven by eight broker PROCESSES
+  with the frame range split by hand, take the master from 6.8 days to 0.8 days
+  for **the same money** and **zero new code**. That is the pattern already
+  built and proven in "Two brokers, one card each" below, run eight times.
+* **The dollar case against a wide box is much STRONGER than this doc thought,
+  and for a reason it never considered.** The 8-GPU box is not merely
+  break-even; it is **$9 dearer and 50 % slower** than eight single cards,
+  because *its individual GPUs are 45 % slower than a good single card*.
+
+Everything below the "Status 2026-08-04" line was fit to **510.5 s/frame**, the
+`render3.blend` anchor. That anchor is not the film, and it has now produced
+**four** wrong master estimates in both directions — 322 h/$146, then 180 h/$80,
+then 172 h/$76, then 155 h/$70. See `STAGING-R2-971-to-R2-999.md`.
+
+## What was measured, and how
+
+One frame — frame 30 of `film16_breach.blend`, 3840x2160, 512 spp, adaptive
+0.01, **`spec_hash 1983dced5cacabb6` on every host**, luminance identical to six
+decimal places every time. So these are the same render, and only the hardware
+differs.
+
+| host | $/hr all-in | $/GPU-hr | frame 30 |
+|---|---|---|---|
+| `47039886` Florida, 1x, Ryzen 9 9950X3D 32c/61.6 GB | 0.4488 | 0.4488 | **151.0 s** |
+| `47065580` S. Africa, 1x, Ryzen 9 7950X 32c/63.4 GB | 0.39987 | 0.39987 | **166.8 s** |
+| `47083562` California, 8x, EPYC 192c/503 GB | 2.7100 | **0.3387** | **219.65 s** one GPU |
+| — the same box, all 8 GPUs on that ONE frame | | | **172.8 s** |
+| — the same box, 8 concurrent workers, one GPU each | | | **225.42 s** mean |
+
+### The two things this doc modelled, now measured
+
+```
+                                    modelled here   MEASURED    verdict
+N independent workers, 1 GPU each        8.00x        7.80x     RIGHT
+N GPUs on ONE frame                      4.49x        1.27x     WRONG by 3.5x
+```
+
+**The independent-worker model was right, and it is the one that was never
+built.** Eight concurrent Blenders on one box cost **2.6 %** against a solo run
+on the same box (225.42 s vs 219.65 s), for **7.80x** throughput. Peak host RAM
+was **322 GB of 503**, and per-process RSS was **41.4-41.6 GB across all nine
+runs** — which pins the "22 GB for a 4.17 GB scene" extrapolation at 5.2x and
+makes RAM-per-GPU the binding rental filter (see `vastctl.MIN_CPU_RAM_GB`).
+
+**The multi-GPU-per-frame model was wrong in the expensive direction.** This doc
+called it "zero code, $243, 3.8 days" and honestly labelled it *a model, not a
+measurement*. It is 1.27x, not 4.49x, so a master run that way costs **$512 and
+takes 7.8 days** — you rent eight cards and get 1.27 of them. It is not a
+fallback. **It is the worst option on the board and it is the one that happens
+BY DEFAULT**, because `enable_gpu()` sets `d.use` on every OptiX device: point
+today's broker at an 8-GPU box and this is what you get, silently.
+
+## THE NUMBER THIS DOC NEVER ASKED FOR: $/FRAME
+
+`$/GPU-hr` is a trap, and it is the trap this project asked to be steered into.
+
+```
+Florida 1x               $0.4488/GPU-hr x 151.0 s = $0.01882/frame
+S. Africa 1x             $0.3999/GPU-hr x 166.8 s = $0.01853/frame
+California 8x, per GPU   $0.3387/GPU-hr x 225.4 s = $0.02121/frame   <- DEAREST
+```
+
+**The cheapest $/GPU-hr box on the market is the dearest per frame.** Across the
+whole exclusive 5090 market the per-GPU price spread from 1x to 8x is **8.8 %**
+($0.3803 -> $0.3470). The *host lottery* — how fast the silicon you happened to
+draw actually renders — is **±45 %** across three measured hosts. Width is
+inside the noise of which host you get.
+
+Note also the two 1x hosts: an 11 % price difference and a 10 % speed difference
+**cancelled to 1.6 % in $/frame.** Shopping on sticker price is close to
+worthless; shopping on measured s/frame is the whole game.
+
+## The master, every architecture, on measured inputs
+
+Beat-weighted 211.8 s/frame at `adaptive 0.01` on the Florida card, x0.927 for
+`adaptive 0.02`, 2,978 frames, serial broker work at the worst measured 4K host.
+
+| architecture | wall | days | total $ | code |
+|---|---|---|---|---|
+| 1 broker, 1 card (today) | 163.1 h | 6.8 | **$74.11** | — |
+| **8 brokers, 8 cards** | **20.4 h** | **0.8** | **$74.21** | **none** |
+| 1 broker, 8 workers, 8x box | 30.4 h | 1.3 | $83.60 | ~1,300 lines |
+| 1 broker, 1 worker, 8x box | 186.6 h | 7.8 | $512.05 | none (the default) |
+
+> **Eight brokers on eight single cards is the recommendation: 8x the speed for
+> +0.1 % money and no new code.** The ~1,300-line N-worker build buys nothing —
+> it is $9 dearer and 50 % slower than the free option, because the wide boxes
+> on this market have slow GPUs.
+
+**What would change that verdict:** an 8-GPU box whose per-GPU speed is within
+~10 % of a good single card. That box may exist — n=1 here, and only 11 exclusive
+8x offers were on the market. The test is one frame and ~$1: rent it, render
+frame 30, compare against 151.0 s. **Do not buy a wide box without doing that
+first.** It is the entire difference between $74 and $84.
+
+## What the 8-broker path actually costs, honestly
+
+Not free of friction, just free of code:
+
+* **The queue is per-broker.** The master must be split into eight contiguous
+  `rq anim --frames A-B` submissions with eight resume keys and eight output
+  directories, then merged.
+* **CONTIGUOUS BLOCKS, NOT STRIPES.** `parse_range` supports `1-2978x8`, which
+  would balance load perfectly — and it is exactly wrong here. PNGs from
+  different hosts are **not bit-identical** (different driver, different OIDN
+  build): measured, luminance agrees to 6 dp but the bytes differ. Striping puts
+  a machine boundary between *every adjacent frame pair*; contiguous blocks put
+  seven boundaries in the whole film. Size the blocks by measured per-beat cost.
+* **The local workstation is the bottleneck, not the market.** It has **6 cores
+  and 11 GB RAM**. Eight concurrent `zstd -10` compressions of a 7.97 GB scene
+  will serialise on it — one push took 405 s today while competing with the exec
+  builds, and the 8x box's push took **617 s**. This is the one real argument
+  this doc made for a wide box (one push serves every worker) and it survives;
+  it is just worth ~$0, not ~$1,300 of code.
+* **Eight labels, eight ports, eight state dirs.** Both hazards in "Two brokers,
+  one card each" apply eight times over: prefixes must be pairwise disjoint (not
+  merely different), and `VASTRENDER_TUNNEL_LOCAL_PORT` /
+  `VASTRENDER_EXEC_LOCAL_PORT` must not collide or startup reaping SIGKILLs a
+  sibling's tunnel mid-frame.
+
+## Corrections to specific claims below this line
+
+* **"exclusive 8x (`46354162`) $0.3337/GPU-hr, ~9 h, $24.0"** — the rate is
+  right and the conclusion drawn from it is not. It assumes a GPU-hour on a wide
+  box does the same work as a GPU-hour on a narrow one. Measured, it does 69 %
+  as much.
+* **"8x box, ONE worker using all 8 cards (zero code) — 91 h, $243"** — measured
+  at 1.27x, not 4.49x: **186.6 h and $512** on today's film rate.
+* **"~14.1 s per frame of SERIAL broker work"** — measured at 720p on a
+  different host and a different code path. Re-derived at **4K on the shipping
+  film, two hosts, n=9 each: 4.52 s (Florida) and 11.14 s (S. Africa).** It is
+  host-dependent (fetch throughput), not a constant. **Parallel collect is NOT
+  required for a 4K master at any width up to 8** — at the worst measured host
+  the dispatch thread is 42 % busy with eight workers. It remains required for a
+  720p ladder pass, which is what the original measurement was of.
+* **"CPU per worker drops below the floor — 192/8 = 24 against MIN_CPU 32,
+  unquantified"** — quantified: 24 effective cores per worker cost **2.6 %**
+  with eight concurrent renders including eight simultaneous scene loads.
+* **"Peak host RSS during a scene load ... never measured"** — measured:
+  **41.4-41.6 GB per process** for a 7.97 GB scene, n=9, load peak and steady
+  state alike. `num_gpus=1` was hardcoded in `vastctl.build_query` until
+  2026-08-07 (`f8aa76b`), which is why this doc had to source its offers by
+  hand.
+
+
 > **A SECOND CARD IS NOW RUNNING, AND IT IS NOT THIS.** See "Two brokers, one
 > card each" at the bottom. Everything below is about N workers inside ONE
 > broker driving ONE box, which is still unbuilt. The second card was obtained
