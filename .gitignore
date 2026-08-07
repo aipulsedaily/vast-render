@@ -10,6 +10,11 @@
 # Rendered output -- 12 GB and entirely regenerable
 out/
 out2/
+# Every fleet broker's output. `farm/brokers.py` gives broker n `out{n}`, so a
+# fleet of eight creates out3..out10 and each one holds a block of 4K frames.
+# A glob rather than eight more lines, because the number of brokers is a
+# runtime choice and a list would go stale the first time somebody ran nine.
+out[0-9]*/
 
 # Live broker state: the SQLite job database, its WAL, logs, locks, and the
 # provisioned-instance record. Machine state, not source, and it changes every
@@ -17,6 +22,8 @@ out2/
 state/
 # The second broker's state. Same reasoning; see scripts/broker2.sh.
 state2/
+# Every fleet broker's state -- state3..state12. Same reasoning again.
+state[0-9]*/
 *.db
 *.db-shm
 *.db-wal

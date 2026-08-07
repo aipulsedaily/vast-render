@@ -1,5 +1,13 @@
 # Multi-worker instances — approved in principle, not yet built
 
+> **THE RECOMMENDED PATH IS NOW BUILT AND PROVEN — 2026-08-07.** The
+> eight-brokers-eight-cards architecture this page's correction recommends is no
+> longer a plan. It is `fleetctl` at the root of this repo, with `farm/` beside
+> it, proven on a real contiguous chunk of the film at delivery spec. Read
+> **`docs/fleet.md`** for how to run it and what it measured. Everything below
+> remains the best map of *why* the alternatives lose, and its correction
+> section remains the source of the numbers.
+
 **Status 2026-08-04: APPROVED IN PRINCIPLE, NOT SCHEDULED. Do not rent an
 8-GPU box for interactive work under any circumstances.** This exists so the
 next person to price it does not re-derive it, and so the one thing that would

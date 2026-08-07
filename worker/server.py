@@ -239,9 +239,88 @@ def progress_end(job_id: str, state: str, err: str = "") -> None:
 # --- device ---------------------------------------------------------------
 
 
+class TooManyGPUs(RuntimeError):
+    """This instance has more cards than this worker can use, and nobody said so.
+
+    THE $512 ROW, AND IT IS REACHED BY DOING NOTHING WRONG. Measured 2026-08-07
+    (docs/multi-gpu.md): one Blender given eight OptiX devices renders one 4K
+    frame in 172.8 s against 219.65 s on a single card — **1.27x for 8x the
+    money**. The master that way is 186.6 h and $512.05, against 20.4 h and
+    $74.21 on eight separate single-GPU boxes. It is the worst option on the
+    board and it was the DEFAULT, because the loop below said `d.use = d.type
+    == chosen` and enabled every device it found. Nothing in the log, in
+    `rq status` or on the bill distinguished it from the good case: the frames
+    come back correct, only slowly and eight times over.
+
+    So width is now something you ASK FOR, in writing, per instance. Set
+    `VASTRENDER_GPU_SLOT=<index>` to pin this worker to one card (what a real
+    N-worker fleet would do, one slot per card), or `VASTRENDER_GPU_ALL=1` to
+    deliberately take them all and accept the 1.27x. With neither, a
+    multi-GPU box refuses to serve rather than quietly bill for seven idle
+    cards.
+
+    Refusing rather than silently pinning is deliberate. Pinning would work
+    and would still leave seven cards billing at $0.34/hr each with nothing on
+    them — the same money lost, just with a correct render on top of it. The
+    only safe default for a cost trap whose symptom is "everything looks fine"
+    is to stop.
+    """
+
+
+def select_devices(devices, kind, slot=None, take_all=False):
+    """Which devices to enable. A pure function, so the guard is testable.
+
+    `devices` is anything with `.type` and `.name` — `prefs.devices` in
+    production, a list of fakes in `farm/test_gpu_guard.py`. The guard for a
+    trap that only appears on a rented 8-GPU box has to be provable without
+    renting one, or it is not a guard, it is a hope.
+
+    Returns the list of indices INTO `devices` to enable. Raises TooManyGPUs.
+    """
+    idx = [i for i, d in enumerate(devices) if getattr(d, "type", None) == kind]
+    if not idx:
+        return []
+    if len(idx) == 1:
+        return idx
+    names = [getattr(devices[i], "name", "?") for i in idx]
+    if take_all:
+        log(f"VASTRENDER_GPU_ALL=1: taking all {len(idx)} {kind} devices "
+            f"DELIBERATELY. Measured 1.27x throughput for {len(idx)}x the "
+            f"rental — see docs/multi-gpu.md. This is a choice, not a default.")
+        return idx
+    if slot is not None:
+        if not 0 <= slot < len(idx):
+            raise TooManyGPUs(
+                f"VASTRENDER_GPU_SLOT={slot} but this instance has "
+                f"{len(idx)} {kind} device(s) (slots 0..{len(idx) - 1}): {names}")
+        log(f"VASTRENDER_GPU_SLOT={slot}: pinned to {kind} device {slot} "
+            f"({names[slot]}) of {len(idx)} on this instance. The other "
+            f"{len(idx) - 1} are BILLING AND IDLE unless a sibling worker has "
+            f"them.")
+        return [idx[slot]]
+    raise TooManyGPUs(
+        f"this instance has {len(idx)} {kind} devices and nothing said which "
+        f"to use: {names}.\n"
+        f"  Enabling all of them is what this code used to do by default, and "
+        f"it is measured at 1.27x throughput for {len(idx)}x the rental — "
+        f"$512 and 7.8 days for the master, against $74 and 0.8 days on "
+        f"{len(idx)} separate single-GPU boxes (docs/multi-gpu.md).\n"
+        f"  The broker rents `num_gpus=1` offers, so reaching this means the "
+        f"instance was ADOPTED rather than rented (adopt_or_reap never "
+        f"re-checks the offer), or VASTRENDER_NUM_GPUS was raised.\n"
+        f"  Deliberate choices, either of which clears this: "
+        f"VASTRENDER_GPU_SLOT=0..{len(idx) - 1} to pin one card, or "
+        f"VASTRENDER_GPU_ALL=1 to take all {len(idx)} and accept the 1.27x.")
+
+
 def enable_gpu() -> str:
     """Force GPU compute, preferring OptiX. Never trust saved preferences —
-    the config that ships with a container is not the one we want."""
+    the config that ships with a container is not the one we want.
+
+    REFUSES A MULTI-GPU INSTANCE unless told what to do with it. See
+    `TooManyGPUs`; the short version is that taking all eight cards is 1.27x
+    for 8x the money, and it used to be what happened when nobody chose.
+    """
     prefs = bpy.context.preferences.addons["cycles"].preferences
     chosen = None
     for kind in ("OPTIX", "CUDA"):
@@ -256,11 +335,19 @@ def enable_gpu() -> str:
     if not chosen:
         raise RuntimeError("no OptiX or CUDA device found — refusing to render on CPU")
 
-    for d in prefs.devices:
-        d.use = d.type == chosen
+    raw_slot = os.environ.get("VASTRENDER_GPU_SLOT")
+    slot = int(raw_slot) if raw_slot not in (None, "") else None
+    take_all = (os.environ.get("VASTRENDER_GPU_ALL") or "").lower() in (
+        "1", "true", "yes", "on")
+    use = set(select_devices(prefs.devices, chosen, slot=slot, take_all=take_all))
+
+    for i, d in enumerate(prefs.devices):
+        d.use = i in use
     bpy.context.scene.cycles.device = "GPU"
     names = [d.name for d in prefs.devices if d.use]
-    log(f"device={chosen} [{', '.join(names)}]")
+    total = sum(1 for d in prefs.devices if d.type == chosen)
+    log(f"device={chosen} [{', '.join(names)}]  ({len(use)} of {total} "
+        f"{chosen} device(s) on this instance)")
     return chosen
 
 

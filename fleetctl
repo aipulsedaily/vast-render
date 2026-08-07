@@ -1,0 +1,944 @@
+#!/usr/bin/env python3
+"""fleetctl — run N brokers on N single-GPU rentals as ONE operation.
+
+    .venv/bin/python fleetctl plan   -n 4                     # costs, no spend
+    .venv/bin/python fleetctl up     -n 4 --scene <blend>
+    .venv/bin/python fleetctl submit -n 4 --scene <blend> --frames 1-64 \
+                                     --name proof --res 3840 2160 --samples 512
+    .venv/bin/python fleetctl status
+    .venv/bin/python fleetctl verify --manifest state/fleet/proof.json
+    .venv/bin/python fleetctl down                            # and PROVE it
+
+WHY THIS EXISTS, AND WHY IT IS NOT BROKER CODE
+----------------------------------------------
+Measured 2026-08-07 (docs/multi-gpu.md), for the 2,978-frame master:
+
+    architecture                    wall     days   total $    new code
+    1 broker, 1 card (today)       163.1 h    6.8   $ 74.11        -
+    8 brokers, 8 cards              20.4 h    0.8   $ 74.21      NONE
+    1 broker, 8 workers, 8x box     30.4 h    1.3   $ 83.60    ~1,300 lines
+    1 broker, 1 worker, 8x box     186.6 h    7.8  $512.05    none - DEFAULT
+
+Eight broker processes on eight separate single-GPU rentals cost **ten cents
+more** than one card and finish in a fifth of the time. They need no new broker
+code because a second broker process is already live and proven: every
+single-instance assumption inside `Fleet` — one `instance_id`, one tunnel, one
+resident `scene_hash` — stays true *inside each process*.
+
+What did not exist is the thing that launches, addresses, monitors and tears
+down eight of them as ONE operation. That is this file. It writes no broker
+code and imports no broker internals beyond reading the SQLite each broker
+already keeps; every broker it starts is the shipping `broker.app` under the
+shipping `scripts/brokerd.sh`.
+
+THE FOUR THINGS IT REFUSES TO LET YOU GET WRONG
+-----------------------------------------------
+1. **Addressing.** `rq` takes a URL and nothing else, and it *silently
+   re-routes* `anim`/`seq` to 8761 unless `VASTRENDER_URL` is set — so the
+   obvious way to write a fleet submission sends all eight blocks to the
+   client's live beat-1 card. Every address here comes off a `farm.brokers`
+   object that carries its state directory and label with it, and every command
+   prints the identity triple it used. R2-979 reported one broker's status as
+   two; that is unreachable from here.
+
+2. **The live two.** `fleet(n)` starts at broker 3, always. Brokers 1 and 2 are
+   declared `protected` and no command in this file can start, stop, submit to
+   or tear down either one.
+
+3. **Double-render.** Blocks are contiguous and disjoint by construction, and
+   `plan` refuses to emit a split whose blocks overlap or leave a gap.
+   `verify` then proves it on the delivered PNGs by hash — which is the claim
+   that matters, since a partition argument is about intent and a hash is about
+   bytes.
+
+4. **A partial teardown.** `down` is not finished when the brokers say so. It
+   re-queries the vast.ai API and exits non-zero if ANY fleet instance is still
+   alive, and names every non-fleet instance still billing so nobody reads
+   "fleet down" as "farm down". An idle rented 5090 is $0.45/hr doing nothing,
+   and that is the expensive failure mode of this whole design.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Optional
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+
+from farm.brokers import Broker, broker, fleet, all_declared   # noqa: E402
+
+MANIFEST_DIR = ROOT / "state" / "fleet"
+
+# Measured on this project, not guessed. Both are inputs to `plan`, which is the
+# only place a number is stated before money is spent.
+#
+# 211.8 s/frame is the beat-weighted 4K/512 rate on the FAST measured host
+# (Florida, $0.4488/hr all-in, 151.0 s on the anchor frame). The host lottery is
+# +-45 %, which is why `plan` prints a range and not a point.
+SEC_PER_FRAME_4K512 = 211.8
+HOST_LOTTERY = 0.45
+DPH_ALL_IN = 0.49          # exclusive 5090 + 80 GB disk, post-filter, measured
+DEPLOY_SEC = 200.0         # image pull + Blender bundle, measured 102-200 s
+
+
+# --- talking to one broker -------------------------------------------------
+
+
+def http(b: Broker, method: str, path: str, body=None, timeout=30):
+    """One request to ONE broker, addressed off its own object.
+
+    There is no `http(url, ...)`. A URL that arrived as a bare string is a URL
+    whose state directory nobody checked.
+    """
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        f"{b.url}{path}", data=data, method=method,
+        headers={"Content-Type": "application/json"} if data else {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as exc:
+        return {"error": f"HTTP {exc.code}", "detail": exc.read().decode()[:400]}
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        return {"error": str(exc)}
+
+
+def rq(b: Broker, *args, timeout=900, capture=True):
+    """Run `rq` against ONE broker, with its own environment.
+
+    `rq_env` pins `VASTRENDER_URL` and drops `VASTRENDER_BULK_URL`. Without
+    that, `rq anim` routes to 8761 — the live client card — and says so only on
+    stderr, on the seventh of eight loop iterations, where nobody reads it.
+    """
+    cmd = [str(ROOT / "rq"), *[str(a) for a in args]]
+    return subprocess.run(cmd, env=b.rq_env(), timeout=timeout,
+                          capture_output=capture, text=True)
+
+
+# --- the vast.ai API, which is the only source of truth about money ---------
+
+
+def api():
+    """The vast.ai client. Imported late so `plan` works without credentials."""
+    sys.path.insert(0, str(ROOT))
+    from vastctl import vastctl                     # noqa: PLC0415
+    return vastctl, vastctl._client()
+
+
+def api_instances():
+    """Every instance on the account, labelled by which broker owns it.
+
+    NOT `our_instances`: that is scoped to one `LABEL_PREFIX` by design, which
+    is exactly why no single broker can see the whole bill. `rq status` reports
+    the BROKER's belief; this reports what vast.ai says. They have disagreed.
+    """
+    vastctl, client = api()
+    owners = {b.label: b for b in all_declared()}
+    rows = []
+    for raw in client.show_instances():
+        inst = vastctl.Instance(raw)
+        label = inst.label
+        owner = next((b for lbl, b in owners.items() if label.startswith(lbl)), None)
+        rows.append({
+            "id": inst.id, "label": label, "dph": inst.dph,
+            "hours": inst.uptime_hours, "state": inst.classify(),
+            "gpu_frac": inst.gpu_frac,
+            "broker": owner.n if owner else None,
+            "protected": bool(owner and owner.protected),
+            "machine": raw.get("machine_id"),
+        })
+    return rows
+
+
+def api_credit() -> float:
+    _, client = api()
+    u = client.show_user()
+    return float(u.get("credit") or 0) + float(u.get("balance") or 0)
+
+
+# --- planning --------------------------------------------------------------
+
+
+def parse_range(spec: str) -> tuple[int, int]:
+    m = re.fullmatch(r"\s*(\d+)\s*-\s*(\d+)\s*", spec)
+    if not m:
+        raise SystemExit(
+            f"--frames {spec!r}: this takes a CONTIGUOUS range A-B only.\n"
+            f"  `rq anim` accepts strides like 1-2978x8, which would balance "
+            f"load perfectly and is exactly wrong here: PNGs from different "
+            f"hosts are not bit-identical (different driver, different OIDN "
+            f"build), so striping puts a machine boundary between EVERY "
+            f"adjacent frame pair. Contiguous blocks put one boundary per "
+            f"broker in the whole film.")
+    a, bb = int(m.group(1)), int(m.group(2))
+    if bb < a:
+        raise SystemExit(f"--frames {spec!r}: last frame is before the first")
+    return a, bb
+
+
+def split(first: int, last: int, width: int,
+          weights: Optional[list[float]] = None) -> list[tuple[int, int]]:
+    """Contiguous, disjoint, gapless blocks. Checked, not asserted.
+
+    Equal-size by default, because balancing on *content* needs per-beat
+    s/frame and this project has got that wrong by factors four times running.
+
+    `weights` balances on HARDWARE instead, which is a different and much
+    better-founded thing: a weight per broker, proportional to how many frames
+    that broker's card can do in a given time. Measured 2026-08-07 across four
+    simultaneously-rented exclusive 5090s, the per-frame spread was **1.9x**
+    (229 s to 432 s on identical work). With equal blocks the fleet finishes
+    when its SLOWEST card finishes, so a 1.9x spread costs about a fifth of the
+    theoretical speedup, and the fast cards sit idle-down while it happens.
+
+    Get the weights from `farm/hostrates.json` after one frame per host — which
+    is what `fleetctl record` exists to fill in, at about $0.02 a host.
+    """
+    n = last - first + 1
+    if width > n:
+        raise SystemExit(f"{width} brokers for {n} frame(s) — at least one "
+                         f"would rent a 5090 to render nothing")
+    if weights:
+        if len(weights) != width:
+            raise SystemExit(f"--weights has {len(weights)} value(s) for "
+                             f"{width} broker(s)")
+        if any(w <= 0 for w in weights):
+            raise SystemExit("--weights must all be positive")
+        total = sum(weights)
+        sizes = [max(1, round(n * w / total)) for w in weights]
+        # Fix the rounding drift on the LAST block, so the partition is exact.
+        while sum(sizes) > n:
+            sizes[sizes.index(max(sizes))] -= 1
+        while sum(sizes) < n:
+            sizes[sizes.index(min(sizes))] += 1
+    else:
+        base, extra = divmod(n, width)
+        sizes = [base + (1 if i < extra else 0) for i in range(width)]
+    blocks, cur = [], first
+    for size in sizes:
+        blocks.append((cur, cur + size - 1))
+        cur += size
+    # The property, verified rather than trusted.
+    covered = [f for a, b in blocks for f in range(a, b + 1)]
+    if sorted(covered) != list(range(first, last + 1)):
+        raise SystemExit("BUG: the split is not a partition — refusing to submit")
+    if len(set(covered)) != len(covered):
+        raise SystemExit("BUG: the split overlaps — refusing to submit")
+    return blocks
+
+
+def cmd_plan(a) -> int:
+    blocks = (split(*parse_range(a.frames), a.n, a.weights)
+              if a.frames else None)
+    bs = fleet(a.n)
+    print(f"FLEET OF {a.n} — brokers {bs[0].n}..{bs[-1].n}\n")
+    print(f"{'#':>2}  {'url':<24} {'label':<10} {'state':<8} {'out':<7} "
+          f"{'tun':<5} {'exec':<5} block")
+    for i, b in enumerate(bs):
+        blk = f"{blocks[i][0]}-{blocks[i][1]}" if blocks else "-"
+        print(f"{b.n:>2}  {b.url:<24} {b.label:<10} {b.state.name:<8} "
+              f"{b.out.name:<7} {b.tunnel_port:<5} {b.exec_port:<5} {blk}")
+
+    print(f"\nNOT TOUCHED BY ANY FLEET COMMAND:")
+    for b in (broker(1), broker(2)):
+        up = "listening" if b.listening() else "down"
+        print(f"{b.n:>2}  {b.url:<24} {b.label:<10} {b.role}  [{up}]")
+
+    if not blocks:
+        return 0
+
+    first, last = parse_range(a.frames)
+    frames = last - first + 1
+    per = frames / a.n
+    sec = a.sec_per_frame or SEC_PER_FRAME_4K512
+    lo, hi = sec * (1 - HOST_LOTTERY), sec * (1 + HOST_LOTTERY)
+
+    # Cost is per-CARD-hour x hours, and every card is up for the WHOLE wall
+    # clock, not just its own render: the fleet finishes when its slowest block
+    # does, and the others keep billing while they wait unless they idle down.
+    wall_fast = (DEPLOY_SEC + a.push_sec + per * lo) / 3600
+    wall_slow = (DEPLOY_SEC + a.push_sec + per * hi) / 3600
+    print(f"\nCOST BEFORE SPENDING — {frames} frames, {per:.0f} per broker, "
+          f"{sec:.0f}s/frame basis")
+    print(f"  render         {frames * sec / 3600:.2f} GPU-hours "
+          f"({frames * lo / 3600:.2f}-{frames * hi / 3600:.2f} with the "
+          f"+-{HOST_LOTTERY:.0%} host lottery)")
+    print(f"  deploy+push    {a.n} x {(DEPLOY_SEC + a.push_sec) / 3600:.2f} h "
+          f"= {a.n * (DEPLOY_SEC + a.push_sec) / 3600:.2f} GPU-hours paid for "
+          f"NOT rendering")
+    print(f"  wall clock     {wall_fast:.2f}-{wall_slow:.2f} h  "
+          f"(the fleet finishes when its SLOWEST block does)")
+    print(f"  TOTAL          ${a.n * wall_fast * DPH_ALL_IN:.2f}-"
+          f"${a.n * wall_slow * DPH_ALL_IN:.2f} at ${DPH_ALL_IN}/hr all-in")
+    single = (DEPLOY_SEC + a.push_sec + frames * sec) / 3600
+    print(f"  one card would be {single:.2f} h and "
+          f"${single * DPH_ALL_IN:.2f} — speedup {single / wall_slow:.1f}x "
+          f"(worst case) to {single / wall_fast:.1f}x")
+
+    if a.push_sec == 0:
+        print(f"\n  !! --push-sec is 0, so the scene push is NOT in the numbers "
+              f"above. It is the single biggest fixed cost of this "
+              f"architecture: the scene cache is per-INSTANCE, so N boxes pay N "
+              f"pushes of the same file, and this workstation has 6 cores and "
+              f"11 GB RAM to compress them with. Measure one and pass it.")
+    try:
+        credit = api_credit()
+        print(f"\n  credit ${credit:.2f} on vast.ai")
+    except Exception as exc:
+        print(f"\n  credit unknown ({exc})")
+    return 0
+
+
+# --- bringing it up --------------------------------------------------------
+
+
+def cmd_up(a) -> int:
+    bs = fleet(a.n)
+    scene = str(Path(a.scene).resolve()) if a.scene else None
+    if scene and not Path(scene).exists():
+        raise SystemExit(f"--scene {scene} does not exist")
+
+    started, already = [], []
+    for b in bs:
+        if b.listening():
+            ok, why = b.verify()
+            if not ok:
+                print(f"REFUSING: {b.ident} — {why}")
+                return 1
+            already.append(b)
+            print(f"  {b.ident}  already up ({why})")
+            continue
+        b.state.mkdir(parents=True, exist_ok=True)
+        b.seq.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env.update(b.env(disk_gb=a.disk, hibernate=a.hibernate,
+                         max_batch_usd=a.cap, scene=scene))
+        subprocess.run([str(ROOT / "scripts" / "brokerd.sh"), "start"],
+                       env=env, cwd=str(ROOT), check=False,
+                       capture_output=True, text=True)
+        started.append(b)
+
+    # Wait for ports, then VERIFY IDENTITY. A broker that came up on the right
+    # port with the wrong state directory is the R2-979 shape and it must not
+    # be sent work.
+    deadline = time.time() + 60
+    pending = list(started)
+    while pending and time.time() < deadline:
+        pending = [b for b in pending if not b.listening()]
+        if pending:
+            time.sleep(1)
+    bad = 0
+    for b in bs:
+        ok, why = b.verify()
+        print(f"  {b.ident}  {'ok' if ok else 'FAILED'}  {why}")
+        bad += not ok
+    if bad:
+        print(f"\n>> STAGE RESULT: FAIL — {bad} of {len(bs)} broker(s) are not "
+              f"who they should be. Nothing has been submitted.")
+        return 1
+    print(f"\n>> STAGE RESULT: PASS — {len(bs)} broker(s) up and identity-"
+          f"verified against /proc ({len(already)} were already running). No "
+          f"instance is rented until work is submitted.")
+    return 0
+
+
+# --- submitting ------------------------------------------------------------
+
+
+def cmd_submit(a) -> int:
+    first, last = parse_range(a.frames)
+    bs = fleet(a.n)
+    blocks = split(first, last, a.n, a.weights)
+    scene = str(Path(a.scene).resolve())
+    if not Path(scene).exists():
+        raise SystemExit(f"--scene {scene} does not exist")
+
+    for b in bs:
+        ok, why = b.verify()
+        if not ok:
+            print(f"REFUSING TO SUBMIT: {b.ident} — {why}")
+            return 1
+
+    MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "name": a.name, "scene": scene, "first": first, "last": last,
+        "width": a.n, "submitted": time.time(),
+        "spec": {"res": a.res, "samples": a.samples,
+                 "adaptive_threshold": a.adaptive_threshold, "cam": a.cam},
+        "blocks": [],
+    }
+
+    for b, (lo, hi) in zip(bs, blocks):
+        argv = ["anim", "--scene", scene, "--frames", f"{lo}-{hi}",
+                "--name", a.name, "--agent", f"fleet{b.n}",
+                "--cam", a.cam, "--res", str(a.res[0]), str(a.res[1]),
+                "--samples", str(a.samples)]
+        if a.adaptive_threshold is not None:
+            argv += ["--adaptive-threshold", str(a.adaptive_threshold)]
+        argv += a.passthrough
+        print(f"  {b.ident}  frames {lo}-{hi}")
+        r = rq(b, *argv)
+        out = (r.stdout or "") + (r.stderr or "")
+        for line in out.splitlines():
+            print(f"      {line}")
+        if r.returncode != 0:
+            print(f"\n>> STAGE RESULT: FAIL — submit to broker {b.n} exited "
+                  f"{r.returncode}. Blocks already submitted are still queued; "
+                  f"`fleetctl down` will stop them.")
+            return 1
+        job = next((w for w in out.split() if re.fullmatch(r"[0-9a-f]{12}", w)), None)
+        manifest["blocks"].append({
+            "broker": b.n, "url": b.url, "label": b.label,
+            "state": str(b.state), "out": str(b.out),
+            "first": lo, "last": hi, "job_id": job,
+            "dir": str(b.seq / a.name),
+        })
+
+    path = MANIFEST_DIR / f"{a.name}.json"
+    path.write_text(json.dumps(manifest, indent=2))
+    print(f"\n>> STAGE RESULT: PASS — {last - first + 1} frames in {a.n} "
+          f"contiguous disjoint blocks. Manifest {path}")
+    print(f"   verify with: .venv/bin/python fleetctl verify --manifest {path}")
+    return 0
+
+
+# --- looking at it ---------------------------------------------------------
+
+
+def _fmt_broker_line(b: Broker, q: dict) -> str:
+    if "error" in q:
+        return f"  {b.ident}\n      unreachable: {q['error']}"
+    f = q.get("fleet") or {}
+    frac = f.get("gpu_frac")
+    if frac is None:
+        excl = "gpu_frac=?" if f.get("instance_id") else ""
+    elif frac >= 0.99:
+        excl = f"exclusive({frac:.2f})"
+    else:
+        excl = f"!!SHARED({frac:.3f})"
+    rec = [j for j in (q.get("recent") or []) if j.get("state") == "running"]
+    prog = ""
+    for j in rec:
+        if j.get("frames_total"):
+            prog = (f" frame {j.get('frame_current')} "
+                    f"{j.get('frames_done')}/{j.get('frames_total')}"
+                    + (f" ({j['prog_pct']:.0f}% of frame)"
+                       if j.get("prog_pct") is not None else ""))
+    # THE PUSH, because it is where a cold fleet spends its first ten minutes
+    # and `status` without it reads as four wedged brokers. N instances pay N
+    # pushes of the same scene — the scene cache is per-box, not per-account.
+    t = f.get("transfer") or {}
+    xfer = (f"\n      pushing {t.get('what')} {t.get('mb', 0) / 1024:.2f} GB — "
+            f"{t.get('elapsed_sec', 0):.0f}s at {t.get('mb_per_sec', 0):.1f} MB/s"
+            if t else "")
+    return (f"  {b.ident}\n"
+            f"      queue {q.get('counts')} depth={q.get('depth')} "
+            f"idle={q.get('idle_sec')}s{prog}\n"
+            f"      gpu {f.get('status')} inst={f.get('instance_id')} "
+            f"${f.get('dph')}/hr up={f.get('uptime_sec')}s "
+            f"spend=${f.get('spend_usd')} {excl}"
+            f"  load={f.get('load_sec')}s render={f.get('render_sec')}s{xfer}")
+
+
+def cmd_status(a) -> int:
+    bs = fleet(a.n) if a.n else [b for b in all_declared() if b.listening()]
+    print("BROKERS (each line's address, state dir and label read off ONE "
+          "object — see farm/brokers.py)\n")
+    broker_spend = 0.0
+    for b in bs:
+        ok, why = b.verify()
+        q = http(b, "GET", "/queue")
+        print(_fmt_broker_line(b, q))
+        if not ok:
+            print(f"      !! IDENTITY: {why}")
+        f = (q.get("fleet") or {})
+        try:
+            broker_spend += float(f.get("spend_usd") or 0)
+        except (TypeError, ValueError):
+            pass
+
+    print("\nvast.ai API — THE ONLY TRUTH ABOUT MONEY.\n"
+          "`rq status` reports each broker's own belief and under-reports "
+          "rates; this is what the account says.\n")
+    try:
+        rows = api_instances()
+    except Exception as exc:
+        print(f"  API unavailable: {exc}\n  VERIFY BY HAND at console.vast.ai")
+        return 1
+    if not rows:
+        print("  no instances on this account")
+    total = 0.0
+    for r in sorted(rows, key=lambda r: (r["broker"] is None, r["broker"] or 0)):
+        who = (f"broker {r['broker']}" + (" PROTECTED" if r["protected"] else "")
+               ) if r["broker"] else "UNCLAIMED — no declared broker owns this"
+        gf = "?" if r["gpu_frac"] is None else f"{r['gpu_frac']:.3f}"
+        print(f"  {r['id']:<10} {r['state']:<9} ${r['dph']:<7.4f} "
+              f"{r['hours']:>6.2f}h  gpu_frac={gf:<6} {r['label']:<22} {who}")
+        if r["state"] in ("running", "loading"):
+            total += r["dph"]
+    print(f"\n  {len([r for r in rows if r['state'] in ('running','loading')])} "
+          f"instance(s) billing at ${total:.4f}/hr combined "
+          f"(${total * 24:.2f}/day if left up)")
+    print(f"  brokers report ${broker_spend:.4f} of cumulative spend between them")
+    try:
+        print(f"  credit ${api_credit():.2f}")
+    except Exception:
+        pass
+    orphan = [r for r in rows if r["broker"] is None
+              and r["state"] in ("running", "loading")]
+    if orphan:
+        print(f"\n  !! {len(orphan)} instance(s) are billing under a label no "
+              f"declared broker owns. Nothing here can tear those down — no "
+              f"broker recognises them as its own. `vastctl destroy <id>`.")
+        return 1
+    return 0
+
+
+# --- taking it down, and PROVING it went down ------------------------------
+
+
+def cmd_down(a) -> int:
+    # EVERY non-protected broker that is listening — `-n` is deliberately not
+    # honoured here. `down` means down. A width-scoped teardown would leave a
+    # broker from an earlier, wider run holding a card, and the whole point of
+    # this command is that it cannot finish while anything is still billing.
+    bs = [b for b in all_declared() if not b.protected and b.listening()]
+    if not bs:
+        print("no fleet brokers listening")
+
+    # THE BILL, TAKEN BEFORE THE EVIDENCE IS DESTROYED. `show_instances` stops
+    # returning an instance the moment it is destroyed, and `dph_total x
+    # duration` is the only account-side record of what a card cost. Read it
+    # after teardown and the answer is silently zero — which is exactly how a
+    # fleet reports "$0.00 spent" and everyone believes it.
+    before = []
+    try:
+        before = [r for r in api_instances() if r["broker"] and not r["protected"]]
+    except Exception as exc:
+        print(f"  could not read the bill before teardown: {exc}")
+    if before:
+        print("\nCOST, off the API, sampled BEFORE anything is destroyed:")
+        total = 0.0
+        for r in sorted(before, key=lambda r: r["broker"]):
+            c = r["dph"] * r["hours"]
+            total += c
+            print(f"  broker {r['broker']:<3} {r['id']:<10} machine "
+                  f"{str(r['machine']):<8} ${r['dph']:.4f}/hr x "
+                  f"{r['hours']:.3f}h = ${c:.4f}")
+        print(f"  TOTAL ${total:.4f} across {len(before)} card(s) — "
+              f"rental only; this includes every second spent deploying, "
+              f"pushing the scene and idling, not just rendering.")
+
+    for b in bs:
+        if b.protected:                     # unreachable, belt and braces
+            raise SystemExit(f"refusing to tear down protected {b.ident}")
+        ok, why = b.verify()
+        print(f"  {b.ident}  {'teardown' if ok else 'SKIPPED (' + why + ')'}")
+        if not ok:
+            continue
+        r = http(b, "POST", "/teardown", {}, timeout=900)
+        print(f"      {json.dumps(r)[:300]}")
+        if not a.keep_brokers:
+            env = dict(os.environ)
+            env.update(b.env())
+            subprocess.run([str(ROOT / "scripts" / "brokerd.sh"), "stop"],
+                           env=env, cwd=str(ROOT), capture_output=True, text=True)
+
+    # THE PART THAT MAKES THIS A TEARDOWN RATHER THAN A REQUEST.
+    #
+    # `rq teardown` returns success from the broker that ran it. It cannot see
+    # any other label — that isolation is deliberate and is what stops two
+    # brokers reaping each other — so "success" has never meant "nothing is
+    # billing". An idle rented 5090 is $0.45/hr, $10.80/day, doing nothing.
+    # THE ORPHAN CASE: a fleet card whose broker is gone. Nothing above can
+    # reach it — `/teardown` needs a broker to answer it — and leaving it is
+    # $0.45/hr forever. Destroying it directly is safe here and ONLY here,
+    # because the owning broker is provably not listening, so no dispatch
+    # thread can be mid-frame on it. This is the failure mode the whole command
+    # exists for; reporting it and walking away is not good enough.
+    try:
+        orphans = [r for r in api_instances()
+                   if r["broker"] and not r["protected"]
+                   and r["state"] in ("running", "loading", "cold")
+                   and not broker(r["broker"]).listening()]
+    except Exception:
+        orphans = []
+    if orphans:
+        _, client = api()
+        from vastctl import vastctl as vc                # noqa: PLC0415
+        print(f"\n  {len(orphans)} fleet card(s) have NO LIVE BROKER — nothing "
+              f"could answer a teardown for them. Destroying directly:")
+        for r in orphans:
+            gone = vc.destroy(client, r["id"])
+            print(f"     {r['id']} {r['label']} ${r['dph']}/hr — "
+                  f"{'destroyed' if gone else 'NOT CONFIRMED GONE'}")
+
+    print("\nverifying against the vast.ai API (not against the brokers' "
+          "own belief)...")
+    # EVERY non-protected label, not just the width that was asked for. A
+    # `down -n 4` that only looked for fleet03..fleet06 would report success
+    # while a fleet07 card from an earlier, wider run kept billing — and
+    # "teardown reported success while something kept billing" is the exact
+    # failure this command exists to make impossible.
+    fleet_labels = {b.label for b in all_declared() if not b.protected}
+    rows, alive = [], []
+    for attempt in range(max(1, a.settle)):
+        try:
+            rows = api_instances()
+        except Exception as exc:
+            print(f"  API unavailable: {exc}")
+            print(f"\n>> STAGE RESULT: FAIL — teardown NOT VERIFIED. Check "
+                  f"console.vast.ai BY HAND before walking away.")
+            return 1
+        alive = [r for r in rows if r["state"] in ("running", "loading", "cold")
+                 and r["label"].split("-")[0] in fleet_labels]
+        if not alive:
+            break
+        if attempt < a.settle - 1:
+            print(f"  {len(alive)} fleet instance(s) still present, "
+                  f"re-checking in 15s...")
+            time.sleep(15)
+
+    # `cold` counts. A stopped instance has stopped paying for the GPU and is
+    # STILL PAYING FOR ITS DISK — 80 GB is ~$0.022/hr, ~$16/month, forever, and
+    # this project has already found an "exited" instance billing for storage
+    # that everyone had written off as gone. "Not running" is not "not costing".
+    others = [r for r in rows if r["state"] in ("running", "loading", "cold")
+              and r["label"].split("-")[0] not in fleet_labels]
+    if alive:
+        cost = sum(r["dph"] for r in alive)
+        print(f"\n>> STAGE RESULT: FAIL — {len(alive)} FLEET INSTANCE(S) ARE "
+              f"STILL ALIVE at ${cost:.4f}/hr (${cost * 24:.2f}/day):")
+        for r in alive:
+            print(f"     {r['id']}  {r['state']}  {r['label']}  ${r['dph']}/hr")
+        print(f"   Destroy by hand: "
+              + "; ".join(f".venv/bin/python -m vastctl.vastctl destroy {r['id']}"
+                          for r in alive))
+        return 1
+    print(f"  0 fleet instances alive — verified against the API")
+    if others:
+        cost = sum(r["dph"] for r in others)
+        print(f"\n  {len(others)} NON-FLEET instance(s) are still billing at "
+              f"${cost:.4f}/hr. These are not the fleet's and are LEFT ALONE:")
+        for r in others:
+            b = next((x for x in all_declared() if r["label"].startswith(x.label)), None)
+            print(f"     {r['id']}  {r['label']}  ${r['dph']}/hr  "
+                  f"{'broker ' + str(b.n) + ' (protected)' if b else 'UNCLAIMED'}")
+        print("  'fleet down' is not 'farm down'. Read that list.")
+    print(f"\n>> STAGE RESULT: PASS — every fleet instance is gone, confirmed "
+          f"by the vast.ai API after the brokers claimed success.")
+    return 0
+
+
+# --- proving the frames ----------------------------------------------------
+
+
+def db_frames(state: Path, name: str) -> dict:
+    """What the broker itself recorded for this sequence: hash, size, seconds.
+
+    Read-only, on a live database, so `mode=ro` and no writes of any kind. The
+    broker's `frames` table already stores a sha256 per delivered frame; using
+    it turns "the file on disk hashes to X" into "the file on disk hashes to
+    the same X the broker computed when it verified the fetch", which catches a
+    frame replaced or truncated after delivery.
+    """
+    import sqlite3                                     # noqa: PLC0415
+    db = state / "broker.db"
+    if not db.exists():
+        return {}
+    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    c.row_factory = sqlite3.Row
+    try:
+        rows = c.execute(
+            "SELECT frame, state, sha256, bytes, width, height, render_sec, "
+            "blank, lum_mean, lum_sd FROM frames WHERE seq=?", (name,)).fetchall()
+    except Exception:
+        return {}
+    finally:
+        c.close()
+    return {r["frame"]: dict(r) for r in rows}
+
+
+def cmd_verify(a) -> int:
+    m = json.loads(Path(a.manifest).read_text())
+    first, last, name = m["first"], m["last"], m["name"]
+    want = list(range(first, last + 1))
+
+    # frame -> [(path, sha256, bytes, broker)], across every block's directory.
+    found: dict[int, list] = {}
+    recorded: dict[int, dict] = {}
+    mismatch, unrecorded = [], []
+    for blk in m["blocks"]:
+        d = Path(blk["dir"])
+        db = db_frames(Path(blk["state"]), name)
+        for fr, row in db.items():
+            recorded[fr] = dict(row, broker=blk["broker"])
+        for p in sorted(d.glob(f"{name}_*.png")) if d.is_dir() else []:
+            mm = re.search(r"_(\d{6})\.png$", p.name)
+            if not mm:
+                continue
+            fr = int(mm.group(1))
+            h = hashlib.sha256(p.read_bytes()).hexdigest()
+            row = db.get(fr)
+            if row is None or not row.get("sha256"):
+                unrecorded.append(fr)
+            elif row["sha256"] != h:
+                mismatch.append((fr, h, row["sha256"]))
+            found.setdefault(fr, []).append(
+                {"path": str(p), "sha256": h, "bytes": p.stat().st_size,
+                 "broker": blk["broker"],
+                 "render_sec": (row or {}).get("render_sec"),
+                 "width": (row or {}).get("width"),
+                 "height": (row or {}).get("height"),
+                 "blank": (row or {}).get("blank")})
+
+    missing = [f for f in want if f not in found]
+    dupes = {f: v for f, v in found.items() if len(v) > 1}
+    stray = [f for f in found if f < first or f > last]
+    # Two brokers rendering the SAME frame is the failure; two files that are
+    # byte-identical would still be two renders paid for twice.
+    identical = {f: v for f, v in dupes.items()
+                 if len({x["sha256"] for x in v}) == 1}
+
+    print(f"sequence {name}   frames {first}-{last} ({len(want)} wanted)")
+    print(f"  present    {len(found)}")
+    print(f"  missing    {len(missing)}"
+          + (f"  {missing[:12]}{'...' if len(missing) > 12 else ''}" if missing else ""))
+    print(f"  duplicated {len(dupes)}"
+          + (f"  ({len(identical)} of them byte-identical)" if dupes else ""))
+    print(f"  outside the requested range {len(stray)}")
+
+    by_broker: dict[int, int] = {}
+    for f, v in found.items():
+        for x in v:
+            by_broker[x["broker"]] = by_broker.get(x["broker"], 0) + 1
+    for blk in m["blocks"]:
+        n = by_broker.get(blk["broker"], 0)
+        expect = blk["last"] - blk["first"] + 1
+        flag = "" if n == expect else "  <-- SHORT" if n < expect else "  <-- EXTRA"
+        print(f"    broker {blk['broker']:<3} {blk['first']}-{blk['last']:<7} "
+              f"{n}/{expect}{flag}")
+
+    uniq = len({v[0]['sha256'] for v in found.values()})
+    print(f"  distinct sha256 across all delivered frames: {uniq} of {len(found)}")
+    if uniq < len(found):
+        # Not necessarily wrong — a held frame can legitimately repeat — but on
+        # a moving camera it is the signature of a stale or duplicated render.
+        print(f"    !! {len(found) - uniq} frame(s) share bytes with another "
+              f"frame. On a moving camera that is a repeat, not a render.")
+
+    # THE FILE ON DISK AGAINST THE HASH THE BROKER COMPUTED AT FETCH TIME.
+    # Hashing the file and comparing it to itself proves nothing; this compares
+    # it to an independent record made by a different process at a different
+    # time.
+    print(f"  sha256 agrees with the broker's own frames table: "
+          f"{len(found) - len(mismatch) - len(unrecorded)}/{len(found)}"
+          + (f"  ({len(mismatch)} MISMATCH, {len(unrecorded)} unrecorded)"
+             if mismatch or unrecorded else ""))
+    for fr, disk, db in mismatch[:5]:
+        print(f"    !! frame {fr}: on disk {disk[:16]}, broker recorded {db[:16]}")
+
+    # Resolution, on every frame, from the broker's measurement of the PNG
+    # rather than from what was asked for. A block rendered at the wrong
+    # resolution comes back looking fine.
+    sizes = {(v[0].get("width"), v[0].get("height")) for v in found.values()}
+    print(f"  resolutions delivered: "
+          + ", ".join(f"{w}x{h}" for w, h in sorted(sizes, key=str)))
+    # Against the broker's OWN verdict set, imported rather than restated. The
+    # first version of this line tested `not in (None, "", "ok")` and flagged
+    # all five delivered frames as failures — the verdict is `"OK"`, uppercase.
+    # A gate that reports a defect in every good frame is worse than no gate:
+    # it trains the reader to ignore it. `imgstat.NOT_OK` is the real set, and
+    # importing it means a new verdict added there is picked up here.
+    from broker import imgstat                          # noqa: PLC0415
+    blanks = [f for f, v in found.items()
+              if v[0].get("blank") in imgstat.NOT_OK]
+    unmeasured = [f for f, v in found.items() if v[0].get("blank") is None]
+    print(f"  blank gate: {len(found) - len(blanks) - len(unmeasured)} OK, "
+          f"{len(blanks)} not-OK{f' {blanks[:10]}' if blanks else ''}, "
+          f"{len(unmeasured)} unmeasured")
+
+    secs = [v[0]["render_sec"] for v in found.values() if v[0].get("render_sec")]
+    if secs:
+        secs.sort()
+        print(f"  render_sec across all brokers: min {secs[0]:.1f} "
+              f"median {secs[len(secs) // 2]:.1f} max {secs[-1]:.1f} "
+              f"mean {sum(secs) / len(secs):.1f}")
+
+    if a.json:
+        Path(a.json).write_text(json.dumps(
+            {"name": name, "first": first, "last": last,
+             "frames": {str(k): v for k, v in sorted(found.items())}}, indent=2))
+        print(f"  hashes written to {a.json}")
+
+    bad = bool(missing or dupes or stray or mismatch or len(sizes) > 1 or blanks)
+    if bad:
+        print(f"\n>> STAGE RESULT: FAIL — {len(missing)} missing, {len(dupes)} "
+              f"duplicated, {len(stray)} out of range, {len(mismatch)} hash "
+              f"mismatches, {len(sizes)} distinct resolution(s), {len(blanks)} "
+              f"blank-gate failures. NOT exactly-once at delivery spec.")
+        return 1
+    print(f"\n>> STAGE RESULT: PASS — all {len(want)} frames present EXACTLY "
+          f"ONCE across {len(m['blocks'])} broker output directories: no "
+          f"duplicates, no gaps, every sha256 matching the hash its broker "
+          f"recorded independently at fetch time, one resolution, no blanks.")
+    return 0
+
+
+# --- writing down what each host actually did ------------------------------
+
+
+def cmd_record(a) -> int:
+    """Per-host measured s/frame, into farm/hostrates.json. Run before `down`.
+
+    THE INPUT THE MASTER'S COST ESTIMATE HAS BEEN WRONG ABOUT FIVE TIMES —
+    322 h/$146, then 180 h/$80, then 172 h/$76, then 155 h/$70, then the
+    correction to all of them. Every one of those numbers came from a
+    neighbouring configuration, and neighbouring configurations on this project
+    are wrong by factors rather than percentages. The only cure is to write
+    down what a specific machine achieved at a specific spec, and to keep the
+    spec next to the number.
+
+    Must run BEFORE teardown: after `down` the instance is gone and with it the
+    machine id, so the rate can never be attributed to the host that earned it.
+    """
+    from farm import procure                            # noqa: PLC0415
+    m = json.loads(Path(a.manifest).read_text())
+    name = m["name"]
+
+    try:
+        rows = {r["id"]: r for r in api_instances()}
+    except Exception as exc:
+        print(f"  API unavailable ({exc}) — machine ids cannot be resolved, so "
+              f"nothing will be recorded. Rates keyed on an instance id are "
+              f"useless: the instance is a rental, the machine is the silicon.")
+        return 1
+
+    print(f"{'broker':<8}{'instance':<11}{'machine':<10}{'n':<5}"
+          f"{'s/frame':<10}{'$/hr(API)':<11}{'$/frame':<10}spec")
+    any_rec = False
+    for blk in m["blocks"]:
+        b = broker(blk["broker"])
+        db = db_frames(b.state, name)
+        secs = [r["render_sec"] for r in db.values()
+                if r["state"] == "done" and r["render_sec"]]
+        q = http(b, "GET", "/queue")
+        f = (q.get("fleet") or {})
+        iid = f.get("instance_id")
+        inst = rows.get(iid) or {}
+        machine = inst.get("machine")
+        dph = inst.get("dph") or 0.0
+        if not secs or not machine:
+            print(f"{b.n:<8}{str(iid):<11}{str(machine):<10}"
+                  f"{len(secs):<5}{'-':<10}{dph:<11.4f}{'-':<10}"
+                  f"{'no frames' if not secs else 'no machine id'}")
+            continue
+        mean = sum(secs) / len(secs)
+        procure.record(machine, a.spec_hash or "unknown", mean, len(secs),
+                       dph=dph, note=a.note or f"{name} on broker {b.n}")
+        any_rec = True
+        print(f"{b.n:<8}{iid:<11}{machine:<10}{len(secs):<5}{mean:<10.1f}"
+              f"{dph:<11.4f}{dph * mean / 3600:<10.5f}{a.spec_hash or 'unknown'}")
+
+    if not any_rec:
+        print("\n>> STAGE RESULT: FAIL — nothing recorded.")
+        return 1
+    print(f"\n>> STAGE RESULT: PASS — written to {procure.RATES}. "
+          f"`farm/procure.py` will rank these machines on measurement rather "
+          f"than on sticker price from now on.")
+    return 0
+
+
+# --- CLI -------------------------------------------------------------------
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="fleetctl",
+                                description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def width(sp, required=False):
+        sp.add_argument("-n", type=int, required=required, default=None,
+                        help="fleet width; brokers 3..n+2, never 1 or 2")
+
+    sp = sub.add_parser("plan", help="what it would cost, before spending it")
+    width(sp, True)
+    sp.add_argument("--frames", help="contiguous A-B")
+    sp.add_argument("--sec-per-frame", type=float, default=None)
+    sp.add_argument("--weights", type=float, nargs="+",
+                    help="relative throughput per broker, from measured "
+                         "s/frame. Equal blocks lose ~20%% to a 1.9x host "
+                         "spread; see split().")
+    sp.add_argument("--push-sec", type=float, default=0.0,
+                    help="measured scene push per instance; it is not free")
+    sp.set_defaults(func=cmd_plan)
+
+    sp = sub.add_parser("up", help="start N brokers, identity-verified")
+    width(sp, True)
+    sp.add_argument("--scene")
+    sp.add_argument("--disk", type=int, default=80)
+    sp.add_argument("--hibernate", type=int, default=14400)
+    sp.add_argument("--cap", type=float, default=20.0,
+                    help="per-broker MAX_BATCH_USD fallback")
+    sp.set_defaults(func=cmd_up)
+
+    sp = sub.add_parser("submit", help="split a range into N contiguous blocks")
+    width(sp, True)
+    sp.add_argument("--scene", required=True)
+    sp.add_argument("--frames", required=True)
+    sp.add_argument("--name", required=True)
+    # Required, exactly as `rq anim` requires them. A fleet submission that
+    # defaulted the resolution would render 48 frames of the wrong deliverable
+    # on four rented cards before anybody looked at a pixel.
+    sp.add_argument("--res", type=int, nargs=2, required=True)
+    sp.add_argument("--samples", type=int, required=True)
+    sp.add_argument("--cam", required=True)
+    sp.add_argument("--weights", type=float, nargs="+",
+                    help="relative throughput per broker; see `plan --weights`")
+    sp.add_argument("--adaptive-threshold", type=float)
+    sp.add_argument("passthrough", nargs="*", default=[])
+    sp.set_defaults(func=cmd_submit)
+
+    sp = sub.add_parser("status", help="every broker AND the account")
+    width(sp)
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("down", help="tear the fleet down and PROVE it")
+    sp.add_argument("-n", type=int, default=None,
+                    help=argparse.SUPPRESS)   # accepted and ignored; see cmd_down
+    sp.add_argument("--keep-brokers", action="store_true",
+                    help="destroy the cards but leave the broker processes up")
+    sp.add_argument("--settle", type=int, default=4,
+                    help="API re-checks before declaring failure")
+    sp.set_defaults(func=cmd_down)
+
+    sp = sub.add_parser("record", help="per-host s/frame -> farm/hostrates.json")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--spec-hash", default="",
+                    help="the broker's spec_hash for this batch; a rate "
+                         "without one is not reusable")
+    sp.add_argument("--note", default="")
+    sp.set_defaults(func=cmd_record)
+
+    sp = sub.add_parser("verify", help="every frame exactly once, by hash")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--json", help="write the per-frame hashes here")
+    sp.set_defaults(func=cmd_verify)
+
+    a = p.parse_args()
+    return a.func(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
