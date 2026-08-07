@@ -44,6 +44,41 @@ time (290.2 render-hours, 2,978 frames, +25.6 h non-render overhead):
 13.4 days → 1.7 days is the entire prize. It changes what a defect costs after
 the master renders, which is the whole reason the ladder discipline exists.
 
+> ### THOSE THREE ROWS ARE SUPERSEDED — measured 2026-08-07
+>
+> **The master is 180.0 h and $79.99 on one exclusive card, not 322 h and
+> $146.** The old figure priced beats 4-6 at `render3.blend`'s 510.5 s/frame
+> and beats 1-3 at `beat1_anim.blend`'s 60.2 s. Neither is the film. Nine
+> frames of `film16_breach.blend` — the ship candidate — were rendered at
+> 3840×2160 / 512 samples on an exclusive 5090 (`gpu_frac 1.0`, $0.4444/hr
+> all-in, instance 47039886), sampled across all six beats because the ladder
+> had already shown beat 1 costing 72 s/frame against the close-out's 43 s:
+>
+> | beat | frames | measured s/frame | sampled at |
+> |---|---|---|---|
+> | 1_assembly | 792 | 161.8 | f30 151, f400 183, f760 152 |
+> | 2_launch | 72 | 158.1 | f830 |
+> | 3_breach | 192 | 216.0 | f950 |
+> | 4_transit | 134 | 230.5 | f1120 |
+> | 5_lap | 1,524 | 240.7 | f1500 271, f2300 210 |
+> | 6_ending | 264 | 197.1 | f2850 |
+>
+> Weighted: **175.2 render-hours**, mean 212 s/frame. Non-render overhead is
+> **4.8 s/frame**, not 31 — measured as the wall gap between eight consecutive
+> frames minus their render times, on a host that took a 7.97 GB scene at
+> 97.6 MB/s and deployed in 102 s.
+>
+> **The whole-film spread is 1.5×, not 8.5×**, and beat 6 — the closing wide,
+> the row the old table feared most — is *cheaper* than beat 5. So the two-point
+> `P = 6.30 s, F = 57.1 s` fit below, and every conclusion drawn from the 8.5×
+> spread, should be re-derived before being used. The fit's *shape* argument
+> (eight independent workers beat eight GPUs on one frame) is unaffected; its
+> magnitudes are not.
+>
+> The lesson is the one this file already teaches in another key: **the numbers
+> came from a neighbouring configuration, and neighbouring configurations on
+> this project are wrong by factors, not by percentages.**
+
 ## PARALLEL COLLECT IS PART OF THE FIRST CUT, NOT A FOLLOW-UP
 
 **Read this before writing any code.** Measured on the live box 2026-08-04,
