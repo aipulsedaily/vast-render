@@ -409,8 +409,74 @@ MIN_CPU_CORES_EFFECTIVE = float(os.environ.get("VASTRENDER_MIN_CPU") or 32.0)
 #
 # NOTE THE UNITS: the vast.ai query language takes `cpu_ram` in GB, while the
 # offer dict returns it in MB. Asking for `cpu_ram>=50000` matches nothing at
-# all and reads as "no capacity" rather than as a malformed query.
-MIN_CPU_RAM_GB = float(os.environ.get("VASTRENDER_MIN_RAM_GB") or 50.0)
+# all and reads as "no capacity" rather than as a malformed query. It also means
+# the query floor and the offer's own figure are in DIFFERENT UNITS, so a floor
+# of 64 "GB" admits a 62.7 GiB box. That is why `search_offers` re-checks the
+# returned dict in GiB rather than trusting the query term — see
+# `_meets_scene_working_set`.
+#
+# ---------------------------------------------------------------------------
+# 2026-08-08: THE FLOOR AND THE REQUIREMENT HAD BECOME THE SAME NUMBER.
+#
+# Everything above was measured when the film was `film16_breach.blend` at
+# 7.97 GB and needed ~42 GB. **The shipping scene is `film23_breach.blend` at
+# 10.19 GiB and it is 50.6 GiB RESIDENT.** Measured from the cgroup on instance
+# 47189253 while it served the scene for the master-cost probe (R2-3018):
+#
+#     /sys/fs/cgroup/memory.max      63,803,752,448   =  59.4 GiB
+#     /sys/fs/cgroup/memory.current  58,342,010,880   =  54.3 GiB   (91 % used)
+#     render worker RSS              53,035,096 kB    =  50.6 GiB
+#
+# A 50.0 GB floor against a 50.6 GiB working set is not a floor. It is the
+# requirement itself, and it would have rented a box the render dies on — where
+# "dies" means the catatonic swap-thrash described above, which every probe the
+# broker has reads as a network fault because every probe travels over the ssh
+# being starved. A cgroup OOM picks the largest RSS, and the largest RSS on a
+# rendering box IS the render worker.
+#
+# WHY 72 AND NOT 56 OR 64. The exclusive 5090 market is bimodal and there is a
+# hole in it. Surveyed 2026-08-08 17:5x, exclusive offers by floor:
+#
+#     floor  50 GB -> 11 offers   RAM 62.7, 60.5, 124.9, 247.3, 251.5, 125.2 GiB
+#     floor  64 GB ->  8 offers   RAM 62.7, 124.9, 247.3, 251.5, 125.2, 125.7
+#     floor  72 GB ->  7 offers   RAM 124.9, 247.3, 251.5, 125.2, 125.7, 251.4
+#     floor  80 GB ->  7 offers   (identical set)
+#     floor  96 GB ->  6 offers   (identical set)
+#
+# **Nothing at all is on sale between 63 GiB and 125 GiB.** So any floor above
+# ~64 buys the same 125 GiB tier, and 72 is simply the cheapest way to ask for
+# it. 80 and 96 cost nothing extra and buy nothing extra; 64 keeps one 62.7 GiB
+# box in the set, which is 12 GiB of headroom on a scene that is still growing
+# (49 of 435 item modules exist).
+#
+# WHAT IT COSTS: at three cards the mean rises $0.4409 -> $0.4703/GPU-hr, about
+# **$8** on a 245.5 GPU-hour master. That is the price of removing a failure
+# mode that presents as a network fault.
+#
+# WHAT IT COSTS IN DEPTH, and this is the number that decided the master's
+# shape: **seven exclusive offers meet it.** Three cards is comfortable, five is
+# the whole market, nine is not purchasable at a memory this scene can load.
+MIN_CPU_RAM_GB = float(os.environ.get("VASTRENDER_MIN_RAM_GB") or 72.0)
+
+# The measurement the floor exists to protect, kept as a number rather than as
+# prose so the refusal message can quote it and so a future scene can update one
+# constant. GiB, because this is compared against the offer dict (MB/1024), not
+# against the query language (GB).
+SCENE_WORKING_SET_GIB = float(
+    os.environ.get("VASTRENDER_SCENE_WORKING_SET_GIB") or 50.6)
+
+# How much of a box must be left over after the scene is resident. The probe box
+# ran the whole 14-frame master-spec batch at 91 % of its cap and finished every
+# frame — so 1.09x is survivable and is NOT the recommendation. `rq exec`'s
+# 20 GB memory gate could not open on it at all, and the scene has only grown so
+# far. 1.25x puts a 50.6 GiB scene on a >=63 GiB box, which is where the market
+# splits anyway.
+#
+# AND THE ADVERTISED FIGURE IS NOT THE CONTAINER'S CAP. Offer 43255050 lists
+# 61.9 GiB; the container it produced reported `memory.max` = 59.4 GiB — 96 % of
+# what was sold. The headroom factor absorbs that gap as well as the scene's
+# growth, which is a second reason not to shave it toward 1.0.
+RAM_HEADROOM = float(os.environ.get("VASTRENDER_RAM_HEADROOM") or 1.25)
 
 # HOW MANY GPUs THE BOX HAS — and why this was invisible.
 #
@@ -576,6 +642,90 @@ def _within_bandwidth_ceiling(offers: list[dict]) -> tuple[list[dict], list[tupl
     return kept, dropped
 
 
+def ram_gib_per_gpu(offer: dict) -> float:
+    """The offer's own RAM figure, in GiB, per GPU. MB/1024, not /1000.
+
+    Per-GPU because the requirement is per concurrent Blender process and a
+    wide box runs one worker per card — the same reasoning `build_query`
+    already applies when it scales the query term by `num_gpus`.
+    """
+    return (float(offer.get("cpu_ram") or 0.0) / 1024.0
+            / max(1, int(offer.get("num_gpus") or 1)))
+
+
+def _meets_scene_working_set(offers: list[dict]) -> tuple[list[dict], list[tuple]]:
+    """Split offers on RAM measured in GiB. Returns (kept, dropped).
+
+    THIS IS NOT A DUPLICATE OF THE QUERY TERM, AND THE UNITS ARE THE REASON.
+    `build_query` asks `cpu_ram>={MIN_CPU_RAM_GB * n}` and the vast.ai query
+    language reads that as **GB**; the offer dict answers in **MB**, which is
+    GiB once divided by 1024. Those differ by 7.4 %, so a 64 "GB" floor admits a
+    62.7 GiB box — observed, on the cheapest offer on the market on 2026-08-08.
+    Seven per cent is not a rounding argument when the requirement is 50.6 GiB
+    and the box that carried it ran at 91 % of its cap.
+
+    So the query narrows and this DECIDES, in the units the requirement is
+    measured in. Same belt-and-braces as `_within_bandwidth_ceiling` above, and
+    for a better reason: that one guards against a term the API might ignore,
+    this one guards against a term the API honours in units we did not mean.
+    """
+    need = SCENE_WORKING_SET_GIB * RAM_HEADROOM
+    kept, dropped = [], []
+    for o in offers:
+        ram = ram_gib_per_gpu(o)
+        if ram < need:
+            dropped.append((o.get("id"), round(ram, 1), o.get("dph_total")))
+            continue
+        kept.append(o)
+    return kept, dropped
+
+
+def _refuse_for_ram(dropped_ram: list[tuple], num_gpus: int) -> "VastError":
+    """The refusal, with the measurement and the market depth in it.
+
+    RENTING THE BEST OF A BAD SET IS THE FAILURE, not the shortage. An operator
+    reading "renting offer X" has no way to know the filter that mattered was
+    the one that found nothing — the same shape as `reap` printing a confident
+    empty kill list while ten GPUs billed. So this raises, and it says which
+    floor, against which measurement, and how much of the market cleared it.
+
+    THIS DELIBERATELY CONTRADICTS `search_offers`' OWN PRINCIPLE, and the
+    contradiction is the point. That docstring says "a hard filter that returns
+    nothing does not degrade, it RAISES, stranding every queued job...
+    Availability wins over preference here", and it is right about
+    EXCLUSIVITY: a shared card renders, just riskily, so having one beats
+    having none. RAM is not a preference. A box that cannot hold the scene does
+    not render slowly, it swaps until sshd cannot complete a banner exchange —
+    and then it is diagnosed as a network fault, because every probe the broker
+    owns travels over the ssh being starved. Availability of a box that cannot
+    do the work is worth nothing, so this one refuses.
+    """
+    lines = ", ".join(f"{i} ({r:.1f} GiB, ${float(d or 0):.4f}/hr)"
+                      for i, r, d in dropped_ram[:8])
+    return VastError(
+        f"REFUSING TO RENT: no exclusive RTX 5090 offer carries enough RAM for "
+        f"this project's scene, and renting the best of a bad set is how a "
+        f"render dies as a network fault.\n"
+        f"  need    {SCENE_WORKING_SET_GIB:.1f} GiB resident x {RAM_HEADROOM:.2f} "
+        f"headroom = {SCENE_WORKING_SET_GIB * RAM_HEADROOM:.1f} GiB per GPU\n"
+        f"  measured on instance 47189253, 2026-08-08: film23_breach.blend is "
+        f"10.19 GiB on disk and 53,035,096 kB (50.6 GiB) resident, on a "
+        f"59.4 GiB cgroup cap running at 91 %\n"
+        f"  query floor  cpu_ram>={MIN_CPU_RAM_GB * max(1, num_gpus):g} GB "
+        f"(MIN_CPU_RAM_GB={MIN_CPU_RAM_GB:g}, num_gpus={num_gpus})\n"
+        f"  rejected     {len(dropped_ram)} offer(s): {lines}\n"
+        f"  NOTE: the exclusive 5090 market is bimodal and thin. Surveyed "
+        f"2026-08-08, NOTHING at all is on sale between 63 GiB and 125 GiB, and "
+        f"the count clearing this floor was EIGHT. Three cards is comfortable, "
+        f"five is most of the market, and nine is not purchasable at a memory "
+        f"this scene can load. If you are sizing a fleet, run "
+        f"`vastctl offers` first and count — do not assume depth.\n"
+        f"  If you are renting for something OTHER than the film scene (an "
+        f"`rq exec` build wave, a small verify blend), lower it deliberately "
+        f"and per-process: VASTRENDER_SCENE_WORKING_SET_GIB=... or "
+        f"VASTRENDER_MIN_RAM_GB=... . Do not change the default.")
+
+
 def search_offers(
     client: VastAI,
     hours: float = 8.0,
@@ -618,6 +768,7 @@ def search_offers(
         type="on-demand", order="dph_total", limit=limit,
     )
     kept, dropped = _within_bandwidth_ceiling(exclusive)
+    kept, dropped_ram = _meets_scene_working_set(kept)
 
     shared_fallback = False
     if not kept:
@@ -628,8 +779,22 @@ def search_offers(
             type="on-demand", order="dph_total", limit=limit,
         )
         kept, more_dropped = _within_bandwidth_ceiling(offers)
+        kept, more_ram = _meets_scene_working_set(kept)
         dropped += more_dropped
+        dropped_ram += more_ram
 
+    # RAM IS CHECKED BEFORE BANDWIDTH IS BLAMED, and before the co-tenancy
+    # fallback gets to speak. Both of those messages are confident and neither
+    # is about memory, so an operator who hit the RAM wall would read a sentence
+    # about $/TB or about sharing a card and go looking in the wrong place.
+    # Refuse on the real reason, first.
+    if not kept and dropped_ram:
+        raise _refuse_for_ram(dropped_ram, num_gpus)
+    if dropped_ram:
+        print(f"[vastctl] dropped {len(dropped_ram)} offer(s) under the "
+              f"{SCENE_WORKING_SET_GIB * RAM_HEADROOM:.1f} GiB/GPU scene "
+              f"working-set floor: "
+              + ", ".join(f"{i}({r} GiB)" for i, r, _ in dropped_ram[:6]))
     if dropped:
         print(f"[vastctl] dropped {len(dropped)} offer(s) over the "
               f"${MAX_INET_COST_PER_TB:.2f}/TB bandwidth ceiling: "
@@ -656,8 +821,9 @@ def search_offers(
         # only becomes the deciding figure once there is a worker per card.
         o["_dph_per_gpu"] = float(o.get("dph_total") or 0.0) / max(
             1, int(o.get("num_gpus") or 1))
-        o["_ram_gb_per_gpu"] = (float(o.get("cpu_ram") or 0.0) / 1024.0
-                                / max(1, int(o.get("num_gpus") or 1)))
+        # One definition, used by the filter and by the display alike, so the
+        # number an operator reads is the number that was decided on.
+        o["_ram_gb_per_gpu"] = ram_gib_per_gpu(o)
 
     if shared_fallback:
         cheapest = min(kept, key=lambda o: o["_est"])
@@ -1258,15 +1424,28 @@ def cmd_offers(args: argparse.Namespace) -> int:
     if not offers:
         print("no offers matched")
         return 1
-    print(f"{'id':<11}{'$/hr':<7}{'rel':<7}{'net Mbps':<11}{'disk$/GB':<10}{f'est {args.hours:g}h':<10}CPU")
-    print("-" * 88)
+    # RAM and geolocation are shown because both decide things and neither was
+    # visible. RAM is the floor that stops a 50.6 GiB scene renting a box it
+    # dies on (MIN_CPU_RAM_GB). GEOLOCATION is the field the offer dict has
+    # always carried and nothing has ever read: `inet_up` says 734 Mbps for the
+    # box rented on 2026-08-08 and its RTT was 254 ms, which cost 13.6 min of
+    # scene push on ONE stream and 13.5 s per frame of fetch. Advertised
+    # bandwidth does not predict a single-stream transfer; distance does.
+    print(f"{'id':<11}{'$/hr':<7}{'rel':<7}{'net Mbps':<11}{'RAM GiB':<9}"
+          f"{'disk$/GB':<10}{f'est {args.hours:g}h':<10}{'geo':<20}CPU")
+    print("-" * 118)
     for o in offers[: args.limit]:
         print(
             f"{o['id']:<11}{o.get('dph_total', 0):<7.3f}{o.get('reliability2', 0):<7.3f}"
             f"{str(int(o.get('inet_up', 0))) + '/' + str(int(o.get('inet_down', 0))):<11}"
+            f"{o.get('_ram_gb_per_gpu', 0.0):<9.1f}"
             f"{o.get('storage_cost', 0):<10.4f}{'$' + format(o['_est'], '.2f'):<10}"
+            f"{str(o.get('geolocation'))[:19]:<20}"
             f"{str(o.get('cpu_name'))[:24]}"
         )
+    print(f"\nRAM floor {SCENE_WORKING_SET_GIB * RAM_HEADROOM:.1f} GiB/GPU "
+          f"({SCENE_WORKING_SET_GIB:.1f} GiB measured resident x {RAM_HEADROOM:.2f}); "
+          f"{len(offers)} offer(s) cleared it.")
     return 0
 
 
