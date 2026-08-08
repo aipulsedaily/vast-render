@@ -13,6 +13,13 @@ indefinitely, and none of it is recoverable after the fact:
     this broker created after a crash. Reap by label *before* creating anything.
   * **Verify destroys.** The API returning success is not the instance being
     gone; poll until the id disappears.
+  * **The CLI is ACCOUNT-WIDE; only the library is label-scoped.** `status` and
+    `reap` answer the question an operator is actually asking — "what am I
+    paying for, and stop it" — which is a question about the ACCOUNT, not about
+    one broker's label. Label scoping belongs in `Fleet.adopt_or_reap`, where it
+    stops two brokers destroying each other's card mid-frame. Putting it in the
+    emergency stop instead is how the emergency stop became a no-op; see
+    `reap()` and `cmd_status()` for the measurement.
 
 There is no server-side safety net to fall back on: verified against the CLI
 source, vast.ai has no spend cap, no instance TTL, no `--end-date`, and
@@ -122,6 +129,36 @@ READY_TIMEOUT = 900.0
 # parked in `stopped`. Bounded so that a vast which ignores start_instance
 # still falls through to READY_TIMEOUT rather than spinning forever.
 COLD_START_NUDGES = 3
+
+# `start_instance` returns a JSON body, and until 2026-08-07 nothing read it.
+# Measured that day on instance 47049525 (machine 138180), hibernated at 14:22
+# and woken at 15:05 for a queued job:
+#
+#     {'success': False, 'error': 'resources_unavailable',
+#      'msg': 'Required resources are currently unavailable, state change queued.'}
+#
+# That is vast saying the machine's GPUs are all let to other tenants, so the
+# container cannot be restarted and the request has been parked on a queue with
+# no deadline. Nothing about it is transient in any useful sense — the instance
+# read `actual=exited, intended=stopped` for the whole window, and the identical
+# response on instance 47040457, on the SAME machine, never cleared across the
+# 30 minutes the broker spent waiting on it that morning.
+#
+# Ignoring the body meant the nudge looked like it had worked: the transition
+# trace logged `start_instance#1` and the loop then slept out all 900 s, twice
+# (RESUME_ATTEMPTS), before fleet.py destroyed the instance and rented working
+# hardware. Half an hour of a blocked queue to learn something the very first
+# API call had already said in plain words.
+#
+# So: once vast has refused for want of resources, stop budgeting a provisioning
+# timeout for it. Keep a short grace — a co-tenant releasing a card really does
+# unblock the start, and the nudges continue through it — then fail so the
+# caller can go rent a GPU that exists. The machine is NOT condemned: it is
+# full, not broken (this one served 4.8 h of renders earlier the same day).
+COLD_UNAVAIL_GRACE = 120.0
+# vast's own error slug for that condition. Matched on the response body, never
+# on prose, so a wording change cannot silently restore the 900 s stall.
+UNAVAIL_ERRORS = ("resources_unavailable", "no_such_resource")
 SSH_PROBE_TIMEOUT = 180.0
 # How long to keep waiting for the *direct* port mapping once the instance is
 # running, before accepting the proxy relay. The relay measured 6.9 Mbps against
@@ -823,6 +860,97 @@ def other_instances(client: VastAI) -> list[Instance]:
     ]
 
 
+def all_instances(client: VastAI) -> list[Instance]:
+    """EVERY instance on this account. The whole bill, no filter, no exceptions.
+
+    THE ONLY ENUMERATION AN EMERGENCY STOP MAY USE. `our_instances` and
+    `other_instances` partition the account by `LABEL_PREFIX`, and that split is
+    correct for a *broker* deciding what it may destroy. It is catastrophic for
+    an *operator* asking what is running, because `LABEL_PREFIX` comes from the
+    environment and a hand-run CLI has no environment: it silently answers
+    "renderbroker", a label the fleet does not use.
+
+    Measured 2026-08-08 on this account, with nine RTX 5090s rendering:
+
+        $ vastctl status
+        credit $51.13   autobill=None
+        no broker instances          <-- nine cards, $4.3065/hr, $103/day
+
+        our_instances()   -> []              (this was reap's entire kill list)
+        other_instances() -> 9 instances, ladderbroker + fleet03..fleet10
+
+    Nine live cards, and both the report AND the panic button read zero. The
+    fleet labels its instances `fleet03`…`fleet11` (`farm/brokers.py:_label`)
+    and the second broker uses `ladderbroker`; none of them start with
+    `renderbroker`, so `scripts/panic.sh` — the project's only emergency stop —
+    destroyed nothing, printed "no broker instances", and told the operator the
+    farm was down while it billed at $103/day.
+
+    That is strictly worse than a missing feature. A stop that fails loudly gets
+    escalated; this one reported success.
+    """
+    return sorted((Instance(r) for r in client.show_instances()), key=lambda i: i.id)
+
+
+def live_broker_labels() -> dict[str, list[int]]:
+    """{VASTRENDER_LABEL: [pid, …]} for every broker process running right now.
+
+    Read out of `/proc/<pid>/environ`, which is the kernel's record of how the
+    process was actually started — not a claim the broker makes about itself,
+    and not a state file that goes stale the moment a broker dies. Same
+    technique as `farm/brokers.py:verify()`, for the same reason.
+
+    A broker started without `VASTRENDER_LABEL` gets the module default, exactly
+    as the broker itself would compute it, so broker 1 is not miscounted as
+    label-less.
+
+    Never shells out to `pgrep`/`pkill`: those match on the whole command line,
+    which includes the shell that ran them, and this project has eaten its own
+    session that way (see `scripts/panic.sh`). Pure /proc reads, no signals.
+    """
+    found: dict[str, list[int]] = {}
+    try:
+        pids = [e for e in os.listdir("/proc") if e.isdigit()]
+    except OSError:
+        return found
+    for entry in pids:
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                cmdline = fh.read().decode("utf-8", "replace")
+            if "broker.app" not in cmdline:
+                continue
+            with open(f"/proc/{pid}/comm") as fh:
+                if not fh.read().strip().startswith("python"):
+                    continue          # the shell that spawned it is not a broker
+            with open(f"/proc/{pid}/environ", "rb") as fh:
+                env = fh.read().decode("utf-8", "replace")
+        except (OSError, PermissionError):
+            continue
+        label = LABEL_PREFIX
+        for kv in env.split("\0"):
+            if kv.startswith("VASTRENDER_LABEL="):
+                label = kv.split("=", 1)[1] or LABEL_PREFIX
+                break
+        found.setdefault(label, []).append(pid)
+    return found
+
+
+def broker_for(inst: Instance, brokers: dict[str, list[int]]) -> Optional[str]:
+    """The live broker label owning this instance, or None if it is an ORPHAN.
+
+    Instance labels are `<broker label>-<runid>` (`create()`), so the owning
+    label is the part before the run stamp. Matched by longest label first:
+    `fleet1` would otherwise claim `fleet11`'s card, which is the exact aliasing
+    bug `farm/brokers.py` uses fixed-width labels to avoid.
+    """
+    label = inst.label
+    for known in sorted(brokers, key=len, reverse=True):
+        if label == known or label.startswith(known + "-"):
+            return known
+    return None
+
+
 # --- watchdog -------------------------------------------------------------
 
 
@@ -909,6 +1037,20 @@ def create(
     return int(resp["new_contract"])
 
 
+def _unavailable(resp: Any) -> str:
+    """vast's refusal slug if a start was declined for want of resources, else "".
+
+    `VastAI(raw=True)` hands back the parsed JSON body, but a transport that
+    returns a string, None, or a list is not worth an AttributeError inside a
+    wait loop — anything unrecognised reads as "no refusal seen", which restores
+    exactly the previous behaviour.
+    """
+    if not isinstance(resp, dict) or resp.get("success"):
+        return ""
+    err = str(resp.get("error") or "").strip()
+    return err if err in UNAVAIL_ERRORS else ""
+
+
 def wait_ready(client: VastAI, instance_id: int, timeout: float = READY_TIMEOUT) -> Instance:
     """Poll to running, then wait for a *direct* SSH endpoint, then probe it.
 
@@ -927,6 +1069,7 @@ def wait_ready(client: VastAI, instance_id: int, timeout: float = READY_TIMEOUT)
     inst: Optional[Instance] = None
     seen: list[str] = []
     nudges = 0
+    unavail_since: Optional[float] = None
 
     while time.time() < deadline:
         raw = client.show_instance(instance_id)
@@ -969,8 +1112,26 @@ def wait_ready(client: VastAI, instance_id: int, timeout: float = READY_TIMEOUT)
             # the resume path in fleet.py) and must still reach the timeout.
             nudges += 1
             try:
-                client.start_instance(instance_id)
-                seen.append(f"start_instance#{nudges} @{time.time() - started:.0f}s")
+                resp = client.start_instance(instance_id)
+                refusal = _unavailable(resp)
+                if refusal:
+                    # vast refused for want of free GPUs on the host. See
+                    # COLD_UNAVAIL_GRACE: keep nudging, but stop paying the full
+                    # provisioning timeout for a start that has been queued
+                    # behind another tenant with no deadline attached.
+                    seen.append(
+                        f"start_instance#{nudges} refused ({refusal}) "
+                        f"@{time.time() - started:.0f}s"
+                    )
+                    unavail_since = unavail_since or time.time()
+                    deadline = min(deadline, unavail_since + COLD_UNAVAIL_GRACE)
+                    # The nudge budget exists to stop us spinning on a vast that
+                    # silently ignores us. This vast is answering, and answering
+                    # the same way each time, so let the grace window do the
+                    # bounding instead of burning the budget in 30 s.
+                    nudges -= 1
+                else:
+                    seen.append(f"start_instance#{nudges} @{time.time() - started:.0f}s")
             except Exception as exc:  # noqa: BLE001 - report, never mask the wait
                 seen.append(f"start_instance#{nudges} failed: {exc}")
         time.sleep(POLL_INTERVAL)
@@ -1050,15 +1211,34 @@ def destroy(client: VastAI, instance_id: int, verify: bool = True) -> bool:
     return False
 
 
-def reap(client: VastAI, keep: Iterable[int] = ()) -> list[int]:
-    """Destroy every instance we own except those explicitly kept.
+def reap(client: VastAI, keep: Iterable[int] = (),
+         *, labelled_only: bool = False) -> list[int]:
+    """Destroy every instance ON THIS ACCOUNT except those explicitly kept.
 
-    Run at broker startup, before creating anything — a crashed previous run is
-    otherwise invisible and bills until someone notices.
+    THE PANIC BUTTON, AND IT USED TO BE A NO-OP. This enumerated
+    `our_instances` — `LABEL_PREFIX`-scoped, and `LABEL_PREFIX` defaults to
+    "renderbroker" for anything run without a broker's environment, which is
+    precisely how `scripts/panic.sh` runs it. Measured 2026-08-08 with nine
+    RTX 5090s live at $4.3065/hr: the kill list was `[]`. panic.sh destroyed
+    nothing and then printed "no broker instances", so the operator's evidence
+    that the farm was down was produced by the same blind spot that left it up.
+    See `all_instances` for the full measurement.
+
+    So the default is now the whole account. That is not a widening of scope,
+    it is the scope the caller always believed it had: panic.sh's first line is
+    "Destroy every rented GPU, right now", and `--help` has always read
+    "destroy all broker instances (panic button)".
+
+    `labelled_only=True` restores the old `LABEL_PREFIX` scoping for a caller
+    that genuinely means one broker's cards. NOTHING in this tree passes it —
+    `Fleet.adopt_or_reap` does not call this function at all, it walks
+    `our_instances` itself precisely so cross-broker destruction stays
+    impossible on the *broker's* path. Keep it that way: label scoping is a
+    property of automatic teardown, never of the emergency stop.
     """
     keep_set = set(keep)
     killed = []
-    for inst in our_instances(client):
+    for inst in (our_instances(client) if labelled_only else all_instances(client)):
         if inst.id in keep_set:
             continue
         if destroy(client, inst.id):
@@ -1091,28 +1271,104 @@ def cmd_offers(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    """Everything this ACCOUNT is paying for, in one screen.
+
+    Not "every instance we own" — that was the old help text and the old bug.
+    An operator running `status` is asking "what is billing"; a per-label answer
+    to that question is worse than no answer, because it looks like one. On
+    2026-08-08 it read "no broker instances" over nine live 5090s.
+
+    The broker column comes from `/proc`, not from a state file: an instance
+    whose broker process is gone is an ORPHAN, it is pure waste at ~$0.45/hr
+    with nothing left that can dispatch work to it, and it is called out in
+    capitals because that is the case worth acting on.
+    """
     client = _client()
     user = client.show_user()
     credit = float(user.get("credit") or 0) + float(user.get("balance") or 0)
     print(f"credit ${credit:.2f}   autobill={user.get('autobill_threshold')}")
 
-    instances = our_instances(client)
+    instances = all_instances(client)
     if not instances:
-        print("no broker instances")
+        print("no instances on this account (checked the vast.ai API, "
+              "not a local state file)")
         return 0
+
+    brokers = live_broker_labels()
+    # Wide enough for "ladderbroker pid 1234567" uncut. A truncated pid is not a
+    # pid — the operator's next command is `kill -0 <that>` and a clipped digit
+    # points at somebody else's process.
+    print(f"{'id':<11}{'state':<9}{'gpu':<20}{'$/hr':<8}{'up':<9}"
+          f"{'broker':<28}{'endpoint':<24}label")
+    print("-" * 128)
+    orphans: list[Instance] = []
+    total = 0.0
     for inst in instances:
+        total += inst.dph
         endpoint = inst.ssh
         where = f"{endpoint[0]}:{endpoint[1]}" if endpoint else "-"
-        print(
-            f"{inst.id:<11}{inst.classify():<10}${inst.dph:<7.3f}"
-            f"{inst.uptime_hours:>6.2f}h  {where:<24}{inst.label}"
-        )
+        gpu = str(inst.raw.get("gpu_name") or "?")
+        n = int(inst.raw.get("num_gpus") or 1)
+        if n != 1:
+            gpu = f"{n}x {gpu}"
+        frac = inst.gpu_frac
+        if frac is not None and frac < 0.99:
+            gpu += f" ({frac:.3g} SHARED)"
+        owner = broker_for(inst, brokers)
+        if owner:
+            pids = ",".join(str(p) for p in brokers[owner])
+            attached = f"{owner} pid {pids}"
+        else:
+            attached = "*** NO BROKER ***"
+            orphans.append(inst)
+        print(f"{inst.id:<11}{inst.classify():<9}{gpu[:19]:<20}{inst.dph:<8.4f}"
+              f"{inst.uptime_hours:>6.2f}h  {attached:<28}{where:<24}{inst.label}")
+
+    print("-" * 128)
+    print(f"{len(instances)} instance(s)   ${total:.4f}/hr   ${total * 24:.2f}/day"
+          + (f"   credit ${credit:.2f} = {credit / total:.1f}h of runway"
+             if total > 0 else ""))
+
+    if orphans:
+        cost = sum(i.dph for i in orphans)
+        print(f"\n*** {len(orphans)} ORPHAN(S): RENTED, BILLING, NO BROKER "
+              f"ATTACHED — ${cost:.4f}/hr, ${cost * 24:.2f}/day OF PURE WASTE ***")
+        for inst in orphans:
+            print(f"      {inst.id}  {inst.label}  ${inst.dph:.4f}/hr  "
+                  f"{inst.uptime_hours:.2f}h old")
+        print("    Nothing can dispatch work to these. Destroy them by id:")
+        print("      " + "; ".join(
+            f".venv/bin/python vastctl/vastctl.py destroy {i.id}" for i in orphans))
+
+    idle = sorted(set(brokers) - {broker_for(i, brokers) for i in instances})
+    if idle:
+        print(f"\n{len(idle)} broker(s) running with no rented card (costing "
+              f"nothing, but rendering nothing): " + ", ".join(
+                  f"{lbl} pid {','.join(str(p) for p in brokers[lbl])}"
+                  for lbl in idle))
     return 0
 
 
 def cmd_reap(args: argparse.Namespace) -> int:
-    killed = reap(_client())
+    client = _client()
+    doomed = our_instances(client) if args.only_label else all_instances(client)
+    if not doomed:
+        print("nothing to reap")
+        return 0
+    # Name the list BEFORE destroying it. A teardown that prints only its result
+    # cannot be audited afterwards, and the ids are the one thing that survives
+    # into a console check if a destroy is not confirmed.
+    cost = sum(i.dph for i in doomed)
+    print(f"destroying {len(doomed)} instance(s), ${cost:.4f}/hr:")
+    for inst in doomed:
+        print(f"    {inst.id}  {inst.classify():<9}${inst.dph:.4f}/hr  {inst.label}")
+    killed = reap(client, labelled_only=args.only_label)
     print(f"destroyed {len(killed)}: {killed}" if killed else "nothing to reap")
+    missed = [i.id for i in doomed if i.id not in set(killed)]
+    if missed:
+        print(f"NOT CONFIRMED GONE — CHECK https://cloud.vast.ai/instances/ "
+              f"BY HAND: {missed}")
+        return 1
     return 0
 
 
@@ -1132,10 +1388,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     o.add_argument("--limit", type=int, default=10)
     o.set_defaults(func=cmd_offers)
 
-    s = sub.add_parser("status", help="credit and every instance we own")
+    s = sub.add_parser("status", help="credit and EVERY instance on the account")
     s.set_defaults(func=cmd_status)
 
-    r = sub.add_parser("reap", help="destroy all broker instances (panic button)")
+    r = sub.add_parser("reap", help="destroy every instance on the account "
+                                    "(panic button)")
+    # Deliberately not the default and deliberately awkward to type. The panic
+    # button's job is to leave nothing billing; a scoped reap that reports
+    # success while eight cards keep running is the defect this flag documents.
+    r.add_argument("--only-label", action="store_true",
+                   help=f"restrict to labels starting with {LABEL_PREFIX!r} "
+                        f"(the old default; this is how the emergency stop "
+                        f"came to destroy nothing)")
     r.set_defaults(func=cmd_reap)
 
     d = sub.add_parser("destroy", help="destroy one instance, verified")
