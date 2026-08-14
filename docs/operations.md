@@ -310,10 +310,18 @@ against a young container legitimately looks like both symptoms. Any round that
 delivers new bytes resets the counter, so a slow-but-progressing link keeps its
 full `MAX_TRANSPORT_ROUNDS` budget.
 
-The blacklists are **persisted** (`state/bad_hosts.json`, 24 h TTL). They used
-to live only in memory, so the one event guaranteed to clear them was a broker
-restart — which is exactly what an operator does when the broker is wedged on a
-bad host.
+The blacklists are **persisted and fleet-wide** (`farm/bad_hosts.json`, 7 d
+TTL, one file for every broker). They used to live only in memory, so the one
+event guaranteed to clear them was a broker restart — which is exactly what an
+operator does when the broker is wedged on a bad host. Then they were per-broker
+with a 24 h TTL, which cost a job: see `docs/incidents.md` #169. Two numbers set
+that TTL — the fleet retires an instance every 12 h, so the question is re-asked
+that often, and the longest measured lifetime of a host defect was 61 h 19 m.
+
+It is a plain JSON file, so it is also how you condemn a host by hand: add
+`"<machine id>": <unix time>` under `machines` and every broker skips it at its
+next rent. Delete an entry to un-condemn one. Brokers merge under a lock, so
+editing it while they run is safe.
 
 ### What the far end's sshd is actually configured to do
 
@@ -966,10 +974,10 @@ the full production filter:
 | shared (no `gpu_frac` term) | 19 | 19 |
 | **exclusive (`gpu_frac>=0.99`)** | **8** | **8** |
 
-Eight machines is thin, `bad_machines` persists for 24 h, and a hard filter that
-matches nothing does not degrade — it **raises**, stranding every queued job.
-That is the failure `_rent` already refuses to walk into when it clears its own
-blacklist rather than deadlock. So the fallback exists, and **the fallback is
+Eight machines is thin, `bad_machines` persists for 7 d across the whole fleet,
+and a hard filter that matches nothing does not degrade — it **raises**,
+stranding every queued job. That is the failure `_rent` already refuses to walk
+into when it ignores the blacklist for one attempt rather than deadlock. So the fallback exists, and **the fallback is
 loud**: it prints a block-capital warning naming the offer, its `gpu_frac`, and
 the instruction to check `nvidia-smi` for a second compute process before
 re-diagnosing black frames as a scene fault. Co-tenancy was never dangerous
@@ -1542,6 +1550,65 @@ cgroup, which is the only honest source inside a container:
     /sys/fs/cgroup/cpu.max      2304000 100000   ->  23.04 CPUs   (plan assumed 32)
     /sys/fs/cgroup/memory.max   97169440768      ->  90.5 GiB     (plan assumed 515 GB)
     nproc / MemTotal / loadavg  96 / 188 GB / 99.5   — all the HOST's, all wrong here
+
+### THE RE-RUN, 2026-08-14: 3.65x ON A BOX THAT MEETS THE SPEC. THE REJECT FALLS.
+
+The measurement above was taken on 23.04 cgroup CPUs against a plan that assumed
+32, and it is listed under "the rented hardware is not what the plan sized
+against" by its own author. Re-run on a box that clears the plan's floor:
+
+| run | box | cgroup CPU | RAM | slots | units | wall | items/h |
+|---|---|---:|---:|---:|---:|---:|---:|
+| local | i7-7700K | 6 | 11 GB | 4 | 46/48 | 2182 s | **75.9** |
+| remote | Threadripper 3960X, whole machine | **46.08** | 241 GiB | 12 | 46/48 | 598 s | **276.9** |
+
+    276.9 / 75.9 = 3.65x        against the same day's local run
+    276.9 / 95.3 = 2.91x        against the recorded A52 above
+                                bar = 2.00x — CLEARED EITHER WAY
+
+**Conditions, because a ratio without them is what produced the first answer.**
+
+* **Same unit both sides**: `f1-round2/tools/ab_exec_unit.py` — import the item
+  module, run its `test_scene()`, save the `.blend` — under the same Blender
+  5.2.0 build. The blend is never fetched; it is not an exec output.
+* **24 item modules x 2 = 48 units**, not the original 26. Three of the 26 no
+  longer build under Blender 5.2 at all (`tree_oak`, `tree_scots_pine`,
+  `tree_italian_cypress`, all `ValueError` in `itemkit.pin`) — verified to fail
+  **identically on the local box**, so this is a module defect and not a
+  property of either side. The first two were dropped from the set; the third
+  was found mid-run and its 2 units failed on both sides and are excluded from
+  both numerators. **46/48 completed on each side.**
+* **The instance was rented by the broker's own `_rent`** at `VASTRENDER_MIN_CPU=48`,
+  the cheapest offer that clears it: `$0.508/hr, gpu_frac 1.0, 48 threads`.
+  cgroup verified on the box, not read off the offer: `cpu.max 4608000 100000`
+  -> 46.08 CPUs, `memory.max` 259.3 GB. **Exactly 2x the CPU of the box the
+  reject was measured on.**
+* **Total cost $0.24** — 24 min of instance life, credit $45.47 -> $45.23,
+  teardown confirmed against the vast.ai API (0 instances) rather than a state
+  file.
+
+**The local baseline was re-measured rather than reused, and it moved.** 75.9
+items/h today against the recorded 95.3, entirely explained by the item mix:
+mean unit 154.8 s here vs 146 s for A52, and a tail — `pont_deck_slab` alone
+took 1235 s and 909 s of a 2182 s run, so the last 320 s ran on one slot.
+Local occupancy was 82 %, and the run blocked on the memory floor for 2 s in
+total, so the 4-way local figure is a saturated one and not a memory artefact.
+
+**Two of the three findings the first A/B reported are now the other way round.**
+
+* *"The rented EPYC is ~1.5x slower per core"* — measured 1.97x slower on
+  `kerb_precast_unit` then. That same module today: **38.5 s remote against
+  47.0 s local**, both single-unit. Per-unit at each side's own concurrency,
+  the remote mean is **77.3 s against 154.8 s local**.
+* *"The remote box does not scale with slots ... throughput plateaus near 160
+  items/hour whatever the slot count."* That plateau was the 23-CPU cgroup. At
+  46 CPUs, 12 slots alone doubles it. **Slot occupancy on the remote run was
+  only 50 %** — the batch is bounded by its longest unit (446 s) and not by the
+  slots, so 276.9 items/h understates what the box will do on a better-packed
+  queue, and raising the slot count is not what would improve it.
+
+The third finding stands and is now the main one: **the local box is the
+denominator**, and it is a 6-thread machine with 11 GB.
 
 #### What would change the answer
 

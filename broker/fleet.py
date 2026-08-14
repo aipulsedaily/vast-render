@@ -26,8 +26,10 @@ broker got them wrong on a live batch:
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import logging
+import os
 import shlex
 import subprocess
 import threading
@@ -58,7 +60,9 @@ RESUME_ATTEMPTS = 2
 #
 # Not forever: a host's link is a property of the host *today*. Banning machine
 # 55313 for all time would slowly eat the market, and the reason it reset every
-# connection this morning may be a switch someone fixes this afternoon.
+# connection this morning may be a switch someone fixes this afternoon. A
+# permanent ban also condemns the cheap end of the market first, because that is
+# where the flaky hosts are and where every re-rent starts looking.
 #
 # Not per-session either, which is what it used to be, and the reason this
 # constant exists. The blacklists lived only in Fleet's memory, so the one event
@@ -66,16 +70,96 @@ RESUME_ATTEMPTS = 2
 # exactly what an operator does when the broker is wedged on a bad host. The
 # very first thing the fresh process then did was search the market, find the
 # same cheapest offer that had just burned forty minutes, and rent it back.
-BAD_HOST_TTL_SEC = float(getattr(config, "BAD_HOST_TTL_SEC", 24 * 3600))
+#
+# AND NOT 24 h, WHICH IS WHAT IT WAS, because that is shorter than the defects
+# it records. `MAX_INSTANCE_HOURS` retires a box every 12 h, so the question
+# "is this host still bad?" is asked every 12 h, and the measured lifetimes of
+# the `authorized_keys` failure — the only host defect this render ever
+# condemned anything for — were:
+#
+#     machine 8512     condemned 2026-08-09 16:37, still broken 2026-08-12 05:56   61 h 19 m
+#     machine 142281   condemned 2026-08-10 05:00, still broken 2026-08-11 05:06   24 h 06 m
+#
+# NOT ONE CONDEMNED HOST IN THE 82-HOUR RENDER WAS EVER OBSERVED TO RECOVER, so
+# every expiry the old TTL granted was spent re-learning something still true.
+# Seven days is ~2.7x the longest defect actually measured and 14 retirement
+# periods, which is the property that matters: a verdict must outlive the cycle
+# that would otherwise re-test it. It is still finite, so a repaired host comes
+# back on its own.
+BAD_HOST_TTL_SEC = float(config.BAD_HOST_TTL_SEC)
 
-# Where that survives. One small JSON file next to the DB rather than a `meta`
-# row, because Fleet holds no db handle and threading one in for this would
-# widen its constructor for every caller and every test stub.
-BAD_HOSTS_PATH = config.DB_PATH.parent / "bad_hosts.json"
+# Where that survives — AND WHO CAN SEE IT.
+#
+# ONE FILE FOR THE WHOLE FLEET, not one per broker. This used to be
+# `config.DB_PATH.parent / "bad_hosts.json"`, and every broker has its own state
+# directory by construction (`farm/brokers.py` gives broker n `staten`), so the
+# blacklist was per-broker for the same reason the job queue is. On 2026-08-12
+# fleet05 condemned machine 58073 at 18:22:57 for failing ssh key injection and
+# fleet04 rented offer 38769886 on that same machine at 18:34:32 — thirteen
+# minutes later, far inside any TTL. The verdict had not expired; it was simply
+# written somewhere fleet04 never looked. That pass rendered zero frames, and a
+# zero-progress pass spends a retry attempt: it was the third, and job
+# 467247848cc6 FAILED with ~101 frames of a 2,978-frame master unrendered.
+#
+# `farm/` rather than any `state*/` because `farm/` is the one directory in this
+# tree that already belongs to the fleet rather than to a broker (`brokers.py`,
+# `hostrates.json`). A plain JSON file is also the seeding CLI this never had:
+# an operator who knows a host is bad can add it with a text editor, which is
+# what the earlier write-up said there was no route to do.
+BAD_HOSTS_PATH = config.BAD_HOSTS_PATH
+
+
+@contextlib.contextmanager
+def _bad_hosts_lock(path: Path):
+    """Exclusive across processes for one read-modify-write of the ban file.
+
+    The store is now shared, so `_save`'s read-modify-write is a race between
+    brokers rather than a private operation: two brokers condemning different
+    hosts in the same second both read the old file and the second write drops
+    the first broker's verdict. That is the failure this whole change exists to
+    prevent, arriving by a different route.
+
+    `flock` on a sidecar, not on the file itself, because `_save` publishes by
+    atomic rename — a lock held on the data file is a lock on an inode that the
+    rename replaces, so the next writer locks a different object and both
+    proceed. The sidecar's inode is stable.
+
+    Blocking, unlike `SingleInstanceLock`: the critical section is two small
+    file operations, there is nothing useful to do instead of waiting, and the
+    kernel releases the lock however the holder dies.
+    """
+    lock = path.with_name(path.name + ".lock")
+    fd = None
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except Exception as exc:
+        # An unwritable lock directory must not stop a broker holding a rented
+        # GPU. Degrade to unlocked access — which is what this code did for its
+        # whole life until now — rather than raise out of a condemnation.
+        #
+        # ACQUISITION IS OUTSIDE THE `try` THAT WRAPS THE YIELD, and that is not
+        # style. A single try/except around both means an exception raised by
+        # the *body* re-enters this handler and hits a second `yield`, which
+        # contextlib turns into "generator didn't stop after throw()" — the
+        # caller's real error replaced by a confusing one from the lock.
+        log.warning("could not lock %s (%s) — proceeding unlocked",
+                    lock, remote.diagnose(exc))
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 class CondemnedIds(set):
-    """A set of offer/machine ids that writes itself to disk when it changes.
+    """A set of offer/machine ids shared by every broker, through one JSON file.
 
     Subclassing `set` rather than adding save calls at each site is deliberate:
     the ids are condemned from seven different places in this file, and a fix
@@ -84,8 +168,18 @@ class CondemnedIds(set):
     the container, so it cannot be forgotten.
 
     Entries carry the time they were condemned and expire after
-    `BAD_HOST_TTL_SEC`; expiry is applied at load, so a long-lived broker keeps
-    its bans for its whole life and a fresh one starts from what is still recent.
+    `BAD_HOST_TTL_SEC`.
+
+    THREE PROPERTIES, AND THE THIRD IS THE ONE THAT WAS MISSING:
+
+    * every write MERGES with what is on disk before writing, under a
+      cross-process lock, so one broker's condemnation never erases another's;
+    * every write PUBLISHES immediately, so a sibling can see it seconds later;
+    * `refresh()` RE-READS before the list is used. A shared file nobody re-reads
+      is still a private file: fleet04 had been running for hours when fleet05
+      condemned machine 58073, so a load that happens only at construction would
+      have missed the verdict by exactly as much as a separate file did. That is
+      why `_rent` calls it rather than trusting the copy in memory.
 
     Persistence failures are logged and swallowed. Losing the ban list degrades
     the broker to the old per-session behaviour, which is bad; taking the broker
@@ -98,7 +192,7 @@ class CondemnedIds(set):
         self.kind = kind
         self.path = path
         self.stamps: dict[int, float] = {}
-        self._load()
+        self._load(announce=True)
 
     # --- persistence ---
     def _read_all(self) -> dict:
@@ -113,32 +207,71 @@ class CondemnedIds(set):
                         "hosts", self.path, remote.diagnose(exc))
             return {}
 
-    def _load(self) -> None:
+    def _stamps_on_disk(self) -> dict[int, float]:
         entries = self._read_all().get(self.kind) or {}
         if not isinstance(entries, dict):
-            return
-        now = time.time()
+            return {}
+        out: dict[int, float] = {}
         for key, when in entries.items():
             try:
-                ident, stamp = int(key), float(when)
+                out[int(key)] = float(when)
             except (TypeError, ValueError):
                 continue
-            if now - stamp < BAD_HOST_TTL_SEC:
-                super().add(ident)
-                self.stamps[ident] = stamp
-        if self:
+        return out
+
+    def _load(self, announce: bool = False) -> set[int]:
+        """Merge the file into this set, dropping anything past its TTL.
+
+        Returns the ids that were NOT already held, so a caller can say what it
+        learned from a sibling rather than logging the whole list every time.
+        """
+        now = time.time()
+        merged = dict(self.stamps)
+        merged.update(self._stamps_on_disk())
+        fresh = {i: s for i, s in merged.items() if now - s < BAD_HOST_TTL_SEC}
+        learned = set(fresh) - set(self)
+        # Expiry applies to what is already in memory too. A broker can now run
+        # for days, and a TTL only the load path enforces is a TTL that a
+        # long-lived process never applies to anything it condemned itself.
+        super().clear()
+        super().update(fresh)
+        self.stamps = fresh
+        if announce and self:
             log.info("%s condemned earlier and still within the %.0f h ban: %s",
                      self.kind, BAD_HOST_TTL_SEC / 3600,
                      ", ".join(str(i) for i in sorted(self)))
+        return learned
+
+    def refresh(self) -> set[int]:
+        """Pick up sibling brokers' verdicts. Called before the list is USED."""
+        learned = self._load()
+        if learned:
+            log.info("%s condemned by ANOTHER broker since we last looked: %s "
+                     "— skipping them without paying to rediscover why",
+                     self.kind, ", ".join(str(i) for i in sorted(learned)))
+        return learned
 
     def _save(self) -> None:
+        """Publish, merging with whatever other brokers have written."""
         try:
-            data = self._read_all()
-            data[self.kind] = {str(i): self.stamps.get(i, time.time()) for i in self}
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-            tmp.replace(self.path)          # atomic; a torn ban list is unreadable
+            with _bad_hosts_lock(self.path):
+                self._load()                 # re-read INSIDE the lock, then merge
+                data = self._read_all()
+                data[self.kind] = {str(i): self.stamps.get(i, time.time())
+                                   for i in self}
+                # PID in the temp name: the old one was `bad_hosts.json.tmp`
+                # for every writer, and once the file was shared that meant two
+                # brokers writing the same scratch path — one `replace()` moves
+                # the other's file out from under it and the loser's write dies
+                # with FileNotFoundError, logged as a warning and otherwise
+                # invisible. Measured 18 of 120 condemnations lost that way in a
+                # two-process run of the pre-fix code. The lock alone would fix
+                # it; this makes the fix true even on the degraded path where
+                # the lock could not be taken.
+                tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+                tmp.replace(self.path)       # atomic; a torn ban list is unreadable
         except Exception as exc:
             log.warning("could not persist condemned %s to %s: %s",
                         self.kind, self.path, remote.diagnose(exc))
@@ -151,6 +284,24 @@ class CondemnedIds(set):
         self.stamps[ident] = time.time()
         self._save()
 
+    def update(self, *others) -> None:                # type: ignore[override]
+        """Routed through `add`, because `set.update` is not.
+
+        `set.__ior__`/`update` are implemented in C and do not call an
+        overridden `add`, so `bad_offers |= restored` used to put ids into the
+        set with no stamp and no write — invisible to every other broker, and
+        re-stamped with *now* by the next unrelated save, which silently
+        restarted their TTL. The only caller that did this is gone; this makes
+        it impossible for the next one to reintroduce it.
+        """
+        for other in others:
+            for ident in list(other):
+                self.add(ident)
+
+    def __ior__(self, other):                         # type: ignore[override]
+        self.update(other)
+        return self
+
     def discard(self, ident) -> None:                # type: ignore[override]
         if ident not in self:
             return
@@ -159,11 +310,21 @@ class CondemnedIds(set):
         self._save()
 
     def clear(self) -> None:                         # type: ignore[override]
+        """Forgets locally. DOES NOT delete the fleet's verdicts.
+
+        The store is shared now, so the old behaviour — write an empty list —
+        means one broker whose market has momentarily run dry deletes every
+        other broker's hard-won evidence, including verdicts about hosts they
+        are not renting from and cannot re-learn without paying for them again.
+        `_rent`'s market-dry path therefore no longer clears at all; it ignores
+        the list for one attempt, which is all it ever needed. This stays
+        memory-only so that a future caller cannot resurrect the wipe by
+        accident, and `refresh()` will restore the entries on the next rent.
+        """
         if not self:
             return
         super().clear()
         self.stamps.clear()
-        self._save()
 
 
 # Printed by `heal_scene_dir_cmd` only when it actually found something wrong,
@@ -351,7 +512,7 @@ class Fleet:
         # inside the same recovery costs another full readiness budget for the
         # same answer. Deliberately a plain set, not CondemnedIds — this must
         # never reach bad_hosts.json, because persisting it would turn a
-        # control-plane blip into the 24 h ban that a control-plane blip must
+        # control-plane blip into the multi-day ban that a control-plane blip must
         # never earn. Dies with the process; cleared when offers run out.
         self.stalled_machines: set[int] = set()
         # Consecutive failed deploy rounds against the *current* instance. A
@@ -721,7 +882,7 @@ class Fleet:
         log.error("instance %s destroyed for an unusable DOWNLOAD path: %s. "
                   "It passed every other health check; none of them can see "
                   "slow, only failed.", self.instance_id, why)
-        self.teardown("download too slow")
+        self.teardown("download too slow", expect=self.instance_id)
 
     def reload_cost_sec(self, scene: Optional[Path] = None) -> float:
         """Seconds to make `scene` (default: the loaded one) live again.
@@ -1324,6 +1485,15 @@ class Fleet:
             # more times, and then start reasoning about whether the GPU is
             # broken. The disk is full; say so once.
             raise
+        except remote.SceneStagingMismatch:
+            # Also not a switch failure, and for the same shape of reason.
+            # `return False` here means "try a full deploy instead", and a full
+            # deploy re-pushes this scene — so a writer/reader disagreement
+            # would buy one push on the switch and DEPLOY_ATTEMPTS more on the
+            # redeploy, which is the multi-push loop this exception exists to
+            # end. The bytes landed; nobody can find them; more bytes will not
+            # help.
+            raise
         except Exception as exc:
             # Counted even though it failed. The GPU was rented for every one
             # of those seconds and rendered nothing in them; a load-vs-render
@@ -1372,6 +1542,21 @@ class Fleet:
                 # another one with an identically sized volume. Straight up to the
                 # dispatcher, which fails the job with the numbers in the message.
                 raise
+            except remote.SceneStagingMismatch as exc:
+                # DO NOT PUSH IT AGAIN. The bytes landed and the broker then
+                # could not find what it had just written, which is a
+                # disagreement between this codebase's writer and its reader.
+                # Two more attempts push the same multi-gigabyte scene up the
+                # same wire to produce the same disagreement — that is precisely
+                # the cost this exception was invented to stop, measured at
+                # three 8 GB pushes and 5.5 minutes on exec job dea2b1d24914.
+                #
+                # Recorded and broken out of, so the classification below sees
+                # it and keeps the instance: no GPU is at fault here.
+                errors.append(exc)
+                log.error("instance %s: %s — NOT retrying the push",
+                          self.instance_id, remote.diagnose(exc))
+                break
             except remote.SshNeverReady as exc:
                 # No point doing this two more times. `wait_ssh` has already
                 # spent four minutes patiently retrying the cheapest possible
@@ -1438,10 +1623,34 @@ class Fleet:
             return (isinstance(e, remote.WorkerUnreachable)
                     and not e.tunnel_died and not e.local)
 
+        # A path disagreement inside this broker. Sibling of `scene_fault` and
+        # for the identical reason: new hardware cannot fix it, and reaching for
+        # new hardware costs a rental, a 481 MB Blender push and the whole scene
+        # push again to reproduce it exactly. `_deploy` calls anything it cannot
+        # name "host-level failure", and this project has already destroyed one
+        # healthy instance (46668588, reachable, idle, 7 h uptime, 5.46 GB of
+        # warm cache) over a broker-side path fault that read that way.
+        def is_broker_fault(e: Exception) -> bool:
+            return isinstance(e, remote.SceneStagingMismatch)
+
         auth_failed = any(is_auth(e) for e in errors)
         local_fault = any(is_local_fault(e) for e in errors)
+        broker_fault = any(is_broker_fault(e) for e in errors)
         scene_fault = errors and all(is_scene_fault(e) for e in errors)
         transport_only = all(is_transport(e) for e in errors)
+
+        if broker_fault:
+            log.error(
+                "instance %s staged a scene, reported it complete, and then read "
+                "it back as NOT staged. That is this broker disagreeing with "
+                "itself about where a cache entry lives — it is not the GPU, not "
+                "the host and not the wire, and it will reproduce identically on "
+                "a fresh instance. KEEPING the GPU and failing the deploy; go and "
+                "look at the scene directory on the box. %s",
+                self.instance_id, remote.diagnose(errors[-1]),
+            )
+            self.status = "deploy-retry"
+            return False
 
         if scene_fault:
             log.error(
@@ -1680,7 +1889,8 @@ class Fleet:
 
     # --- hibernate -------------------------------------------------------
 
-    def hibernate(self, force: bool = False) -> None:
+    def hibernate(self, force: bool = False,
+                  expect: Optional[int] = None) -> None:
         """Stop the container: GPU billing ends, the disk survives.
 
         Never a substitute for teardown — a stopped instance still bills
@@ -1696,6 +1906,18 @@ class Fleet:
         """
         with self.lock:
             if not self.instance_id or self.stopped_at:
+                return
+            # `expect` for the same reason `teardown` has it: this lock is held
+            # across resumes and deploys, so "the queue has been idle for 300 s"
+            # can be a statement about a box that was replaced while this call
+            # waited. Stopping is recoverable where destroying is not, but
+            # stopping a freshly deployed instance still throws away the deploy
+            # the replacement just paid for.
+            if expect is not None and self.instance_id != expect:
+                log.warning(
+                    "stop of instance %s SKIPPED — while this call waited for "
+                    "the fleet lock the instance became %s, which has not been "
+                    "idle for anything.", expect, self.instance_id)
                 return
             if not force:
                 act = self.activity()
@@ -2067,9 +2289,9 @@ class Fleet:
         Retrying the *same* offer is close to useless and not free: the broker
         destroyed an instance that never became reachable, searched again, was
         handed the same cheapest offer, and rented it a second time five minutes
-        later. Offers that fail are remembered for the session, and a host that
-        failed for host-level reasons is remembered by machine id too, since one
-        machine backs many offers.
+        later. Offers that fail are remembered — by every broker, not just this
+        one — and a host that failed for host-level reasons is remembered by
+        machine id too, since one machine backs many offers.
         """
         self.status = "renting"
         credit = vastctl.guard_credit(self.client)
@@ -2081,6 +2303,15 @@ class Fleet:
                 f"no RTX 5090 offers matched: {vastctl.build_query(disk_gb=config.DISK_GB)}"
             )
 
+        # THE ONE PLACE THE BLACKLIST IS READ, so it is the one place that has
+        # to be current. A broker loads the file when it starts and then runs
+        # for days; fleet04 had been up for hours when fleet05 condemned machine
+        # 58073, and bought it thirteen minutes later. Sharing the file is only
+        # half the fix — somebody has to look at it again.
+        for store in (self.bad_offers, self.bad_machines):
+            if isinstance(store, CondemnedIds):
+                store.refresh()
+
         fresh = [
             o for o in offers
             if int(o.get("id") or 0) not in self.bad_offers
@@ -2088,17 +2319,24 @@ class Fleet:
             and int(o.get("machine_id") or 0) not in self.stalled_machines
         ]
         if not fresh:
-            # Everything on the market has already failed for us this session.
-            # Better to try the cheapest again than to stop renting entirely.
-            # `stalled_machines` clears here too: skipping a host is only ever
-            # a preference, so when it is the difference between renting and
-            # not renting, it loses. This is also what makes a genuine
-            # control-plane outage — which stalls every host we try — recover
-            # instead of deadlocking on an empty candidate list.
-            log.warning("all %d matching offers failed earlier this session — "
-                        "clearing the blacklist and retrying", len(offers))
-            self.bad_offers.clear()
-            self.bad_machines.clear()
+            # Everything on the market has already failed for somebody. Better
+            # to try the cheapest again than to stop renting entirely. This is
+            # also what makes a genuine control-plane outage — which stalls
+            # every host we try — recover instead of deadlocking on an empty
+            # candidate list.
+            #
+            # IGNORED FOR THIS ATTEMPT, NOT DELETED, and that distinction became
+            # load-bearing when the store went fleet-wide: `bad_offers.clear()`
+            # used to write an empty ban list, so one broker with a momentarily
+            # thin market erased what every other broker had paid to learn —
+            # including verdicts about hosts it was not even considering.
+            # Ignoring the list here has always been the whole intent; deleting
+            # it was how that intent was expressed while the list was private.
+            # `stalled_machines` is genuinely this process's own preference and
+            # is still cleared.
+            log.warning("all %d matching offers are condemned or stalled — "
+                        "ignoring the blacklist for this attempt (the verdicts "
+                        "stay on file for the rest of the fleet)", len(offers))
             self.stalled_machines.clear()
             fresh = offers
 
@@ -2179,7 +2417,7 @@ class Fleet:
                 # this exists for: a host that stopped progressing because it
                 # could not resolve a vast.ai name. That is a control-plane
                 # failure, it is true of every host during a zone outage, and
-                # it must not cost hardware a 24 h ban.
+                # it must not cost hardware a seven-day ban.
                 host_at_fault = getattr(exc, "host_at_fault", not provisioning)
                 log.error(
                     "instance %s (offer %s, machine %s) never became reachable — "
@@ -2213,7 +2451,7 @@ class Fleet:
                     # same box back, and each proof costs a full readiness budget.
                     #
                     # `bad_machines` is the wrong home for that: it persists to
-                    # bad_hosts.json with a 24 h TTL, which is precisely the ban
+                    # the FLEET'S bad_hosts.json with a seven-day TTL, which is precisely the ban
                     # a control-plane fault must not earn. So avoidance gets its
                     # own set — in memory, this process only, never written to
                     # disk, cleared the moment the market runs dry. The hardware
@@ -2222,7 +2460,7 @@ class Fleet:
                     self.stalled_machines.add(machine_id)
                     log.warning(
                         "machine %s NOT blacklisted despite failing to come up (%s) "
-                        "— the hardware is not blamed and earns no 24 h ban. But it "
+                        "— the hardware is not blamed and earns no seven-day ban. But it "
                         "just burned the whole %.0fs readiness budget, and one "
                         "machine backs many offers, so condemning the offer alone "
                         "would let us re-rent the same box minutes later (it did, "
@@ -2398,7 +2636,6 @@ class Fleet:
                 scenes.label(scene), digest, ep,
                 "\n".join(line for line in healed.splitlines()
                           if line.strip() and line.strip() != STRAY_MARK))
-        self.status = "uploading-scene"
         log.info("pushing scene %s (%.0f MB) hash=%s", scenes.label(scene), size / 1e6, digest)
         # The digest is carried alongside the label so ANOTHER dispatcher can
         # recognise this push as the one it was about to start. See
@@ -2407,43 +2644,33 @@ class Fleet:
         # which is the exact confusion `scene_hash` exists to prevent.
         self.transfer = {"what": scenes.label(scene), "bytes": size,
                          "began": time.time(), "digest": digest}
+        # THE SAME WRITER THE EXEC PATH USES, and that is the fix rather than an
+        # incidental tidy-up. What used to be here was the correct sequence —
+        # `.part`, size check, rename, siblings, marker last — and the exec path
+        # had a shorter, wrong copy of it. Two implementations of "make a cache
+        # entry" is how the marker came to be written by one of them and read by
+        # both. There is one now; the preflight and the eviction policy above
+        # stay here, because those genuinely differ between the two job types.
+        #
+        # Physics caches go up AFTER the blend and BEFORE any worker starts, so
+        # a worker never opens a scene whose caches are still in flight — an
+        # unfinished cache tree reads as an absent one, and an absent one makes
+        # Blender simulate. `stage_scene_tree` owns that ordering now.
+        siblings = scenes.sibling_dirs_for(scene)
         try:
-            elapsed = remote.push_scene(ep, scene, remote_path=final + ".part")
+            elapsed, files, cache_bytes = remote.stage_scene_tree(
+                ep, scene, digest, siblings,
+                on_phase=lambda phase: setattr(self, "status", phase))
         finally:
             # Cleared on the failure path too, or a push that raised would
             # leave `rq status` reporting a transfer that ended minutes ago.
             self.transfer = None
-        landed = remote.probe(ep, f"stat -c %s {shlex.quote(final + '.part')}", timeout=60)
-        got = int(landed.out.split()[-1]) if landed.ok and landed.out.split() else -1
-        if got != size:
-            remote.run(ep, f"rm -f {shlex.quote(final + '.part')}", timeout=60, check=False)
-            raise remote.TransferError(
-                f"scene push of {scenes.label(scene)}", str(ep),
-                f"remote holds {got} bytes, expected {size}", elapsed,
-                sent=max(got, 0), expected=size,
-            )
-        remote.run(ep, f"mv -f {shlex.quote(final + '.part')} {shlex.quote(final)}",
-                   timeout=60)
         log.info("scene uploaded in %.1fs (%.1f MB/s raw)",
                  elapsed, size / 1e6 / max(elapsed, 0.1))
-
-        # Physics caches and anything else the .blend references relatively, in
-        # the one place Blender will look for them: beside the uploaded scene.
-        # Pushed AFTER the blend and BEFORE any worker starts, so a worker never
-        # opens a scene whose caches are still in flight — an unfinished cache
-        # tree reads as an absent one, and an absent one makes Blender simulate.
-        siblings = scenes.sibling_dirs_for(scene)
         if siblings:
-            self.status = "uploading-caches"
-            began = time.time()
-            files, cache_bytes = remote.push_scene_siblings(
-                ep, digest, scene.parent, siblings)
-            log.info("pushed %d cache/sibling file(s), %.1f MB, in %.1fs from %s",
-                     files, cache_bytes / 1e6, time.time() - began,
+            log.info("pushed %d cache/sibling file(s), %.1f MB from %s",
+                     files, cache_bytes / 1e6,
                      ", ".join(d.name for d in siblings))
-        # Last, and only now: this is what makes the cache entry mean "the whole
-        # scene is here", rather than "a .blend is here and its caches may be".
-        remote.mark_scene_complete(ep, digest)
         return final
 
     def _report_missing(self, ep, scene: Path) -> list[str]:
@@ -2703,8 +2930,54 @@ class Fleet:
                 log.warning("instance %s confirmed destroyed on retry — it had "
                             "survived an earlier destroy attempt", iid)
 
-    def teardown(self, reason: str = "idle") -> None:
+    def teardown(self, reason: str = "idle", expect: Optional[int] = None) -> None:
+        """Destroy the instance. `expect` names WHICH ONE the caller decided about.
+
+        A DECISION AND ITS EXECUTION ARE SEPARATED BY THIS LOCK, AND THE LOCK
+        CAN BE HELD FOR TEN MINUTES. `ensure_ready` holds it across a resume
+        (2 x 902 s of `wait_ready`), a teardown, a rent, and a full deploy — so
+        a caller that reads `instance_id` and `stopped_at` outside the lock,
+        decides, and then blocks here, wakes up in a world where every one of
+        those facts has changed and its decision is about an instance that no
+        longer exists.
+
+        Measured 2026-08-07, and it cost a whole deploy:
+
+            05:19:56  ensure_ready takes the lock; resume 2/2 of 47040457
+            05:30:05  maybe_idle_down reads stopped_at (set at 04:30), decides
+                      "hibernated 60 min — destroying", calls teardown, BLOCKS
+            05:34:57  resume gives up; 47040457 destroyed; 47048579 rented
+            05:38:16  47048579 deployed — Blender installed, 409 MB scene
+                      pushed, worker ready in 140.3 s. Lock released.
+            05:38:22  the call from 05:30:05 finally runs and destroys 47048579
+
+        The log line it wrote says exactly what happened if you read it:
+        `destroyed 47048579 (hibernation expired) ... hibernated 0.0 min`. A
+        hibernation deadline was applied to an instance that had never
+        hibernated, because `_teardown_locked` faithfully destroys whatever
+        `self.instance_id` happens to hold at the moment it runs.
+
+        `hibernate` has always re-checked its precondition under the lock
+        (`if not self.instance_id or self.stopped_at: return`). This is the
+        same rule for the destructive path, and it has to be keyed on the
+        instance ID rather than on a flag: "still stopped?" is a different
+        question from "still the same box?", and only the second one catches a
+        replacement that is legitimately running.
+
+        `expect=None` means "whatever is up now", which is what `rq teardown`,
+        a pause and a shutdown genuinely mean. Every caller acting on an
+        observation it made earlier must pass the ID it observed.
+        """
         with self.lock:
+            if expect is not None and self.instance_id != expect:
+                log.warning(
+                    "teardown of instance %s (%s) SKIPPED — while this call "
+                    "waited for the fleet lock the instance became %s. The "
+                    "decision was made about a box that is already gone, and "
+                    "destroying its replacement would throw away a deploy "
+                    "nobody asked to lose.",
+                    expect, reason, self.instance_id or "none")
+                return
             self._teardown_locked(reason)
 
     def _teardown_locked(self, reason: str = "idle") -> None:

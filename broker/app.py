@@ -152,9 +152,6 @@ class Broker:
         self._veto_scene: Optional[str] = None
         self._veto_since = 0.0
         self._veto_promised = 0.0
-        # Offers/machines that failed to come up, restored from the database so
-        # a restart does not walk straight back into the host that just failed.
-        self._blacklist_seen: dict = {"offers": {}, "machines": {}}
         # Frames the current dispatch pass has actually delivered. A pass that
         # got work done did not "fail" in the sense the retry budget means,
         # however it ended. See run_job.
@@ -180,7 +177,6 @@ class Broker:
                         "itself, so this is expected after every restart",
                         stale, self.fleet.local_port)
         self.reclaim_orphans()
-        self.load_blacklist()
         # Only on a genuinely fresh start. This runs again if the thread is ever
         # restarted, and re-adopting an instance this process already owns would
         # restart its spend clock and re-classify every *other* instance as a
@@ -1513,55 +1509,31 @@ class Broker:
         # `orphaned_spend` count it a second time for the rest of the run.
         self.db.set_meta("live_spend", {})
 
-    # How long a host that failed to come up stays blacklisted. Long enough to
-    # stop a restart walking straight back into it, short enough that a machine
-    # having a bad hour is not written off for the week.
-    BLACKLIST_TTL_SEC = 6 * 3600
-
-    def load_blacklist(self) -> None:
-        """Restore the failed-host blacklist across a broker restart.
-
-        `Fleet.bad_offers` and `bad_machines` were per-process, and a restart is
-        routine — it is how new code is loaded and the only supported way to
-        stop a broker. So the blacklist evaporated exactly when it was most
-        needed: on 2026-07-28 machine 91334 failed to start sshd, the broker was
-        restarted to pick up a fix, and the dispatcher immediately rented **the
-        same offer on the same machine** because it was still the cheapest. Both
-        rentals failed the same way.
-
-        Time-limited on load rather than pruned on write, so a machine that had
-        a bad hour is not written off permanently.
-        """
-        stored = self.db.get_meta("bad_hosts", {}) or {}
-        if not isinstance(stored, dict):
-            return
-        now = time.time()
-        offers = {int(k): v for k, v in (stored.get("offers") or {}).items()
-                  if now - float(v) < self.BLACKLIST_TTL_SEC}
-        machines = {int(k): v for k, v in (stored.get("machines") or {}).items()
-                    if now - float(v) < self.BLACKLIST_TTL_SEC}
-        self.fleet.bad_offers |= set(offers)
-        self.fleet.bad_machines |= set(machines)
-        self._blacklist_seen = {"offers": offers, "machines": machines}
-        if offers or machines:
-            log.info("restored blacklist from a previous run: %d offer(s), "
-                     "%d machine(s) that failed to come up in the last %.0f h",
-                     len(offers), len(machines), self.BLACKLIST_TTL_SEC / 3600)
-
-    def save_blacklist(self) -> None:
-        """Persist anything newly blacklisted, stamped with when."""
-        seen = getattr(self, "_blacklist_seen", None) or {"offers": {}, "machines": {}}
-        now = time.time()
-        changed = False
-        for key, live in (("offers", self.fleet.bad_offers),
-                          ("machines", self.fleet.bad_machines)):
-            for item in live:
-                if str(item) not in seen[key]:
-                    seen[key][str(item)] = now
-                    changed = True
-        if changed:
-            self._blacklist_seen = seen
-            self.db.set_meta("bad_hosts", seen)
+    # THE SECOND BLACKLIST USED TO LIVE HERE, and it is gone rather than fixed.
+    #
+    # `load_blacklist` / `save_blacklist` / `BLACKLIST_TTL_SEC = 6 * 3600` kept
+    # a copy of the ban list in this broker's SQLite `meta.bad_hosts`, restored
+    # at startup and written every heartbeat. `fleet.CondemnedIds` already does
+    # everything that copy existed for — it survives a restart, and it now
+    # survives the broker entirely, because it is shared with the rest of the
+    # fleet.
+    #
+    # Two reasons it had to go rather than have its constant raised:
+    #
+    #   * `meta` is per-broker, so the db copy could not be the shared one, and
+    #     two stores of the same fact drift by construction;
+    #   * `load_blacklist` merged with `bad_offers |= set(offers)`, and
+    #     `set.__ior__` is C and does not call `CondemnedIds.add` — so restored
+    #     ids entered the set with no timestamp, were never published, and were
+    #     re-stamped with `now` by the next unrelated save, silently restarting
+    #     the TTL of a host condemned hours earlier. `CondemnedIds.update` now
+    #     routes through `add` so no future caller can repeat it.
+    #
+    # The 6 h TTL that #169 was filed against was this one. It could only ever
+    # ADD ids (nothing here removed any), so the TTL that actually governed
+    # re-renting was `fleet.BAD_HOST_TTL_SEC`, 24 h at the time — still less
+    # than half the 61 h defect lifetime measured on machine 8512, which is why
+    # the fix is in that constant and not this one.
 
     def checkpoint_spend(self) -> None:
         """Persist the live instance's spend without waiting for a teardown.
@@ -1762,7 +1734,7 @@ class Broker:
             # command, rate-limited to DISK_SAMPLE_SEC, and its failure is logged
             # rather than raised — an unmeasurable disk must not stop the beat.
             for task in (self.checkpoint_spend, self.sample_credit,
-                         self.save_blacklist, self.fleet.reap_doomed,
+                         self.fleet.reap_doomed,
                          self.fleet.sample_disk):
                 try:
                     task()

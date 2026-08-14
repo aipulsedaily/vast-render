@@ -5,6 +5,178 @@ thing it first looked like. Newest first.
 
 ---
 
+## #169 — a per-broker blacklist with a 6 h TTL burned a job's last retry attempt
+
+**2026-08-12. This is the instance that moves #169 from "worth doing" to "do it
+before the next multi-day render."** The two earlier instances cost price rungs.
+This one cost a job.
+
+### What happened
+
+```
+18:22:57  fleet05  machine 58073 blacklisted for this session (ssh key injection failed)
+18:34:32  fleet04  renting offer 38769886 (machine 58073)          <- 12 minutes later
+18:39:10  fleet04  machine 58073 blacklisted for this session (ssh key injection failed)
+18:39:22  broker   job 467247848cc6 FAILED: sequence master4k stopped at frame 1766
+                   after 0 frame(s) this pass: FleetUnavailable (0/3 rounds)
+```
+
+fleet04 rented a machine its sibling had condemned **twelve minutes earlier**,
+spent ~5 minutes discovering the same `authorized_keys` failure, and ended the
+pass having rendered **zero** frames. Zero-progress passes spend a retry
+attempt; it was its third. **The job failed and the broker went idle with ~101
+frames of a 2,978-frame master unrendered.**
+
+### The two independent causes, each sufficient on its own
+
+**1. The blacklist is per-process.** `Fleet.bad_offers` / `bad_machines` live in
+one broker; nothing publishes them. Across a 7-cycle render, 4 of 10
+condemnations were one broker rediscovering another's verdict. The 12-minute gap
+above is far inside any TTL — **scoping alone caused it.**
+
+**2. `BLACKLIST_TTL_SEC = 6 * 3600` is shorter than the defect it records.**
+Measured lifetimes of `authorized_keys` failures on the same machine:
+
+| machine | first condemned | condemned again | interval |
+| --- | --- | --- | ---: |
+| 8512 | 2026-08-09 16:37 | 2026-08-12 05:56 | **61 h 19 min** |
+| 142281 | 2026-08-10 05:00 | 2026-08-11 05:02 | **24 h 02 min** |
+
+**No condemned host in this render ever recovered.** The TTL's rationale — *"a
+machine having a bad hour is not written off for the week"* — describes a
+failure mode never once observed here. The retirement period is 12 h, so **every
+verdict expires before the cycle that could use it.**
+
+### A third gap, cheaper but real
+
+A create that returns **HTTP 400** never produces an instance, so the
+"destroyed as unusable" path that blacklists an offer is never reached. Offer
+46851284 400'd for **all three brokers** across two days and stayed top of the
+cheapest-first list each time, costing a price rung per re-rent.
+**The blacklist only learns from failures that got far enough to be destroyed.**
+
+> **2026-08-14: this third gap is a NULL as written, and the evidence is in the
+> state files.** `_rent` already condemns the offer on a create failure —
+> `except Exception: self.bad_offers.add(offer_id)`, right around the
+> `vastctl.create` call — and it always has. `state3/bad_hosts.json` contains
+> exactly one entry, `{"offers": {"46851284": ...}}`, written by that path at
+> 17:17:35 on 2026-08-11. So each broker *did* record the 400 and did not buy
+> that offer again. What produced the three-brokers-two-days pattern was cause
+> **2**: fleet03 condemned it at 17:17:35, fleet05 bought it at 17:29:06 and
+> fleet04 at 17:48:18, each rediscovering a verdict that was on disk in a
+> directory it never reads. **The 400 was recorded. Nobody could see it.**
+
+### What would have prevented it
+
+A fleet-wide blacklist, persisted where all brokers can read it, with a TTL on
+the order of the observed defect lifetime (days, not hours), and an entry
+written on **any** terminal rental failure including a 400 on create.
+
+On this render that would have removed **4 repeat condemnations**, several price
+rungs, and — the reason this is filed as an incident rather than a nit — **the
+one job failure in an otherwise fully self-healing 82-hour render.**
+
+### Not fixed here
+
+Deliberately. There is no CLI to seed a blacklist (`rq` and `fleetctl` have no
+such subcommand; the state lives in the broker's SQLite `meta.bad_hosts`), and
+the only routes in are writing to a running broker's database or restarting it —
+neither acceptable under a live render. Recorded for whoever picks this up.
+
+### Fixed 2026-08-14, once the fleet was destroyed and the master delivered
+
+Three changes, and each one had to be watched failing first.
+
+**1. The TTL is seven days, and the constant that was raised is not the one
+this was filed against.** `Broker.BLACKLIST_TTL_SEC = 6 * 3600` in `app.py` was
+real, but it governed a *second* copy of the list in the broker's SQLite
+`meta.bad_hosts`, and `load_blacklist` only ever ADDED ids from it. It could not
+shorten anything. **The TTL that actually decided re-renting was
+`fleet.BAD_HOST_TTL_SEC`, 24 h**, applied to `state<n>/bad_hosts.json` — which
+is why the two re-condemnations in the table above are 24 h 06 m and 61 h 19 m
+apart rather than 6 h apart. It is now `7 * 24 * 3600`: longer than the longest
+defect ever measured here (2.7x), fourteen times the 12 h retirement period that
+re-asks the question, and still finite, so a repaired host returns on its own.
+
+That second store is **deleted**, not raised. Two stores of one fact drift, and
+this pair had already started to: `load_blacklist` merged with
+`bad_offers |= set(offers)`, and `set.__ior__` is implemented in C and does not
+call an overridden `add` — so restored ids entered the set with no timestamp,
+were never persisted by the container that owned them, and got re-stamped with
+`now` by the next unrelated save, **silently restarting the ban clock of a host
+condemned hours earlier**. `CondemnedIds.update` now routes through `add`.
+
+**2. The store is fleet-wide: `farm/bad_hosts.json`, one file, cross-process
+locked.** `farm/` because it is the only directory in this tree that belongs to
+the fleet rather than to a broker. Three properties, and the third is the one
+that is easy to miss: every write merges under an `flock` before it writes, so
+one broker's verdict never erases another's; every write publishes immediately;
+and **`refresh()` re-reads before the list is used**. A shared file nobody
+re-reads is still a private file — fleet04 had been up for hours when fleet05
+condemned machine 58073, so a load that happens only at construction misses the
+verdict by exactly as much as a separate file did. `_rent` refreshes.
+
+Two consequences fell out of sharing:
+
+* `_rent`'s market-dry path used to call `bad_offers.clear()`, which wrote an
+  empty list. Shared, that is one broker with a momentarily thin market
+  **deleting evidence every other broker paid for**. It now ignores the list for
+  that one attempt, which is all it ever meant to do; `CondemnedIds.clear()` is
+  memory-only so the wipe cannot be reintroduced by accident.
+* the file is the seeding route this write-up said did not exist. Add
+  `"<machine id>": <unix time>` under `machines` with a text editor and every
+  broker skips it at its next rent.
+
+**3. The create-failure gap was already closed.** See the note above; it is a
+null, and there is now a test so it stays closed.
+
+#### Watched failing first
+
+`broker/test_broker.py::test_a_condemnation_outlives_the_retirement_and_reaches_every_broker`,
+13 checks, run against a copy of the pre-fix tree and then against the fix:
+**7/13 before, 13/13 after.** What the six failures were:
+
+| check | pre-fix |
+| --- | --- |
+| a host still broken 61 h later is still condemned | machine 8512 gone from the list |
+| the TTL exceeds the longest measured defect | 24 h vs 61 h 19 m |
+| the TTL exceeds the retirement period that re-asks | 24 h vs 4 x 12 h |
+| the re-rent skips the machine a sibling just condemned | bought offer 38769886 |
+| two brokers condemning at once keep both verdicts | one verdict lost to the read-modify-write race |
+| the fleet's verdicts survive an empty market | file emptied by one broker's `clear()` |
+
+And separately, because a single-process test cannot show it, the incident's own
+shape was replayed with **two real processes** — a sibling broker started,
+left running, and sent shopping only after the other one condemned machine
+58073 and took a 400 on offer 46851284. Pre-fix it bought both
+(`attempted=[38769886, 46851284, 46285754]`); post-fix it bought neither
+(`attempted=[46285754]`). 1/5 → 5/5.
+
+#### One more defect, found by writing that proof
+
+Sharing the file turns `_save`'s read-modify-write into a race, so the lock went
+in on principle. Two processes condemning 60 hosts each, on the pre-fix code:
+
+    run 1  109/120 survived, 11 lost      run 2  120/120, 0 lost      run 3  117/120, 3 lost
+
+**Run 2 is the point.** The race is timing-dependent, so a fifty-fifty test
+passes half the time and the guard would have looked fine. Post-fix: 120/120,
+three runs out of three.
+
+The lost verdicts had *two* causes, and only one was the obvious one. The
+temp file was `bad_hosts.json.tmp` for every writer, so two brokers staged
+their writes through the **same scratch path** — one `replace()` moves the
+other's file out from under it and the loser's write dies with
+`FileNotFoundError`, logged as a warning and otherwise invisible. It is now
+`bad_hosts.json.<pid>.tmp`, which makes that impossible even on the degraded
+path where the lock could not be taken.
+
+The eight surviving `state<n>/bad_hosts.json` files were merged into
+`farm/bad_hosts.json` (newest stamp per id, 7 d TTL applied): 13 offers and 8
+machines carried forward, including 58073, 8512 and 46851284.
+
+---
+
 ## A recurring shape: a comment describing a path the code's own ordering makes unreachable
 
 **Not an exec bug. A class.** Logged separately because the exec instance is the

@@ -30,6 +30,15 @@ state[0-9]*/
 *.log
 *.lock
 
+# The fleet's shared blacklist of bad offers and machines. It lives in `farm/`
+# rather than a `state*/` directory because it belongs to the fleet and not to
+# any one broker (see broker/fleet.py CondemnedIds), but it is still machine
+# state: it changes whenever a rental fails and it is a statement about today's
+# market. `farm/hostrates.json` beside it IS tracked, because that one is a
+# measurement of hardware we chose to keep.
+farm/bad_hosts.json
+farm/bad_hosts.json.tmp
+
 # Scene copies pushed to the worker -- these are f1-round2 artefacts, tracked
 # (or deliberately not tracked) over there
 scenes/

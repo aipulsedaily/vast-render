@@ -331,19 +331,22 @@ the same rented box's CPUs — item builds, gates, placement and collision passe
               --arg --item --arg kerb_precast_unit \
               --output gate.json --timeout 1800 --wait
 
-**What it is measured to be worth: 1.7x, not 3-5x.** 52 units of 26 real
-wave-1 item modules, an identical unit of work both sides:
+**What it is measured to be worth: 3.65x — but only on a box that meets the
+spec.** 48 units of 24 real wave-1 item modules, an identical unit both sides:
 
-    local   i7-7700K   6 cores    4 slots   1964 s    95.3 items/h
-    remote  EPYC 7R32  23 CPU     12 slots  1184 s   158.1 items/h    1.66x
-    remote  same box   23 CPU     20 slots  1170 s   160.0 items/h    1.68x
+    local   i7-7700K            6 CPU     4 slots   2182 s    75.9 items/h
+    remote  Threadripper 3960X  46 CPU   12 slots    598 s   276.9 items/h   3.65x
 
-The remote box plateaus near 160 items/hour however the slots are set — mean
-per-item wall clock is 80 s at 1-way, 206 s at 12-way and 289 s at 20-way. The
-plan that motivated this feature set an adoption bar of **2x and it is not met**;
-`docs/operations.md` records the decision and what would change it. The feature
-ships because it is correct and because the three things it is uniquely good at
-are real:
+    the same lever, measured 2026-08-04 on a 23-CPU cgroup:
+    remote  EPYC 7R32           23 CPU   12 slots   1184 s   158.1 items/h   1.66x
+
+The adoption bar is **2x, and the first measurement missed it at 1.68x on
+hardware with half the CPU the plan assumed.** Re-run 2026-08-14 on 46.08 cgroup
+CPUs — verified on the box, not read off the offer — it clears the bar by 80 %.
+`docs/operations.md` records both runs, the conditions of each, and the three
+findings the re-run reversed. **The CPU floor is the whole result: at 23 CPUs
+this lever is not worth adopting and at 46 it is.** Beyond that, the three
+things it is uniquely good at are real:
 
   * **the `.blend` is born where the render happens.** Across 553 broker jobs
     against item scenes, 7,687 s of rendering sat inside 40,737 s of job — 81 %

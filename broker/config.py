@@ -26,6 +26,40 @@ def _env(name: str, default):
 # per core), so this is an input to the broker, never something it produces.
 SCENE = Path(_env("SCENE", str(ROOT / "scene.blend")))
 
+# THE SCENE `rq exec` DEPLOYS WITH WHEN THERE IS NO RENDER SCENE AT ALL, and
+# deliberately NOT a default for `SCENE`.
+#
+# `Fleet.ensure_ready` is the only code that may rent or wake a box, and it
+# insists on a scene because the render path always has one. Exec does not: it
+# runs `blender -b -P <entry>` on the CPUs and never touches the render worker.
+# So on a broker started without `VASTRENDER_SCENE` — which is how this one has
+# run all week, `scene.blend` has never existed — an exec-only workload could
+# not bring up a box at ALL. It waited (correctly, refunding its attempts) for
+# some *render* job to happen to rent one first. Measured 2026-08-07: job
+# c066603f71e3 requeued indefinitely against an empty fleet with no render work
+# anywhere in the queue to unblock it.
+#
+# That is an invisible coupling between two paths documented as independent,
+# and it is the same shape as the retry-accounting hole fixed the same day: the
+# render path had something the exec path did not.
+#
+# WHY A SEPARATE KNOB RATHER THAN JUST POINTING `SCENE` AT blank_probe.blend.
+# `SCENE` is what a render job gets when it omits `--scene`. `blank_probe.blend`
+# is the fixture built to prove the blank-frame checker works — it contains
+# CAM_VOID, aimed 5 km into empty space, and renders BLACK ON PURPOSE. Making
+# that the render default would answer a forgotten `--scene` with a black frame
+# instead of an error, which is precisely the silent-wrong-output class this
+# broker refuses everywhere else (no dedup, no defaulted worker fields, a
+# terminal verdict on blank frames). A missing render default must stay a hard
+# error. This scene is a BOOTSTRAP: something valid to hand the deploy path so
+# an instance can exist, never something anyone's pixels come from.
+#
+# It is 0.59 MB, so the push is free next to the 409 MB assemblies, and the
+# first render job that arrives switches the worker to its own scene in the
+# usual 40-60 s. Set to a path that does not exist to disable.
+EXEC_BOOTSTRAP_SCENE = Path(_env(
+    "EXEC_BOOTSTRAP_SCENE", str(ROOT / "scenes" / "blank_probe.blend")))
+
 # Jobs may name their own scene. Everything they can name must sit under this
 # root, resolved — a client-supplied scene becomes a file path on *both*
 # machines, which is the same class of vector that made job ids broker-minted:
@@ -577,6 +611,23 @@ LOG_DIR = ROOT / "state"
 # lifespan startup and then destroy it when its port bind failed, so this is a
 # money guard, not hygiene. See broker/lock.py.
 LOCK_PATH = Path(_env("LOCK", str(ROOT / "state" / "broker.lock")))
+
+# --- what the whole fleet knows about bad hardware ------------------------
+#
+# DELIBERATELY NOT UNDER `DB_PATH.parent`, which is where it used to live and
+# which is per-broker. `farm/` is the only directory in this tree that belongs
+# to the fleet rather than to one broker, and a condemned host is a fact about
+# the market, not about whoever happened to discover it. See
+# `fleet.CondemnedIds` and `docs/incidents.md` #169 for the job this cost.
+#
+# Env-driven so a test — or a second, deliberately isolated fleet — can point
+# somewhere else. Anything sharing the vast.ai account should share this file.
+BAD_HOSTS_PATH = Path(_env("BAD_HOSTS", str(ROOT / "farm" / "bad_hosts.json")))
+
+# Seven days. The number is derived in `fleet.BAD_HOST_TTL_SEC`, from measured
+# defect lifetimes of 24 h and 61 h against a 12 h instance retirement period;
+# read that comment before changing it here.
+BAD_HOST_TTL_SEC = float(_env("BAD_HOST_TTL_SEC", 7 * 24 * 3600.0))
 
 # --- remote ---------------------------------------------------------------
 

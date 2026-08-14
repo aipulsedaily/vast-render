@@ -13,7 +13,35 @@ scene so dispatch fails before it can rent anything:
 whatever is listening on port 8760, so against a working broker it queues junk
 renders on a real GPU, and its last two checks ("long-poll returns on terminal
 state", "no GPU rented during tests") fail by observing the live batch rather
-than anything the tests did. Run the offline sections alone with:
+than anything the tests did.
+
+That paragraph has been here all along, and on 2026-08-08 an agent ran
+`python -m broker.test_broker` anyway — the obvious invocation, the one the
+shebang and the `__main__` block both invite — and it POSTed a render job to
+the live broker on 8760. No harm resulted (the submit was refused with a
+non-JSON body, which is what crashed the runner; `depth` stayed 0 and no GPU was
+rented), and it was harmless only because it was checked rather than assumed.
+
+    A WARNING IS NOT A MECHANISM.
+
+So the default is now the offline suite and nothing else. `http()` and
+`test_http()` refuse to open a socket unless `--live-http` was passed, and
+`--live-http` takes a URL with **no default**, because the default was
+production:
+
+    .venv/bin/python -m broker.test_broker            # offline; cannot reach
+                                                      # the network at all
+
+    VASTRENDER_SCENE=/tmp/nope.blend VASTRENDER_PORT=8799 \
+    VASTRENDER_DB=/tmp/throwaway.db .venv/bin/python -m broker.app &
+    .venv/bin/python -m broker.test_broker --live-http http://127.0.0.1:8799
+
+Even with the flag, the run is refused unless the target has **no job history**
+— a throwaway has none and a working broker has thousands. An earlier version
+of this gate checked "is it renting right now" and "does its scene exist", and
+allowed a run against broker 1, because a production broker had drifted into
+exactly the state the docs called safe. A state is not an identity; history is.
+`run_offline()` remains callable directly:
 
     .venv/bin/python -c "from broker import test_broker as t; \
         raise SystemExit(t.run_offline())"
@@ -27,8 +55,10 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import argparse
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -45,6 +75,35 @@ from .fleet import Fleet
 
 BASE = "http://127.0.0.1:8760"
 results: list[tuple[bool, str, str]] = []
+
+
+class LiveBrokerRefused(RuntimeError):
+    """A test tried to talk to a real broker without anyone asking it to."""
+
+
+# THE DEFAULT PATH MAY NOT REACH THE NETWORK, AND THIS IS WHAT ENFORCES IT.
+#
+# Not a convention and not a docstring: a flag that every route to a socket in
+# this file checks first. `main()` sets it only when `--live-http` is passed.
+#
+# The guard lives at the point of egress rather than in `main()` on purpose. A
+# check in `main()` protects the tests that exist today; a check in `http()`
+# also protects the test somebody adds next year, drops into OFFLINE_TESTS
+# because it looked offline, and never runs against a broker until the one time
+# it does.
+_LIVE_HTTP_ALLOWED = False
+
+
+def _require_live_http(what: str) -> None:
+    """Refuse anything that would reach a real broker, unless asked explicitly."""
+    if _LIVE_HTTP_ALLOWED:
+        return
+    raise LiveBrokerRefused(
+        f"REFUSED: {what} would talk to a real broker at {BASE}, and nothing "
+        f"asked it to. The broker on 8760 is production: it accepts jobs and "
+        f"rents GPUs. Re-run with `--live-http` and point it at a throwaway "
+        f"broker (see this module's docstring), or call `run_offline()`."
+    )
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -2549,17 +2608,48 @@ def test_jobs_survive_a_restart() -> None:
 
 
 def http(method: str, path: str, payload=None):
+    _require_live_http(f"http({method} {path})")
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(BASE + path, data=data, method=method,
                                  headers={"Content-Type": "application/json"} if data else {})
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
-            return r.status, json.loads(r.read() or b"{}")
+            return r.status, _body(r.read())
     except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read() or b"{}")
+        return e.code, _body(e.read())
+
+
+def _body(raw: bytes):
+    """Decoded JSON, or the raw text when the server did not send JSON.
+
+    `json.loads` used to be called on the error body directly, so ANY non-JSON
+    response killed the runner with `JSONDecodeError: Expecting value: line 1
+    column 1` — a traceback pointing at the JSON decoder, naming neither the
+    status code nor the endpoint nor the body.
+
+    That is not hypothetical and it is not cosmetic: it is what this file did on
+    2026-08-08, three separate times, and each time it hid the actual answer.
+    The broker was returning
+
+        HTTP/1.1 500 Internal Server Error
+        content-type: text/plain
+        Internal Server Error
+
+    to `POST /jobs` — a real defect, visible in one line — and the harness
+    converted it into a decoder crash that read like a broken test. A test
+    harness that cannot report a 500 is worse than one that has no HTTP tests.
+    """
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return raw.decode("utf-8", "replace").strip()
 
 
 def test_http() -> bool:
+    # Before the health probe, which is itself a socket to production.
+    _require_live_http("test_http()")
     try:
         urllib.request.urlopen(BASE + "/health", timeout=5)
     except Exception:
@@ -2576,8 +2666,17 @@ def test_http() -> bool:
     check("unknown job -> 404", code == 404, str(code))
 
     code, body = http("POST", "/jobs", {"spec": spec(), "agent": "test"})
-    check("submit accepted", code == 200 and "job_id" in body, str(body)[:60])
-    jid = body.get("job_id", "")
+    accepted = code == 200 and isinstance(body, dict) and "job_id" in body
+    check("submit accepted", accepted, f"{code} {str(body)[:60]}")
+    if not accepted:
+        # Everything below needs a job id. Without this the run died on
+        # `'str' object has no attribute 'get'` three frames later, which reads
+        # like a harness bug and is in fact the broker's 500 arriving intact.
+        check("HTTP section reached a broker and reported its answer", True,
+              f"submit returned {code}; remaining checks need a job id and are "
+              f"skipped")
+        return True
+    jid = body["job_id"]
 
     # Long-poll must return promptly once the job reaches a terminal state
     # rather than burning the full wait window.
@@ -5895,7 +5994,252 @@ def _raises_http(fn) -> Optional[int]:
     return None
 
 
+def test_the_live_http_guard_refuses_before_it_opens_a_socket() -> None:
+    """A guard only ever seen to ALLOW has not been tested.
+
+    So this makes it refuse, twice, and proves the refusal happens *before* any
+    socket exists — `socket.create_connection` is replaced with something that
+    raises, so an escape shows up as `Egress` rather than as a quiet pass. That
+    distinction is the whole test: a guard that refuses after connecting has
+    already submitted the job.
+
+    Then it flips the flag and checks egress IS attempted, because a guard that
+    refuses unconditionally is just a broken test suite, and the failure mode
+    there — nobody can run the HTTP section at all — would get the guard deleted
+    by the next person in a hurry.
+    """
+    global _LIVE_HTTP_ALLOWED
+
+    class Egress(Exception):
+        """Raised by the stubbed socket layer. Not an OSError, so urllib's own
+        `except OSError -> URLError` cannot swallow it and turn an escape into
+        a plausible-looking connection failure."""
+
+    def no_egress(*_a, **_k):
+        raise Egress("a socket was opened")
+
+    real_connect = socket.create_connection
+    socket.create_connection = no_egress
+    # Restore whatever was here rather than forcing False: this test flips the
+    # flag, and a test that leaves a global in a state its caller did not choose
+    # is how a guard gets disabled by the thing that checks it.
+    prior = _LIVE_HTTP_ALLOWED
+    try:
+        check("the guard is OFF while the offline suite runs", prior is False,
+              f"_LIVE_HTTP_ALLOWED={prior}")
+        _LIVE_HTTP_ALLOWED = False
+
+        for what, call in (
+            ("http() POST /jobs",
+             lambda: http("POST", "/jobs", {"spec": spec(), "agent": "test"})),
+            ("test_http()", test_http),
+        ):
+            try:
+                call()
+            except LiveBrokerRefused as exc:
+                check(f"REFUSED with no --live-http: {what}", True,
+                      str(exc).split(",")[0])
+            except Egress:
+                check(f"REFUSED with no --live-http: {what}", False,
+                      "IT OPENED A SOCKET — the guard is after the connect")
+            else:
+                check(f"REFUSED with no --live-http: {what}", False,
+                      "it returned normally — the guard did not fire at all")
+
+        _LIVE_HTTP_ALLOWED = True
+        try:
+            http("GET", "/health")
+        except Egress:
+            check("--live-http still lets the HTTP section reach the network",
+                  True, "egress attempted, as it must be")
+        except LiveBrokerRefused:
+            check("--live-http still lets the HTTP section reach the network",
+                  False, "the guard refused even when enabled")
+        else:
+            check("--live-http still lets the HTTP section reach the network",
+                  False, "no egress was attempted")
+    finally:
+        socket.create_connection = real_connect
+        _LIVE_HTTP_ALLOWED = prior
+
+
+def _market(*pairs):
+    """A cheapest-first offer list. First entry is the one we want skipped."""
+    return [{"id": oid, "machine_id": mid, "dph_total": 0.40 + i * 0.05,
+             "reliability2": 0.99, "_est": 3.2 + i, "inet_up": 600,
+             "direct_port_count": 90, "gpu_frac": 1.0, "_exclusive": True}
+            for i, (oid, mid) in enumerate(pairs)]
+
+
+def _renter(fleet_mod, market, store_path, boom=None):
+    """A Fleet carrying REAL `CondemnedIds` on `store_path`, whose every create
+    fails — so `attempted` is exactly the list of offers it was willing to buy."""
+    f = Fleet.__new__(Fleet)
+    f.client = None
+    f.bad_offers = fleet_mod.CondemnedIds("offers", path=store_path)
+    f.bad_machines = fleet_mod.CondemnedIds("machines", path=store_path)
+    f.stalled_machines = set()
+    f.instance_id = f.started_at = f.machine_id = f.offer_id = None
+    f.dph, f.gpu_frac, f.may_hold_render, f.status = 0.0, None, False, "down"
+    f.attempted = []
+    f._destroy_confirmed = lambda i, why: None
+    real_vc = fleet_mod.vastctl
+
+    class Stub:
+        MAX_OFFER_ATTEMPTS = real_vc.MAX_OFFER_ATTEMPTS
+        READY_TIMEOUT = real_vc.READY_TIMEOUT
+        NotReachable = real_vc.NotReachable
+        guard_credit = staticmethod(lambda c: 50.0)
+        build_query = staticmethod(lambda **kw: "")
+        search_offers = staticmethod(lambda c, **kw: [dict(o) for o in market])
+
+        @staticmethod
+        def create(client, offer_id, **kw):
+            f.attempted.append(int(offer_id))
+            raise RuntimeError(boom(offer_id) if boom else "stub: create refused")
+
+    def go():
+        fleet_mod.vastctl = Stub
+        try:
+            try:
+                f._rent()
+            except Exception:
+                pass                      # every offer failing is the point
+        finally:
+            fleet_mod.vastctl = real_vc
+        return f.attempted
+
+    f.go = go
+    return f
+
+
+def test_a_condemnation_outlives_the_retirement_and_reaches_every_broker() -> None:
+    """#169. A verdict nobody can read is the same as no verdict.
+
+    THE JOB THIS COST, from the fleet logs of 2026-08-12:
+
+        18:22:57  fleet05  machine 58073 blacklisted (ssh key injection failed)
+        18:34:32  fleet04  renting offer 38769886 (machine 58073)
+        18:39:10  fleet04  machine 58073 blacklisted (ssh key injection failed)
+        18:39:22  broker   job 467247848cc6 FAILED after 0 frame(s) this pass
+
+    Twelve minutes, far inside any TTL — the entry had not expired, it lived in
+    another process's state directory. A zero-progress pass spends a retry
+    attempt; that was the third, and a 2,978-frame master stopped 101 frames
+    short. Both `state4/bad_hosts.json` and `state5/bad_hosts.json` still hold
+    machine 58073, stamped 973 s apart: two brokers, two files, one fact.
+
+    Three separate properties are checked here because each one is enough on its
+    own to reproduce the failure, and fixing any two still leaves it:
+
+      1. the ban outlives the 12 h retirement cycle that goes shopping again —
+         measured defect lifetimes were 24 h 06 m (machine 142281) and
+         61 h 19 m (machine 8512), and no condemned host was ever seen to heal;
+      2. one broker's verdict is visible to a broker that was ALREADY RUNNING;
+      3. a create that 400s is condemned — it was, which is why this one is a
+         null, and it is checked so it stays true.
+    """
+    from . import fleet as fleet_mod                            # noqa: PLC0415
+
+    tmp = Path(tempfile.mkdtemp(prefix="badhosts_"))
+    try:
+        shared = tmp / "bad_hosts.json"
+        now = time.time()
+
+        # --- 1. the TTL against the defect it records ---------------------
+        shared.write_text(json.dumps({
+            "machines": {"8512": now - (61 * 3600 + 19 * 60),    # measured
+                         "142281": now - (24 * 3600 + 6 * 60),   # measured
+                         "999001": now - 8 * 86400},             # long healed
+        }))
+        kept = fleet_mod.CondemnedIds("machines", path=shared)
+        check("a host still broken 61 h later is still condemned — the whole "
+              "point, since the fleet retires an instance every 12 h",
+              8512 in kept and 142281 in kept, str(sorted(kept)))
+        check("...and the ban is NOT permanent, or the cheap end of the market "
+              "gets condemned one host at a time and never comes back",
+              999001 not in kept, str(sorted(kept)))
+        check("the TTL is comfortably longer than the longest defect measured",
+              fleet_mod.BAD_HOST_TTL_SEC > 61 * 3600 + 19 * 60,
+              f"{fleet_mod.BAD_HOST_TTL_SEC / 3600:.0f} h")
+        retire = fleet_mod.vastctl.MAX_INSTANCE_HOURS
+        check("...and longer than the retirement period that re-asks the "
+              "question, which is the property that actually matters",
+              fleet_mod.BAD_HOST_TTL_SEC > 4 * retire * 3600,
+              f"{fleet_mod.BAD_HOST_TTL_SEC / 3600:.0f} h ban vs a {retire:.0f} h "
+              f"retirement")
+
+        # --- 2. the sibling, which was already running --------------------
+        shared.unlink()
+        market = _market((38769886, 58073), (46285754, 31233))
+        fleet04 = _renter(fleet_mod, market, shared)     # loads NOW: file empty
+        check("the broker that will do the buying starts with a clean list, "
+              "exactly as fleet04 did at 18:22",
+              not fleet04.bad_machines, str(sorted(fleet04.bad_machines)))
+
+        fleet05 = _renter(fleet_mod, market, shared)
+        fleet05.bad_offers.add(38769886)
+        fleet05.bad_machines.add(58073)                  # 18:22:57
+
+        check("...and a sibling's condemnation is published where it can be "
+              "read, not kept in the process that discovered it",
+              "58073" in json.loads(shared.read_text()).get("machines", {}),
+              shared.read_text())
+        check("THE RE-RENT SKIPS THE MACHINE ANOTHER BROKER JUST CONDEMNED",
+              fleet04.go() == [46285754], str(fleet04.attempted))
+        check("...and it still rents SOMETHING — a shared blacklist must not "
+              "become a way for one broker to starve the others",
+              fleet04.instance_id is None and fleet04.attempted,
+              str(fleet04.attempted))
+
+        # --- 3. a create that 400s ----------------------------------------
+        # Offer 46851284 400'd for all three brokers across two days while
+        # staying the cheapest qualifying listing. The condemnation itself was
+        # never the missing piece; publishing it was.
+        shared.unlink()
+        four00 = _renter(
+            fleet_mod, _market((46851284, 53711), (47436065, 31233)), shared,
+            boom=lambda o: (f"HTTPError: 400 Client Error: Bad Request for url: "
+                            f"https://console.vast.ai/api/v0/asks/{o}/"))
+        four00.go()
+        check("a create that returns 400 condemns the offer (it already did — "
+              "this is here so it keeps doing it)",
+              46851284 in four00.bad_offers, str(sorted(four00.bad_offers)))
+        check("...and a broker that never saw the 400 can read it off the file",
+              46851284 in fleet_mod.CondemnedIds("offers", path=shared),
+              shared.read_text())
+
+        # --- 4. two brokers condemning at once ----------------------------
+        # The store is shared now, so `_save`'s read-modify-write is a race.
+        # Without the lock the second writer's copy — read before the first
+        # wrote — is what lands, and one verdict simply vanishes.
+        shared.unlink()
+        a = fleet_mod.CondemnedIds("machines", path=shared)
+        b = fleet_mod.CondemnedIds("machines", path=shared)
+        a.add(111111)
+        b.add(222222)
+        both = fleet_mod.CondemnedIds("machines", path=shared)
+        check("two brokers condemning different hosts keep BOTH verdicts",
+              both == {111111, 222222}, str(sorted(both)))
+
+        # --- 5. an empty market must not delete the fleet's evidence ------
+        # `_rent` used to call `bad_offers.clear()` when everything on the
+        # market was condemned. Against a shared file that is one broker with a
+        # thin market erasing what every other broker paid to learn.
+        dry = _renter(fleet_mod, _market((38769886, 58073)), shared)
+        dry.bad_machines.add(58073)
+        check("a broker with nothing clean to rent still tries the cheapest",
+              dry.go() == [38769886], str(dry.attempted))
+        check("...but the fleet's verdicts SURVIVE it",
+              fleet_mod.CondemnedIds("machines", path=shared) >= {58073, 111111, 222222},
+              shared.read_text())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 OFFLINE_TESTS = (
+    "test_a_condemnation_outlives_the_retirement_and_reaches_every_broker",
+    "test_the_live_http_guard_refuses_before_it_opens_a_socket",
     "test_a_dns_outage_never_condemns_the_hardware",
     "test_a_black_frame_on_a_scene_that_used_to_work_gets_one_retry",
     "test_the_pixel_cap_counts_what_is_actually_rendered",
@@ -5984,10 +6328,117 @@ def run_offline() -> int:
     return report()
 
 
-def main() -> int:
+def _target_broker_safety(url: str) -> Optional[dict]:
+    """What `url` says about itself, or None if nothing is listening.
+
+    Returns `{instance_id, history, scene}`. **`history` is the gate that
+    matters**, and the other two are corroboration.
+
+    The first version of this checked `instance_id` and the scene path, and it
+    was wrong in a way worth recording, because it was wrong by following the
+    documentation. The docstring's definition of a safe target — "a broker
+    pointed at a scene that does not exist, so dispatch fails before it can
+    rent" — describes a *runtime state*, and broker 1 happened to be in it:
+    `instance_id: null`, scene `/home/zany/vast-render/scene.blend` absent. The
+    gate read production as a throwaway and allowed the run. (No harm: the
+    broker refused the submit for the same missing-scene reason. It was correct
+    by luck, which is not a guard.)
+
+    A state a production broker can drift into is not an identity. Job history
+    is: a throwaway started thirty seconds ago has done nothing, and broker 1
+    has 2458 jobs behind it and always will. So the question asked here is not
+    "could this broker rent right now" but "has this broker ever been used for
+    anything", and only a categorical no is allowed through.
+    """
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/queue", timeout=5) as r:
+            body = json.loads(r.read() or b"{}")
+    except Exception:
+        return None
+    counts = body.get("counts") or {}
+    return {
+        "instance_id": (body.get("fleet") or {}).get("instance_id"),
+        "history": sum(int(v or 0) for v in counts.values()) + int(body.get("depth") or 0),
+        "counts": counts,
+        "scene": body.get("scene"),
+    }
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """Offline by default. The HTTP section is opt-in and double-gated.
+
+    This used to run `test_http()` unconditionally, so the obvious invocation —
+    `python -m broker.test_broker`, which the shebang and `__main__` both invite
+    — submitted a render job to production. See the module docstring for the
+    2026-08-08 incident. The next person to run this file will be an agent with
+    no reason to suspect it, so the default is now the one that cannot cost
+    anything.
+    """
+    global _LIVE_HTTP_ALLOWED, BASE
+    p = argparse.ArgumentParser(
+        prog="broker.test_broker",
+        description="Broker tests. Offline by default; see the module docstring.")
+    p.add_argument(
+        "--live-http", metavar="URL",
+        help="also run the HTTP section, against the broker at URL. It SUBMITS "
+             "JOBS. There is deliberately NO DEFAULT: the default was "
+             + BASE + ", which is production, and defaulting to production is "
+             "the whole defect. Must be a throwaway broker with no job history.")
+    a = p.parse_args(sys.argv[1:] if argv is None else argv)
+
+    if not a.live_http:
+        return run_offline()
+
+    url = a.live_http.rstrip("/")
+    if not url.startswith(("http://127.0.0.1", "http://localhost")):
+        print(f"REFUSED: {url} is not loopback. This starts brokers and reads "
+              f"their scene paths off the local filesystem; nothing here is "
+              f"meaningful against a remote host. Failing closed.")
+        return 1
+
+    info = _target_broker_safety(url)
+    if info is None:
+        print(f"--live-http: nothing is listening on {url}")
+        return 1
+
+    # THE SECOND GATE, AND IT FAILS CLOSED. `--live-http` says "I meant to use
+    # HTTP". It does not say "I meant to queue junk renders onto a 5090", and
+    # those are different intentions with very different bills.
+    if info["history"]:
+        print(f"REFUSED: the broker at {url} has {info['history']} jobs of "
+              f"history ({info['counts']}). That is a broker somebody uses. It "
+              f"may hold no card this second — broker 1 did not, on the day "
+              f"this section submitted to it twice — and that means only that "
+              f"the next accepted job pays for a fresh 5090.\n"
+              f"  Start a throwaway with its own empty database:\n"
+              f"      VASTRENDER_SCENE=/tmp/nope.blend VASTRENDER_PORT=8799 \\\n"
+              f"      VASTRENDER_DB=/tmp/throwaway.db .venv/bin/python -m broker.app &\n"
+              f"      .venv/bin/python -m broker.test_broker --live-http http://127.0.0.1:8799")
+        return 1
+    if info["instance_id"] is not None:
+        print(f"REFUSED: the broker at {url} has no job history but is holding "
+              f"rented instance {info['instance_id']}. Nothing that owns a GPU "
+              f"is a throwaway.")
+        return 1
+    if info["scene"] and Path(info["scene"]).exists():
+        print(f"REFUSED: the broker at {url} is pointed at a scene that EXISTS "
+              f"({info['scene']}), so its dispatch path can reach a GPU. Point "
+              f"it at a missing scene: VASTRENDER_SCENE=/tmp/nope.blend")
+        return 1
+
+    BASE = url
+
+    # The offline suite runs with the guard still OFF — it needs no network, and
+    # running it under the flag would mean the one test that checks the guard
+    # refuses is the one test running with refusal disabled.
     for name in OFFLINE_TESTS:
         globals()[name]()
-    test_http()
+
+    _LIVE_HTTP_ALLOWED = True
+    try:
+        test_http()
+    finally:
+        _LIVE_HTTP_ALLOWED = False
     return report()
 
 

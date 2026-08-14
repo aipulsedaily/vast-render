@@ -195,7 +195,7 @@ GONE_STATES = {"destroyed", "terminated", "offline"}
 # as substrings. See `Instance.classify` for why this list is short and why
 # nothing about the registry, DNS, TLS or timeouts belongs on it: those are
 # retried by containerd and by vast, and condemning a machine for one costs a
-# 24 h ban on hardware that was about to work.
+# seven-day ban on hardware that was about to work.
 #
 # The test for adding an entry: *would waiting fifteen more minutes fix it?*
 # If yes, it is not terminal, and READY_TIMEOUT is already the right handler.
@@ -747,12 +747,14 @@ def search_offers(
         shared    (no gpu_frac term)   19 offers / 19 machines
         exclusive (gpu_frac>=0.99)      8 offers /  8 machines
 
-    Eight machines is thin. `bad_offers` and `bad_machines` persist for 24 h, so
-    a bad day that condemns three of them leaves five — and a hard filter that
-    returns nothing does not degrade, it RAISES, stranding every queued job
-    behind an empty candidate list. That is the same failure the blacklist code
-    already refuses to walk into: `_rent` clears its own bans rather than
-    deadlock, and `stalled_machines` is dropped "when it is the difference
+    Eight machines is thin. `bad_offers` and `bad_machines` persist for seven
+    days and are now shared by every broker, so a bad day that condemns three of
+    them leaves five for the whole fleet — and a hard filter that returns nothing
+    does not degrade, it RAISES, stranding every queued job behind an empty
+    candidate list. That is the same failure the blacklist code already refuses
+    to walk into: `_rent` ignores the bans for one attempt rather than deadlock
+    (it used to DELETE them, which with a shared store threw away other brokers'
+    evidence), and `stalled_machines` is dropped "when it is the difference
     between renting and not renting". Availability wins over preference here for
     the same reason it wins there.
 
@@ -1309,7 +1311,7 @@ def wait_ready(client: VastAI, instance_id: int, timeout: float = READY_TIMEOUT)
         #
         # "cold" belongs with it: we asked to start COLD_START_NUDGES times and
         # vast never acted. The image loaded, so the machine did its part —
-        # blacklisting it for 24 h would throw away good hardware for a
+        # blacklisting it for seven days would throw away good hardware for a
         # control-plane failure. Condemn the offer, keep the machine.
         #
         # And a host that spent the whole timeout unable to resolve a vast.ai
