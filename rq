@@ -524,6 +524,13 @@ def cmd_exec(a: argparse.Namespace) -> int:
         "timeout_s": a.timeout,
         "blender_args": a.blender_arg or ["-b", "--factory-startup"],
         "cpu_slots": a.slots,
+        # Sent to the BROKER always — it filters the payload against the worker
+        # schema it reads out of the tree, and drops anything the deployed exec
+        # server would not understand. See `ExecService.run_one`: a false
+        # declaration is deliberately dropped there rather than here, because an
+        # exec server from before this field existed refuses unknown fields, and
+        # `gpu: false` means "carry on as before".
+        "gpu": bool(getattr(a, "gpu", False)),
     }
     patterns = list(a.include or [])
     if a.closure:
@@ -1286,6 +1293,38 @@ def cmd_resume(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_drift(a: argparse.Namespace) -> int:
+    """What each running broker is EXECUTING, against what is in the tree.
+
+    Deliberately does NOT go through the broker's HTTP API, unlike every other
+    subcommand here. The question is "is that process running the code I am
+    reading?", and asking the process is the one way of answering it that a
+    process running the wrong code can get wrong. It reads /proc instead, so it
+    works on a broker that is wedged, and it works when the broker is exactly
+    the thing under suspicion.
+
+    Why this is a first-class subcommand and not a script somebody remembers:
+    on 2026-08-07 an 8 GB blend was pushed three times to a path nothing read,
+    because the running broker predated its own fix by two hours. Everyone
+    involved was reading the fixed file. A check that has to be remembered is a
+    check that is run after the incident.
+    """
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "scripts", "drift.py")
+    if not os.path.isfile(script):
+        print(f"rq drift: {script} is missing", file=sys.stderr)
+        return 2
+    argv = [sys.executable, script]
+    if a.all:
+        argv.append("--all")
+    if a.json:
+        argv.append("--json")
+    if a.pid:
+        argv += ["--pid", str(a.pid)]
+    import subprocess
+    return subprocess.run(argv).returncode
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="rq", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1391,6 +1430,17 @@ def main() -> int:
                    help="exec slots this job occupies")
     x.add_argument("--blender-arg", action="append", default=[],
                    help="flag for Blender itself; defaults to -b --factory-startup")
+    x.add_argument("--gpu", action="store_true",
+                   help="DECLARE that this job uses the GPU. Off by default and "
+                        "ENFORCED off: an exec child is launched with an empty "
+                        "CUDA_VISIBLE_DEVICES, so `cycles.device = 'GPU'` in "
+                        "your script finds no devices and renders on the CPU. "
+                        "With this flag the exec server checks who holds the "
+                        "card first and REFUSES the job by name if the render "
+                        "worker is on it — on 2026-08-07 an undeclared GPU exec "
+                        "put a second 8 GB scene on the same 32 GB card and "
+                        "killed another agent's render twice. Prefer `rq render`, "
+                        "which the fleet serialises against the worker")
     x.add_argument("--prio", type=int, default=100)
     x.add_argument("--agent", default=os.environ.get("VASTRENDER_AGENT", "anon"))
     x.add_argument("--wait", action="store_true")
@@ -1471,6 +1521,14 @@ def main() -> int:
 
     sub.add_parser("teardown", help="destroy the GPU now").set_defaults(func=cmd_teardown)
     sub.add_parser("resume", help="clear a pause").set_defaults(func=cmd_resume)
+
+    d = sub.add_parser("drift", help="is each running broker executing the code "
+                                     "in this tree? Reads /proc, not the broker")
+    d.add_argument("--all", action="store_true",
+                   help="every tracked file, not only the drifted ones")
+    d.add_argument("--json", action="store_true")
+    d.add_argument("--pid", type=int, help="only this broker process")
+    d.set_defaults(func=cmd_drift)
 
     a = p.parse_args()
     # `-o` means "put the file here". Only `rq render` also documents it as

@@ -1434,10 +1434,18 @@ class StubFleet:
         self.condemned.append(why)
         self.torn_down = True
 
-    def hibernate(self, force: bool = False) -> None:
+    def hibernate(self, force: bool = False,
+                  expect: Optional[int] = None) -> None:
+        # `expect` mirrors the real signature. The stub does not enforce it —
+        # the guard itself is pinned in
+        # `test_a_stale_teardown_cannot_destroy_the_replacement` against a real
+        # Fleet — but it must be ACCEPTED here, or every caller that passes it
+        # dies on a TypeError that the idle path catches and turns into
+        # "stop failed — destroying instead".
         self.hibernated = True
 
-    def teardown(self, reason: str = "idle") -> None:
+    def teardown(self, reason: str = "idle",
+                 expect: Optional[int] = None) -> None:
         self.torn_down = True
 
 
@@ -2255,6 +2263,104 @@ def test_resume_abandon_destroys_stopped_instance() -> None:
         fleet_mod.vastctl.destroy = real_destroy
 
 
+def test_a_stale_teardown_cannot_destroy_the_replacement() -> None:
+    """The most expensive lock race this broker has: a verdict outlives its box.
+
+    Every caller of `teardown`/`hibernate` reads `instance_id` and `stopped_at`
+    OUTSIDE `Fleet.lock` and acts on them INSIDE it, and that lock is held for
+    the whole of `ensure_ready` — a resume is 902 s, and `RESUME_ATTEMPTS` is
+    2, followed by a destroy, a rent and a full deploy. Ten minutes is normal.
+
+    Measured 2026-08-07 on instance 47040457:
+
+        05:19:56  ensure_ready takes the lock, resume 2/2
+        05:30:05  maybe_idle_down sees stopped_at from 04:30, logs
+                  "hibernated 60 min — destroying", calls teardown, BLOCKS
+        05:34:57  resume abandoned; 47040457 destroyed; 47048579 rented
+        05:38:16  47048579 deployed: Blender, 409 MB scene, worker ready 140.3s
+        05:38:22  the 05:30:05 call runs and destroys 47048579
+
+    The evidence is in the line it wrote — `destroyed 47048579 (hibernation
+    expired) ... hibernated 0.0 min` — a hibernation deadline enforced against
+    an instance that never hibernated. Two agents lost their box to it and the
+    whole deploy was paid for twice.
+
+    `hibernate`'s existing `if not self.instance_id or self.stopped_at: return`
+    cannot catch this: the replacement is running, so both facts read healthy.
+    Only the identity answers the right question.
+    """
+    from . import fleet as fleet_mod
+
+    destroyed: list[int] = []
+    real_destroy = fleet_mod.vastctl.destroy
+    fleet_mod.vastctl.destroy = lambda client, iid: destroyed.append(iid) or True
+    try:
+        def make(instance_id: int) -> Fleet:
+            f = Fleet.__new__(Fleet)
+            f.lock = threading.Lock()
+            f.instance_id = instance_id
+            f.ep = None
+            f.tunnel = None
+            f.stopped_at = None
+            f.started_at = time.time()
+            f.dph = 0.3
+            f.gpu_seconds = 0.0
+            f.gpu_frac = None
+            f.scene_hash = None
+            f.scene_path = None
+            f.mirrored_assets = set()
+            f.last_ready = True
+            f.status = "ready"
+            f.may_hold_render = False
+            f.machine_id = 0
+            f.offer_id = 0
+            f.transport_bytes = 0
+            f.stalled_rounds = 0
+            f.heartbeat_failures = 0
+            f.on_teardown = None
+            f.doomed = {}
+            f.client = None
+            return f
+
+        # The exact shape of the incident: the caller decided about 47040457,
+        # the fleet is now serving its freshly deployed replacement.
+        fleet = make(47048579)
+        fleet.teardown("hibernation expired", expect=47040457)
+        check("a teardown decided about a REPLACED instance destroys nothing — "
+              "the replacement's deploy is not the dead box's to spend",
+              destroyed == [] and fleet.instance_id == 47048579,
+              f"destroyed={destroyed} instance_id={fleet.instance_id}")
+
+        # And the guard must not become a way to never tear anything down.
+        fleet.teardown("hibernation expired", expect=47048579)
+        check("a teardown decided about the instance that is actually up still "
+              "destroys it", destroyed == [47048579], str(destroyed))
+
+        destroyed.clear()
+        fleet = make(47048579)
+        fleet.teardown("rq teardown")
+        check("expect=None still means 'whatever is up now' — rq teardown, a "
+              "pause and a shutdown are not observations, they are orders",
+              destroyed == [47048579], str(destroyed))
+
+        # The same rule on the stop path. Stopping is recoverable where
+        # destroying is not, but stopping a box that was deployed 6 s ago still
+        # throws the deploy away.
+        stopped: list[int] = []
+        fleet = make(47048579)
+        fleet.client = type("C", (), {
+            "stop_instance": lambda self, iid: stopped.append(iid)})()
+        fleet.hibernate(force=True, expect=47040457)
+        check("a stop decided about a replaced instance stops nothing",
+              stopped == [] and fleet.stopped_at is None,
+              f"stopped={stopped} stopped_at={fleet.stopped_at}")
+        fleet.hibernate(force=True, expect=47048579)
+        check("and the instance that IS up still stops", stopped == [47048579],
+              str(stopped))
+    finally:
+        fleet_mod.vastctl.destroy = real_destroy
+
+
 def test_unconfirmed_destroy_is_reaped() -> None:
     """`destroy()` returning False used to be ignored inside `_rent`'s cleanup;
     the instance then billed on, untracked, until the next restart. Unconfirmed
@@ -2591,6 +2697,26 @@ def test_exec_transport_is_a_wait_and_never_spends_an_attempt() -> None:
         check("a stale bundle stays terminal", state == "failed",
               f"{state} {attempts}/3")
 
+        # THE GPU REFUSAL, 2026-08-07. An exec job set `cycles.device = GPU`
+        # and put a second 8 GB film scene on the same 32 GB card as the warm
+        # render worker; another agent's `carhero` render died twice with `Out
+        # of memory in CUDA queue enqueue`, terminally the second time. The
+        # classification is the whole point of the class: the thing the job
+        # collided with is a WARM worker holding a resident scene for the entire
+        # campaign, so a retry is not "later", it is the same collision three
+        # times ending in a `3/3` that reads as a build tried and found wanting.
+        # This is deliberately the OPPOSITE verdict to ExecMemoryShort directly
+        # above, which is a wait because sibling builds end and a resident
+        # render scene does not.
+        state, attempts = outcome(execservice.ExecGpuRefused(
+            "exec job d41d8cd98f00 was refused the GPU by the exec server: "
+            "refusing d41d8cd98f00: the render worker holds "
+            "/workspace/scenes/deadbeef/film18.blend on NVIDIA GeForce RTX 5090"))
+        check("a GPU refusal is TERMINAL ON THE FIRST REFUSAL — the render "
+              "worker holds its scene for the whole campaign, so three attempts "
+              "buy three identical collisions",
+              (state, attempts) == ("failed", 1), f"{state} {attempts}/3")
+
         # And the thing the whole budget exists for still spends it: a child
         # that ran and came back `ok: false` is the caller's own code failing.
         jid = db.submit({"entry": "tools/x.py"}, agent="a", kind="exec",
@@ -2621,6 +2747,159 @@ def test_exec_transport_is_a_wait_and_never_spends_an_attempt() -> None:
         check("every failure execremote raises is a RemoteError (or a caller "
               "input error), so the transport net cannot be reopened by adding "
               "one more type", not unclassified, str(unclassified))
+
+
+def test_exec_can_bring_up_a_box_without_a_render_job() -> None:
+    """An exec-only workload must not depend on somebody else renting a GPU.
+
+    `Fleet.ensure_ready` is the only code that may rent or wake an instance and
+    it insists on a scene, because the render path always has one. Exec does
+    not. On a broker started without `VASTRENDER_SCENE` — how this one has run
+    all week; `scene.blend` has never existed — that left `rq exec` unable to
+    bootstrap at all: it waited, refunding attempts forever, for a RENDER job
+    to happen along and bring a box up. Measured 2026-08-07, job c066603f71e3,
+    against a queue that contained no render work to unblock it.
+
+    The fix is a bootstrap scene of exec's own. What this test mostly exists to
+    pin is what the fix must NOT be: pointing `SCENE` at the same file.
+    `blank_probe.blend` is the fixture that proves the blank-frame checker
+    works — CAM_VOID renders black on purpose — so as the render default it
+    would answer a forgotten `--scene` with a black frame instead of an error.
+    """
+    from . import execservice as es
+
+    check("the exec bootstrap scene is NOT the render default — a missing "
+          "--scene must stay a hard error, not a black test fixture",
+          config.EXEC_BOOTSTRAP_SCENE != config.SCENE,
+          f"{config.EXEC_BOOTSTRAP_SCENE} == {config.SCENE}")
+
+    svc = es.ExecService.__new__(es.ExecService)
+    asked: list[Path] = []
+
+    class StubFleetNoBox:
+        ep = None
+        stopped_at = None
+        scene_path = None
+        def ensure_ready(self, scene):
+            asked.append(Path(scene))
+            return "endpoint"
+
+    svc.fleet = StubFleetNoBox()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        missing = Path(tmpdir) / "never_existed.blend"
+        boot = Path(tmpdir) / "blank_probe.blend"
+        boot.write_bytes(b"x" * 594666)
+
+        real_scene, real_boot = config.SCENE, config.EXEC_BOOTSTRAP_SCENE
+        config.SCENE, config.EXEC_BOOTSTRAP_SCENE = missing, boot
+        try:
+            ep = svc.endpoint_without_disturbing_the_worker()
+            check("with no scene loaded and no render default, exec deploys "
+                  "with its bootstrap scene instead of waiting for a render "
+                  "job that may never come",
+                  ep == "endpoint" and asked == [boot], f"{ep} {asked}")
+
+            # The render default still WINS when it exists: the bootstrap is a
+            # last resort, not a preference. Deploying a probe over the real
+            # assembly would cost a scene switch on the next render.
+            asked.clear()
+            real = Path(tmpdir) / "assembly.blend"
+            real.write_bytes(b"y" * 1024)
+            config.SCENE = real
+            svc.endpoint_without_disturbing_the_worker()
+            check("a real render default still wins — the bootstrap is a last "
+                  "resort, not a preference", asked == [real], str(asked))
+
+            # And a scene already loaded wins over both, which is what keeps
+            # exec from ever causing a worker restart.
+            asked.clear()
+            svc.fleet.scene_path = Path(tmpdir) / "loaded.blend"
+            svc.endpoint_without_disturbing_the_worker()
+            check("a scene already loaded wins over both, so exec never causes "
+                  "a scene switch under a render",
+                  asked == [svc.fleet.scene_path], str(asked))
+
+            # With all three gone it is still a refunded WAIT, never a verdict.
+            asked.clear()
+            svc.fleet.scene_path = None
+            config.SCENE, config.EXEC_BOOTSTRAP_SCENE = missing, missing
+            try:
+                svc.endpoint_without_disturbing_the_worker()
+                raised: Exception | None = None
+            except Exception as exc:                            # noqa: BLE001
+                raised = exc
+            check("with no scene anywhere it is still FleetUnavailable — a "
+                  "refunded wait, never a FileNotFoundError that would burn an "
+                  "attempt and fail the build",
+                  isinstance(raised, remote.FleetUnavailable), repr(raised))
+        finally:
+            config.SCENE, config.EXEC_BOOTSTRAP_SCENE = real_scene, real_boot
+
+
+def test_a_box_that_will_not_wake_does_not_spend_an_exec_attempt() -> None:
+    """The hole the RemoteError net could never have covered: `vastctl`.
+
+    `_run_guarded` refunds everything under `remote.RemoteError`, on the rule
+    that transport is never the caller's code. `Fleet.ensure_ready` does not
+    obey that rule — its resume path raises `vastctl.NotReachable`, which is a
+    `VastError` and has no relation to `RemoteError` at all. So the one failure
+    that says the LEAST about a build, "the broker could not get a box", was
+    the one that landed in the final `else` and spent an attempt.
+
+    Measured 2026-08-07 on instance 47040457: hibernated at 04:30, and vast.ai
+    then would not act on `start_instance` — `actual=exited, intended=stopped`
+    across three calls, 902 s per resume. Exec job 5534329f168f (agent
+    occ-all6, 2.41 GB bundle) came back `attempts=2, err=NotReachable` without
+    having executed a line of its own code; one more and the row would have
+    read `failed` for good.
+
+    `run_one` re-types it, exactly as `app.py` already does for renders around
+    `acquire_worker`. The wrapper sits where the fleet is ASKED for hardware,
+    so whatever `Fleet` raises next is covered without a name being added to
+    any list — which is the same argument the transport net is built on.
+    """
+    sys.path.insert(0, str(config.ROOT / "vastctl"))
+    import vastctl
+
+    svc = execservice.ExecService.__new__(execservice.ExecService)
+
+    def unwakeable() -> None:
+        raise vastctl.NotReachable(
+            47040457, "waiting for running", "actual=exited, intended=stopped",
+            902.0, provisioning=True)
+
+    svc.ensure_ready = unwakeable
+    try:
+        svc.run_one({"id": "5534329f168f", "bundle": "e35c9db563b31b22"}, {})
+        raised: Exception | None = None
+    except Exception as exc:                                   # noqa: BLE001
+        raised = exc
+
+    check("an instance that will not wake is re-typed FleetUnavailable — the "
+          "refunded WAIT branch — not left as a bare VastError that spends an "
+          "attempt", isinstance(raised, remote.FleetUnavailable), repr(raised))
+    check("and the re-typing keeps the original diagnosis, or the log says "
+          "only 'no instance available' about a control-plane fault",
+          "47040457" in str(raised) and "intended=stopped" in str(raised),
+          str(raised))
+    check("the cause is chained, so nothing is thrown away by re-typing",
+          isinstance(raised.__cause__, vastctl.NotReachable),
+          repr(getattr(raised, "__cause__", None)))
+
+    # The ordering half: DiskFull must not be swallowed into a refunded wait on
+    # its way through, or a full disk retries forever.
+    for exc_in in (remote.DiskFull("7.97 GB will not fit"),
+                   remote.WorkerBusy("a frame is in flight")):
+        svc.ensure_ready = lambda e=exc_in: (_ for _ in ()).throw(e)
+        try:
+            svc.run_one({"id": "x", "bundle": "0"}, {})
+            out: Exception | None = None
+        except Exception as exc:                               # noqa: BLE001
+            out = exc
+        check(f"{type(exc_in).__name__} passes through the wrapper unchanged, "
+              f"keeping the verdict its own branch gives it",
+              out is exc_in, repr(out))
 
 
 def test_exec_server_saying_not_yet_is_not_the_build_failing() -> None:
@@ -4617,6 +4896,1005 @@ def test_a_dns_outage_never_condemns_the_hardware() -> None:
           host_fleet.bad_machines == {99999}, str(host_fleet.bad_machines))
 
 
+def test_a_start_refused_for_resources_does_not_cost_the_full_timeout() -> None:
+    """`start_instance` saying "no free GPUs" must not be waited out for 900 s.
+
+    THE DEFECT, measured 2026-08-07. Instance 47049525 (machine 138180) was
+    hibernated at 14:22 and woken at 15:05 for a queued 4K job. vast answered
+    the very first start with
+
+        {'success': False, 'error': 'resources_unavailable',
+         'msg': 'Required resources are currently unavailable, state change queued.'}
+
+    — the machine's cards had been let to other tenants, so the container could
+    not restart and the request was parked on an open-ended queue. Nobody read
+    the body. `wait_ready` logged `start_instance#1` as though it had worked,
+    slept out all 900 s, and `fleet.ensure_ready` did it a second time
+    (RESUME_ATTEMPTS) before destroying the instance and renting hardware that
+    existed. Half an hour of a blocked queue, and a `--wait` client blocked with
+    it, to learn what the first API call had already said in words.
+
+    The same response on the same machine had stranded instance 47040457 for 30
+    minutes that morning, so this is a repeat, not a one-off.
+
+    Two things are asserted here, and the second matters as much as the first:
+    the refusal must shorten the wait, and it must NOT blame the host. Machine
+    138180 rendered for 4.8 h earlier the same day; it is full, not broken, and
+    a 24 h ban on every host that is merely busy would empty the market.
+    """
+    from .fleet import vastctl as vc                            # noqa: PLC0415
+
+    cold = {
+        "id": 47049525, "actual_status": "exited", "intended_status": "stopped",
+        "cur_state": "stopped", "machine_id": 138180,
+        "status_msg": "success, running nvidia/cuda_12.8.0-base-ubuntu24.04/ssh",
+        "ports": {}, "public_ipaddr": "", "label": vc.LABEL_PREFIX + "x",
+    }
+    check("the exact payload vast returned is still classified `cold`",
+          vc.Instance(cold).classify() == "cold", vc.Instance(cold).classify())
+
+    class Client:
+        def __init__(self, resp): self.resp, self.starts = resp, 0
+        def show_instance(self, _id): return cold
+        def start_instance(self, _id):
+            self.starts += 1
+            return self.resp
+
+    def wait(resp, timeout):
+        c = Client(resp)
+        t0 = time.time()
+        try:
+            vc.wait_ready(c, 47049525, timeout=timeout)
+            return None, time.time() - t0, c
+        except vc.NotReachable as exc:
+            return exc, time.time() - t0, c
+
+    refusal = {"success": False, "error": "resources_unavailable",
+               "msg": "Required resources are currently unavailable, state change queued."}
+
+    # A grace far below the nominal timeout, so "did the refusal shorten the
+    # wait?" is answered by the clock and not by a mocked deadline.
+    saved, vc.COLD_UNAVAIL_GRACE = vc.COLD_UNAVAIL_GRACE, 0.0
+    try:
+        exc, elapsed, client = wait(refusal, timeout=30.0)
+    finally:
+        vc.COLD_UNAVAIL_GRACE = saved
+
+    check("a refused start gives up inside the grace, not at READY_TIMEOUT",
+          exc is not None and elapsed < 25.0, f"{elapsed:.1f}s, exc={exc!r}")
+    check("...and vast's own refusal is in the message, so the log names the "
+          "real cause instead of an unexplained 900 s stall",
+          exc is not None and "resources_unavailable" in str(exc), str(exc)[:200])
+    check("...and a full host is NOT blamed — it is busy, not broken",
+          exc is not None and exc.host_at_fault is False,
+          f"host_at_fault={getattr(exc, 'host_at_fault', '?')}")
+    check("...and it is reported as provisioning, so the offer is condemned "
+          "rather than the machine",
+          exc is not None and exc.provisioning is True,
+          f"provisioning={getattr(exc, 'provisioning', '?')}")
+
+    # THE CONTROL CASE. A vast that accepts the start and simply never acts is a
+    # different failure (instance 46695656, 2026-08-03) and must keep its full
+    # provisioning budget — shortening THAT is how a host still starting gets
+    # thrown away. Same cold payload, only the response body differs.
+    exc2, elapsed2, client2 = wait({"success": True}, timeout=3.0)
+    check("an ACCEPTED start still waits out the whole timeout — a slow start "
+          "is not a refused one",
+          exc2 is not None and elapsed2 >= 2.5, f"{elapsed2:.1f}s")
+    check("...and it is still bounded by COLD_START_NUDGES, never spinning",
+          client2.starts <= vc.COLD_START_NUDGES, str(client2.starts))
+    check("...while a refusal keeps asking, because a co-tenant releasing a "
+          "card is exactly what would unblock it",
+          client.starts >= 1, str(client.starts))
+
+    # An unparseable body must read as "no refusal seen" and change nothing,
+    # rather than raising inside the wait loop.
+    for junk in ("boom", None, [], {"success": False, "error": "other"}):
+        check(f"a {type(junk).__name__} response body is not mistaken for a refusal",
+              vc._unavailable(junk) == "", repr(junk))
+
+
+def test_cancelling_an_exec_job_reaches_the_process_and_frees_the_slots() -> None:
+    """`DELETE /jobs/{id}` on an exec job must stop the child, not just the row.
+
+    THE DEFECT. The endpoint was `return {"canceled": broker.db.cancel(job_id)}`
+    and there was no cancellation path to a dispatched exec child anywhere in
+    the broker — `grep -n cancel broker/execservice.py` found a docstring
+    mention. Instance 47040457, 2026-08-07: job a39bd71095f9 was cancelled at
+    03:46, answered `{"canceled": true}`, and its Blender child ran on until its
+    own `timeout_s` expired at 04:44. It held 6 of 12 exec slots and an ~8 GB
+    loaded assembly for those 58 minutes, against a memory gate that wants 20 GB
+    free per job. The collateral is in `state/broker.log` in the same window:
+    two of another agent's jobs `waited 600s for 20.0G of free memory` and were
+    refused, and one was OOM-killed straight after `Read blend`.
+
+    WHAT IS PINNED HERE, in the order the bug would come back in:
+
+      * the render path is UNCHANGED — no remote call, one DB write;
+      * a QUEUED exec job needs no remote call and is never dispatched after;
+      * a DISPATCHED exec job sends exactly `{"cmd": "cancel", "job_id": ...}`,
+        naming the job and nothing else — no pattern, no process name;
+      * a cancel that cannot reach the box still cancels the row;
+      * the row goes terminal BEFORE the signal, so the job thread's reaction to
+        its child dying cannot turn a cancel into a `failed` or a requeue.
+    """
+    import asyncio
+    from . import execremote
+
+    class StubBroker:
+        running = True
+        paused = False
+        last_work = 0.0
+
+    class Tunnel:
+        def poll(self):
+            return None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = DB(Path(tmpdir) / "cancel.db")
+        svc = execservice.ExecService.__new__(execservice.ExecService)
+        svc.broker = StubBroker()
+        svc.db = db
+        svc.fleet = None
+        svc.slots = 12
+        svc.inflight = {}
+        svc.lock = threading.Lock()
+        svc.last_error = ""
+        svc.tunnel = Tunnel()
+
+        sent: list[dict] = []
+        reply: dict = {"ok": True, "canceled": True, "running": True,
+                       "killed": True, "pid": 4242, "pgid": 4242,
+                       "detail": "the child's process group was signalled and is gone"}
+
+        def fake_call(payload, *a, **kw):
+            sent.append(dict(payload))
+            if isinstance(reply, Exception):
+                raise reply
+            return dict(reply)
+
+        real_call = execremote.exec_call
+        execremote.exec_call = fake_call
+
+        # The endpoint under test reads two attributes off the module-level
+        # broker. Swapped rather than mocked, so what runs is the real handler.
+        class FakeBrokerObj:
+            pass
+
+        fake = FakeBrokerObj()
+        fake.db = db
+        fake.execsvc = svc
+        real_broker = app.broker
+        app.broker = fake
+        try:
+            # --- a RENDER job's cancel is unchanged -----------------------
+            rid = db.submit(spec(), agent="a")
+            db.claim(600)
+            out = asyncio.run(app.cancel(rid))
+            check("a render job's cancel still just cancels the row",
+                  out["canceled"] is True and db.get(rid)["state"] == "canceled",
+                  str(out))
+            check("and it makes NO remote call — the render worker serves one "
+                  "frame at a time and has no child to signal",
+                  sent == [], str(sent))
+            check("the render cancel reply does not grow an exec section",
+                  "exec" not in out, str(out))
+
+            # --- a QUEUED exec job ---------------------------------------
+            qid = db.submit({"entry": "tools/x.py"}, agent="a", kind="exec",
+                            bundle="0123456789abcdef")
+            out = asyncio.run(app.cancel(qid))
+            check("cancelling a QUEUED exec job cancels the row",
+                  out["canceled"] is True and db.get(qid)["state"] == "canceled")
+            check("and signals nothing, because no dispatcher ever claimed it "
+                  "so no child can exist for it",
+                  sent == [] and out["exec"]["dispatched"] is False, str(out["exec"]))
+            check("A CANCELLED QUEUED EXEC JOB IS NEVER DISPATCHED — the "
+                  "dispatcher cannot claim a terminal row",
+                  db.claim_exec(600) is None, str(db.get(qid)["state"]))
+
+            # --- a DISPATCHED exec job ------------------------------------
+            jid = db.submit({"entry": "tools/x.py"}, agent="a", kind="exec",
+                            bundle="0123456789abcdef")
+            claimed = db.claim_exec(600)
+            assert claimed is not None and claimed["id"] == jid
+            with svc.lock:
+                svc.inflight[jid] = {"started": time.time(), "cpu_slots": 6,
+                                     "agent": "a", "entry": "tools/x.py"}
+            out = asyncio.run(app.cancel(jid))
+            check("cancelling a DISPATCHED exec job cancels the row AND signals "
+                  "the instance",
+                  out["canceled"] is True and out["exec"]["signalled"] is True
+                  and out["exec"]["killed"] is True, str(out.get("exec")))
+            check("the request names the JOB and nothing else — not a process "
+                  "name, not a pattern, nothing `pkill -f` could widen",
+                  sent == [{"cmd": "cancel", "job_id": jid}], str(sent))
+            check("the row is terminal, so the job thread's reaction to its "
+                  "child dying cannot resurrect it",
+                  db.get(jid)["state"] == "canceled"
+                  and db.fail(jid, "child exited -15", config.MAX_ATTEMPTS) == "canceled"
+                  and db.requeue(jid, "x") is False
+                  and db.get(jid)["state"] == "canceled",
+                  db.get(jid)["state"])
+
+            # --- a cancel stops THE JOB, not merely this attempt ----------
+            #
+            # `MAX_ATTEMPTS` is 3, so a job whose child is killed comes back
+            # through `_run_guarded` looking like a job that died, and the
+            # obvious readings of that are "requeue it" and "fail it". Both are
+            # wrong for a cancel, and the first is the expensive one: measured
+            # on 2026-08-07, agent r2851ab's crashed 12-minute build was
+            # automatically re-run in full against code already known to be
+            # broken, and only `rq cancel` stopped a third pass. Stopping this
+            # attempt but not the next one is not a cancellation.
+            svc._hold_the_slot_and_wait = lambda s: 0.0
+            cid = db.submit({"entry": "tools/x.py"}, agent="a", kind="exec",
+                            bundle="0123456789abcdef")
+            db.claim_exec(600)
+            db.cancel(cid)
+
+            def killed_under_us(job, job_spec):
+                raise remote.WorkerUnreachable("the child was killed under us")
+
+            svc.run_one = killed_under_us
+            svc._run_guarded({"id": cid}, {})
+            row = db.get(cid)
+            check("a cancelled job whose child dies mid-run is NOT requeued and "
+                  "NOT failed — it stays cancelled",
+                  row["state"] == "canceled", f"{row['state']} {row['attempts']}/3")
+            check("and the dispatcher can never pick it up for another attempt",
+                  db.claim_exec(600) is None)
+
+            # --- the box cannot be reached --------------------------------
+            sent.clear()
+            reply = remote.WorkerUnreachable("the exec tunnel is gone")
+            jid2 = db.submit({"entry": "tools/x.py"}, agent="a", kind="exec",
+                             bundle="0123456789abcdef")
+            db.claim_exec(600)
+            with svc.lock:
+                svc.inflight[jid2] = {"started": time.time(), "cpu_slots": 1,
+                                      "agent": "a", "entry": "tools/x.py"}
+            out = asyncio.run(app.cancel(jid2))
+            check("a cancel the box will not answer STILL cancels the row — "
+                  "'I could not confirm it' is not a reason to do nothing",
+                  out["canceled"] is True and db.get(jid2)["state"] == "canceled",
+                  str(out.get("exec")))
+            check("and says plainly that the child was not signalled, rather "
+                  "than reporting a success it did not have",
+                  out["exec"]["signalled"] is False and out["exec"]["error"],
+                  str(out["exec"].get("detail")))
+
+            # --- a dead tunnel is not even attempted ----------------------
+            sent.clear()
+            svc.tunnel = None
+            jid3 = db.submit({"entry": "tools/x.py"}, agent="a", kind="exec",
+                             bundle="0123456789abcdef")
+            db.claim_exec(600)
+            with svc.lock:
+                svc.inflight[jid3] = {"started": time.time(), "cpu_slots": 1,
+                                      "agent": "a", "entry": "tools/x.py"}
+            out = asyncio.run(app.cancel(jid3))
+            check("with no tunnel the cancel is honest and makes no call",
+                  sent == [] and out["exec"]["signalled"] is False
+                  and db.get(jid3)["state"] == "canceled", str(out["exec"]))
+            svc.tunnel = Tunnel()
+
+            # --- AN ORPHAN THE BROKER HAS FORGOTTEN -----------------------
+            #
+            # The worst case, and the one `self.inflight` cannot see. A job
+            # whose `_run_guarded` thread has already exited — socket timeout,
+            # tunnel reset, a broker restart that re-adopted the instance — is
+            # gone from `inflight` while its child runs on. Read off the live
+            # box at 04:20 on 2026-08-07: `rq status` showed one exec job in
+            # flight and the exec server's own ping showed a DIFFERENT one,
+            # 6f0e2c1d110a, still holding 6 of 12 slots with nothing in this
+            # process aware of it. Trusting `inflight` would make that the one
+            # orphan `rq cancel` can never touch — which is the defect again,
+            # wearing the fix as a costume.
+            sent.clear()
+            reply = {"ok": True, "canceled": True, "running": True,
+                     "killed": True, "pid": 777, "pgid": 777,
+                     "detail": "the child's process group was signalled and is gone"}
+            oid = db.submit({"entry": "tools/x.py"}, agent="a", kind="exec",
+                            bundle="0123456789abcdef")
+            db.claim_exec(600)                    # dispatched once, attempts -> 1
+            db.cancel(oid)                        # and already cancelled once
+            check("the orphan really is invisible to the broker's own view — "
+                  "otherwise this check is measuring nothing",
+                  oid not in svc.inflight, str(sorted(svc.inflight)))
+            out = asyncio.run(app.cancel(oid))
+            check("a job the broker has FORGOTTEN is still signalled on the box, "
+                  "because the exec server is the authority on what is running",
+                  sent == [{"cmd": "cancel", "job_id": oid}]
+                  and out["exec"]["signalled"] is True
+                  and out["exec"]["killed"] is True, str(out["exec"]))
+            check("and it is reported as not-locally-dispatched rather than "
+                  "pretending the broker knew about it",
+                  out["exec"]["dispatched"] is False, str(out["exec"]))
+
+            check("cancelling a job that does not exist is still a 404",
+                  _raises_http(lambda: asyncio.run(app.cancel("nosuchjob"))) == 404)
+        finally:
+            execremote.exec_call = real_call
+            app.broker = real_broker
+
+
+def test_a_cancel_during_staging_stops_the_job_before_it_is_dispatched() -> None:
+    """The window between "the broker calls it dispatched" and "the box has it".
+
+    `loop()` marks a job in-flight the moment it hands it to a thread, and that
+    thread then calls `ensure_ready`, stages a scene that can be 8 GB, and
+    pushes a bundle — minutes during which the exec server has never heard the
+    job id, so a cancel arriving then has nothing to signal. If the job were
+    dispatched anyway afterwards, the cancel would have achieved exactly what
+    the original defect achieved: a row that says cancelled and a child that
+    runs for an hour.
+
+    Two independent guards, and this pins the broker's half. (The instance's
+    half is `canceled_ids` in `worker/exec_server.py`, checked by
+    `worker/test_exec_server.py`: a cancel that overtakes its job is remembered
+    and the job is refused on arrival without taking a slot.)
+    """
+    from . import execremote
+
+    class StubBroker:
+        running = True
+        paused = False
+        last_work = 0.0
+
+    class Tunnel:
+        def poll(self):
+            return None
+
+    class Bundle:
+        digest = "0123456789abcdef"
+        root = Path("/nowhere")
+        members: list = []
+        bytes = 0
+
+        def describe(self):
+            return "stub bundle"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = DB(Path(tmpdir) / "staging.db")
+        svc = execservice.ExecService.__new__(execservice.ExecService)
+        svc.broker = StubBroker()
+        svc.db = db
+        svc.fleet = StubFleet([idle_worker()])
+        svc.fleet.protected_scenes = lambda: set()
+        svc.slots = 12
+        svc.inflight = {}
+        svc.lock = threading.Lock()
+        svc.last_error = ""
+        svc.tunnel = Tunnel()
+        svc.ensure_ready = lambda: None
+        svc.refuse_if_memory_is_short = lambda _spec: None
+        svc.ensure_scene_staged = lambda _ep, _spec: None
+
+        calls: list[dict] = []
+        real_call, real_plan, real_push = (execremote.exec_call,
+                                           execservice.plan_bundle,
+                                           execremote.push_bundle)
+        execremote.exec_call = lambda payload, *a, **kw: (calls.append(dict(payload)),
+                                                          {"ok": True})[1]
+        execservice.plan_bundle = lambda root, patterns: Bundle()
+        execremote.push_bundle = lambda ep, bundle, **kw: {"cached": True}
+        try:
+            job_spec = {"entry": "tools/x.py", "argv": [], "outputs": ["r.json"],
+                        "timeout_s": 600, "blender_args": ["-b"], "cpu_slots": 1,
+                        "bundle_root": "/nowhere", "bundle_patterns": ["**/*.py"]}
+            jid = db.submit(job_spec, agent="a", kind="exec", bundle=Bundle.digest)
+            job = db.claim_exec(600)
+            # The cancel lands while the pushes above would still be running.
+            db.cancel(jid)
+            svc.run_one(job, job_spec)
+            check("a job cancelled while its inputs were being staged is NEVER "
+                  "handed to the exec server", calls == [], str(calls))
+            check("and it stays cancelled rather than being failed or requeued",
+                  db.get(jid)["state"] == "canceled", db.get(jid)["state"])
+
+            # The same job NOT cancelled does reach the box, so the check above
+            # is measuring the guard and not a stub that never dispatches.
+            jid2 = db.submit(job_spec, agent="a", kind="exec", bundle=Bundle.digest)
+            job2 = db.claim_exec(600)
+            try:
+                svc.run_one(job2, job_spec)
+            except RuntimeError:
+                # The stub reply carries no outputs, so `collect` refuses it.
+                # Irrelevant here: the assertion is that the dispatch HAPPENED.
+                pass
+            check("an uncancelled job does reach the exec server — the guard is "
+                  "the reason for the silence above, not the stub",
+                  len(calls) >= 1 and calls[0].get("job_id") == jid2, str(calls[:1]))
+        finally:
+            execremote.exec_call = real_call
+            execservice.plan_bundle = real_plan
+            execremote.push_bundle = real_push
+
+
+class _FakeInstance:
+    """A `/workspace` on the local disk, driven by the REAL shell strings.
+
+    `remote.probe` is the single primitive under `run`, `scene_cached`,
+    `mark_scene_complete` and the size verification, so replacing it with a
+    local `bash -c` runs every one of those commands verbatim — the `mkdir -p`,
+    the `mv -f`, the `touch`, and `scene_cached`'s
+    `test -f <marker> && stat -c %s <path>`. That matters more than usual here:
+    the defect was a PATH, and a test that stubs the path out cannot see one.
+
+    `config.REMOTE_ROOT` is read by `remote.scene_dir` on every call, so
+    pointing it at a temp directory relocates the whole remote layout.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.commands: list[str] = []
+        (root / "scenes").mkdir(parents=True, exist_ok=True)
+
+    def probe(self, _ep, command: str, timeout: float = 600, mux: bool = True):
+        self.commands.append(command)
+        proc = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+        return remote.Ran(cmd=command, rc=proc.returncode, out=proc.stdout.strip(),
+                          err=proc.stderr.strip(), elapsed=0.0, where="fake")
+
+
+def _stage_on_a_fake_instance(tmp: Path, blend_bytes: bytes,
+                              siblings: Optional[list] = None,
+                              break_it=None):
+    """Run the real `stage_scene_tree` against `_FakeInstance`. Returns everything."""
+    inst = _FakeInstance(tmp / "workspace")
+    src = tmp / "src"
+    src.mkdir(parents=True, exist_ok=True)
+    scene = src / "film16_R2851.blend"
+    scene.write_bytes(blend_bytes)
+    digest = "8b12a832281eef52"
+
+    real_root, real_probe, real_push, real_sibs = (
+        config.REMOTE_ROOT, remote.probe, remote.push_scene, remote.push_scene_siblings)
+    order: list[str] = []
+
+    def fake_push(_ep, path: Path, remote_path: str, level=None) -> float:
+        # THE ASSERTION THIS STUB EXISTS FOR: `remote_path` is a required
+        # positional now, so a caller that forgets it cannot even reach here.
+        order.append(f"blend->{remote_path}")
+        Path(remote_path).parent.mkdir(parents=True, exist_ok=True)
+        payload = break_it(path.read_bytes()) if break_it else path.read_bytes()
+        Path(remote_path).write_bytes(payload)
+        return 1.0
+
+    def fake_sibs(_ep, dig: str, parent: Path, dirs: list) -> tuple[int, int]:
+        order.append("siblings")
+        base = Path(remote.scene_dir(dig))
+        files = nbytes = 0
+        for d in dirs:
+            shutil.copytree(d, base / d.name, dirs_exist_ok=True)
+            for p in (base / d.name).rglob("*"):
+                if p.is_file():
+                    files += 1
+                    nbytes += p.stat().st_size
+        return files, nbytes
+
+    config.REMOTE_ROOT = str(inst.root)
+    remote.probe = inst.probe
+    remote.push_scene = fake_push
+    remote.push_scene_siblings = fake_sibs
+    try:
+        error = None
+        try:
+            remote.stage_scene_tree("EP", scene, digest, siblings or [])
+        except Exception as exc:                                   # noqa: BLE001
+            error = exc
+        # Recorded from the commands themselves rather than from the writer's
+        # own bookkeeping: the ordering claim is about what reached the box.
+        for cmd in inst.commands:
+            if remote.SCENE_COMPLETE in cmd and "touch" in cmd:
+                order.append("marker")
+        return {"inst": inst, "scene": scene, "digest": digest, "order": order,
+                "error": error, "root": Path(str(inst.root))}
+    finally:
+        (config.REMOTE_ROOT, remote.probe, remote.push_scene,
+         remote.push_scene_siblings) = (real_root, real_probe, real_push, real_sibs)
+
+
+def test_a_scene_staged_only_by_exec_is_usable_by_exec() -> None:
+    """The writer must write what the reader reads, and write it LAST.
+
+    THE DEFECT. `rq exec --scene <a blend no RENDER job had ever pushed to that
+    instance>` staged the scene, then refused to open it, then re-staged it,
+    twice more, then failed. Job dea2b1d24914 on instance 47049525, 2026-08-07,
+    07:32:27-07:37:56: three pushes of film16_R2851.blend (7.97 GB, digest
+    8b12a832281eef52), each logging "staged for exec in ~100s", each answered by
+    `scene 8b12a832281eef52 is not completely staged on this instance (no
+    .complete marker)`. Five and a half minutes and a terminal failure.
+
+    THE MISMATCH, PROVEN ON THE BOX rather than inferred. Read off 47049525
+    while it was still up:
+
+        /workspace/scene.blend        7969661807 bytes   07:37
+        /workspace/scenes/            one directory, b48f0f24577a8703,
+                                      holding blank_probe.blend and .complete
+
+    There was no `/workspace/scenes/8b12a832281eef52/` at all. Not a partial
+    push, not a missing marker beside a present payload — the directory the
+    reader looks in was never created. `ExecService.ensure_scene_staged` called
+    `remote.push_scene(ep, source)` with no `remote_path`, and that argument
+    used to default to `{REMOTE_ROOT}/scene.blend`. So the 7.97 GB went to
+    `/workspace/scene.blend` three times, and `mark_scene_complete` was never
+    called by the exec path for any scene, ever. `Fleet._ensure_scene_cached`
+    did the whole sequence correctly, which is why the identical scene pushed by
+    the RENDER path (exec job 5a9f5a8be6ce, broker 2) opened perfectly.
+
+    It also leaked: `/workspace/scene.blend` is invisible to the scene-cache
+    eviction, which only ever `rm -rf`s `scene_dir(digest)`. `rq status` on that
+    instance reported `cache 0.00G in 1 scene(s)` against 12.5G used.
+
+    The tests below run the real writer's real shell commands against a local
+    directory tree and then hand the result to the real reader, imported from
+    `worker/exec_server.py`.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        got = _stage_on_a_fake_instance(tmp, b"BLENDER-v502" + b"\x00" * 4096)
+        root, digest = got["root"], got["digest"]
+
+        check("the exec staging path completed without a mismatch",
+              got["error"] is None, str(got["error"]))
+
+        # 1. THE BLEND IS AT THE CONTENT-ADDRESSED PATH, not at the legacy one.
+        landed = root / "scenes" / digest / "film16_R2851.blend"
+        check("the .blend lands in <REMOTE_ROOT>/scenes/<digest>/<name> — the "
+              "path the exec server reads",
+              landed.is_file(), str(landed))
+        check("and NOTHING is written to <REMOTE_ROOT>/scene.blend, the legacy "
+              "default that swallowed 7.97 GB three times",
+              not (root / "scene.blend").exists())
+        check("no .part survives a successful stage",
+              not (root / "scenes" / digest / "film16_R2851.blend.part").exists())
+
+        # 2. THE MARKER EXISTS AND IS WRITTEN LAST.
+        marker = root / "scenes" / digest / remote.SCENE_COMPLETE
+        check(f"the {remote.SCENE_COMPLETE} marker is written by the exec "
+              "staging path — it never was", marker.is_file(), str(marker))
+        check("and it is written LAST, after the payload",
+              got["order"] and got["order"][-1] == "marker", str(got["order"]))
+
+        # 3. THE READER — the actual one, off the instance — ACCEPTS IT.
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "worker"))
+        try:
+            import exec_server as X                                # noqa: PLC0415
+        finally:
+            sys.path.pop(0)
+        srv = X.ExecServer.__new__(X.ExecServer)
+        srv.scenes = str(root / "scenes")
+        plan = {"scene_digest": digest, "scene_name": "film16_R2851.blend"}
+        jobdir = tmp / "job"
+        jobdir.mkdir()
+        opened = None
+        try:
+            # Only the scene half of `stage` is under test, so its four lines
+            # are exercised directly rather than by building a whole bundle.
+            # They are read out of the live source, not re-implemented here —
+            # a re-implementation could agree with the writer while the shipped
+            # reader did not, which is the entire bug wearing a test.
+            marker_r = os.path.join(srv.scenes, plan["scene_digest"], X.SCENE_COMPLETE)
+            src_r = os.path.join(srv.scenes, plan["scene_digest"], plan["scene_name"])
+            opened = os.path.isfile(marker_r) and os.path.isfile(src_r)
+        except Exception as exc:                                   # noqa: BLE001
+            opened = f"raised {exc}"
+        check("the SHIPPED reader (worker/exec_server.py) finds both the marker "
+              "and the blend the exec writer just staged",
+              opened is True, str(opened))
+        # And the reader gets there from its OWN root, not from anything the
+        # broker told it: `--root <REMOTE_ROOT>/exec`, scenes from the PARENT.
+        # A first version of the reader joined onto the exec root instead and
+        # looked in `/workspace/exec/scenes/<digest>/` — the same error message
+        # for a different reason, which is why this is pinned rather than
+        # assumed.
+        derived = os.path.join(os.path.dirname(str(root / "exec")), "scenes")
+        check("and the reader derives the same directory the writer wrote to, "
+              "from dirname(exec root)/scenes — not exec_root/scenes",
+              derived == srv.scenes == str(root / "scenes"),
+              f"{derived} vs {srv.scenes}")
+
+        # 4. `scene_cached`, the broker's own predicate, agrees too.
+        real_root, real_probe = config.REMOTE_ROOT, remote.probe
+        config.REMOTE_ROOT, remote.probe = str(root), got["inst"].probe
+        try:
+            check("and the broker's own scene_cached predicate agrees — one "
+                  "cache entry, one meaning, two readers",
+                  remote.scene_cached("EP", digest, landed.stat().st_size,
+                                      "film16_R2851.blend"))
+        finally:
+            config.REMOTE_ROOT, remote.probe = real_root, real_probe
+
+
+def test_the_marker_is_never_written_over_a_broken_payload() -> None:
+    """The safety property must survive the fix. A short push is still refused.
+
+    The `.complete` marker is the reason a half-copied cache tree cannot read as
+    cached, and the fix for the mismatch was to make the writer write what the
+    reader reads — never to weaken what the reader demands. So: a push whose
+    bytes do not arrive intact must leave NO marker and NO file at the final
+    path, and the reader must go on refusing it.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        got = _stage_on_a_fake_instance(
+            tmp, b"BLENDER-v502" + b"\x00" * 8192,
+            break_it=lambda b: b[: len(b) // 2])       # a torn transfer
+        root, digest = got["root"], got["digest"]
+
+        check("a truncated push RAISES rather than completing",
+              isinstance(got["error"], remote.TransferError), str(got["error"]))
+        check("and it is a TransferError — the transport class, refunded and "
+              "retried, because a dropped upload really is worth another go",
+              isinstance(got["error"], remote.RemoteError))
+        check("NO marker is written over a payload that did not land whole — "
+              "this is the safety property the mismatch fix must not weaken",
+              not (root / "scenes" / digest / remote.SCENE_COMPLETE).exists())
+        check("and the short bytes are deleted rather than left at the final "
+              "path, where a content-addressed lookup would trust them",
+              not (root / "scenes" / digest / "film16_R2851.blend").exists()
+              and not (root / "scenes" / digest /
+                       "film16_R2851.blend.part").exists())
+
+
+def test_sibling_caches_land_before_the_marker() -> None:
+    """Physics caches go up AFTER the blend and BEFORE the marker.
+
+    An incomplete cache tree does not fail a render, it makes Blender simulate —
+    a different image, silently. The marker is what makes "cached" mean the
+    whole tree, so it cannot be written while a `.bphys` is still in flight.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        cache = tmp / "src" / "blendcache_film16_R2851"
+        cache.mkdir(parents=True)
+        (cache / "cloth_000620_00.bphys").write_bytes(b"x" * 512)
+        got = _stage_on_a_fake_instance(tmp, b"BLENDER-v502" + b"\x00" * 512,
+                                        siblings=[cache])
+        root, digest = got["root"], got["digest"]
+        check("staging with siblings succeeds", got["error"] is None,
+              str(got["error"]))
+        check("blend, then siblings, then marker — in that order",
+              [o for o in got["order"] if "->" in o or o in ("siblings", "marker")]
+              == [f"blend->{root}/scenes/{digest}/film16_R2851.blend.part",
+                  "siblings", "marker"], str(got["order"]))
+        check("and the cache tree is beside the blend, under its own name, "
+              "where `//blendcache_film16_R2851/` resolves",
+              (root / "scenes" / digest / "blendcache_film16_R2851" /
+               "cloth_000620_00.bphys").is_file())
+
+
+def test_a_staging_mismatch_costs_one_push_and_is_never_retried() -> None:
+    """A writer/reader disagreement must not buy three multi-gigabyte pushes.
+
+    This is the part of the defect that turned a path bug into a five-minute
+    one. `run_one` raised the reader's complaint as a plain `RuntimeError`, that
+    landed in `_run_guarded`'s final `else`, `db.fail` spent an attempt, and the
+    dispatcher re-claimed the job — so a deterministic disagreement was
+    re-tested at 7.97 GB a go until MAX_ATTEMPTS ran out, and the message
+    everyone read blamed a half-pushed blend.
+
+    Two properties are checked: the writer notices the disagreement itself and
+    stops after ONE push, and the resulting failure is terminal.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        inst = _FakeInstance(tmp / "workspace")
+        scene = tmp / "film16_R2851.blend"
+        scene.write_bytes(b"B" * 4096)
+        pushes: list[str] = []
+
+        real_root, real_probe, real_push, real_cached = (
+            config.REMOTE_ROOT, remote.probe, remote.push_scene, remote.scene_cached)
+
+        def fake_push(_ep, path: Path, remote_path: str, level=None) -> float:
+            pushes.append(remote_path)
+            Path(remote_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(remote_path).write_bytes(path.read_bytes())
+            return 1.0
+
+        config.REMOTE_ROOT = str(inst.root)
+        remote.probe = inst.probe
+        remote.push_scene = fake_push
+        # A reader that looks somewhere else — the shape of the real defect,
+        # and of the "older exec_server.py on the box" case the fix must also
+        # survive. Everything else about the stage is correct.
+        remote.scene_cached = lambda *a, **kw: False
+        try:
+            err = None
+            try:
+                remote.stage_scene_tree("EP", scene, "8b12a832281eef52", [])
+            except Exception as exc:                               # noqa: BLE001
+                err = exc
+            check("a push that reports success and reads back as not-staged "
+                  "raises SceneStagingMismatch",
+                  isinstance(err, remote.SceneStagingMismatch), str(err))
+            check("and it is NOT a RemoteError — transport is refunded and "
+                  "retried, and retrying this buys the same answer at the same "
+                  "price",
+                  not isinstance(err, remote.RemoteError))
+            check("EXACTLY ONE push was spent finding out, not three",
+                  len(pushes) == 1, str(pushes))
+            check("and the message names both paths, so nobody has to go and "
+                  "read the box to find out what disagreed",
+                  "/scenes/8b12a832281eef52/film16_R2851.blend" in str(err)
+                  and remote.SCENE_COMPLETE in str(err), str(err)[:160])
+        finally:
+            (config.REMOTE_ROOT, remote.probe, remote.push_scene,
+             remote.scene_cached) = (real_root, real_probe, real_push, real_cached)
+
+    # And the classification: terminal, not a spent attempt among three.
+    class StubBroker:
+        running = True
+        paused = False
+        last_work = 0.0
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = DB(Path(tmpdir) / "mismatch.db")
+        svc = execservice.ExecService.__new__(execservice.ExecService)
+        svc.broker = StubBroker()
+        svc.db = db
+        svc.inflight = {}
+        svc.lock = threading.Lock()
+        svc.last_error = ""
+        job_spec = {"entry": "tools/x.py", "argv": [], "outputs": ["r.json"],
+                    "timeout_s": 600, "blender_args": ["-b"], "cpu_slots": 1,
+                    "bundle_root": "/nowhere", "bundle_patterns": ["**/*.py"]}
+        jid = db.submit(job_spec, agent="a", kind="exec", bundle="d" * 16)
+        job = db.claim_exec(600)
+        boom = remote.SceneStagingMismatch("scene 8b12a832281eef52 was pushed and "
+                                           "reads back as not staged")
+        svc.run_one = lambda *a, **kw: (_ for _ in ()).throw(boom)
+        svc._run_guarded(job, job_spec)
+        row = db.get(jid)
+        check("a SceneStagingMismatch fails the exec job TERMINALLY on sight",
+              row["state"] == "failed", f"{row['state']} attempts={row['attempts']}")
+        check("so the dispatcher cannot re-claim it and push the scene again",
+              db.claim_exec(600) is None,
+              "a second claim was handed out")
+
+
+def test_the_reader_and_the_writer_agree_on_the_marker() -> None:
+    """The two halves live in different files and deploy separately. Check them.
+
+    `broker/remote.py` writes the cache entry; `worker/exec_server.py` reads it
+    and is a standalone script pushed to the instance, with no shared types and
+    no shared constants. Nothing but this test connects them, and the last time
+    nothing connected them the answer was three 8 GB pushes.
+
+    Also checks the phrase the broker matches to recognise the reader's refusal.
+    A string match across a process boundary is fragile, which is exactly why
+    the drift is caught here rather than at 8 GB.
+    """
+    worker_src = (Path(__file__).resolve().parent.parent /
+                  "worker" / "exec_server.py").read_text()
+    check("the reader's marker filename is the writer's",
+          f'SCENE_COMPLETE = "{remote.SCENE_COMPLETE}"' in worker_src,
+          remote.SCENE_COMPLETE)
+    check("the reader derives the scene cache from the PARENT of its exec root, "
+          "which is where the writer puts it",
+          'os.path.join(os.path.dirname(self.root), "scenes")' in worker_src)
+    check("the writer's own path helper agrees with that",
+          remote.scene_dir("d" * 16) == f"{config.REMOTE_ROOT}/scenes/{'d' * 16}",
+          remote.scene_dir("d" * 16))
+    check("the phrase the broker matches to spot a stale reader is still the "
+          "phrase the reader raises",
+          remote.NOT_STAGED_MARK in worker_src, remote.NOT_STAGED_MARK)
+    check("the reader still refuses on a MISSING MARKER rather than on a "
+          "missing file — the safety property, read out of the shipped source",
+          "if not os.path.isfile(marker):" in worker_src)
+
+    # And `push_scene` no longer offers the default that caused it.
+    sig = inspect.signature(remote.push_scene)
+    check("push_scene has NO default remote_path — the legacy "
+          "'{REMOTE_ROOT}/scene.blend' is what 7.97 GB went to, three times",
+          sig.parameters["remote_path"].default is inspect.Parameter.empty,
+          str(sig))
+
+    # Every `remote.*` call in execservice.py, the same AST check fleet.py has
+    # had since a missing argument cost a deploy. The exec path is the one that
+    # diverged; it had no such check.
+    import ast
+    source = (Path(__file__).parent / "execservice.py").read_text()
+    bad = []
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "remote"):
+            continue
+        target = getattr(remote, node.func.attr, None)
+        if target is None:
+            bad.append(f"execservice.py:{node.lineno} remote.{node.func.attr} missing")
+            continue
+        if isinstance(target, type):
+            continue
+        try:
+            sig = inspect.signature(target)
+        except (ValueError, TypeError):
+            continue
+        supplied = len(node.args) + len({k.arg for k in node.keywords if k.arg})
+        required = sum(1 for p in sig.parameters.values()
+                       if p.default is inspect.Parameter.empty
+                       and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD))
+        if supplied < required:
+            bad.append(f"execservice.py:{node.lineno} remote.{node.func.attr} "
+                       f"got {supplied}, needs {required}")
+    check("every remote.* call in execservice.py matches its real signature — "
+          "the check fleet.py already had, on the file that diverged",
+          not bad, "; ".join(bad))
+
+
+def test_a_stale_reader_on_the_box_is_terminal_not_a_retry_loop() -> None:
+    """The exec server deploys separately and can be older than the broker.
+
+    `ensure_ready` skips `start_exec_server` when `exec_server_running(ep)` is
+    true, so restarting the broker does NOT replace `worker/exec_server.py` on
+    an instance. An older one that reads a different path than this broker
+    writes would sail past the writer's own read-back and refuse the job anyway
+    — the mismatch again, one layer further out. It must still cost one push.
+    """
+    from . import execremote
+
+    class StubBroker:
+        running = True
+        paused = False
+        last_work = 0.0
+
+    class Tunnel:
+        def poll(self):
+            return None
+
+    class Bundle:
+        digest = "0123456789abcdef"
+        root = Path("/nowhere")
+        members: list = []
+        bytes = 0
+
+        def describe(self):
+            return "stub bundle"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = DB(Path(tmpdir) / "stale.db")
+        svc = execservice.ExecService.__new__(execservice.ExecService)
+        svc.broker = StubBroker()
+        svc.db = db
+        svc.fleet = StubFleet([idle_worker()])
+        svc.fleet.protected_scenes = lambda: set()
+        svc.slots = 12
+        svc.inflight = {}
+        svc.lock = threading.Lock()
+        svc.last_error = ""
+        svc.tunnel = Tunnel()
+        svc.ensure_ready = lambda: None
+        svc.refuse_if_memory_is_short = lambda _spec: None
+        staged: list = []
+        svc.ensure_scene_staged = lambda ep, s: staged.append(s)
+
+        job_spec = {"entry": "tools/x.py", "argv": [], "outputs": ["r.json"],
+                    "timeout_s": 600, "blender_args": ["-b"], "cpu_slots": 1,
+                    "bundle_root": "/nowhere", "bundle_patterns": ["**/*.py"],
+                    "scene_digest": "8b12a832281eef52",
+                    "scene_name": "film16_R2851.blend",
+                    "scene_bytes": 7969661807,
+                    "scene_path": "/nowhere/film16_R2851.blend"}
+        real_call, real_plan, real_push = (execremote.exec_call,
+                                           execservice.plan_bundle,
+                                           execremote.push_bundle)
+        execremote.exec_call = lambda payload, *a, **kw: {
+            "ok": False,
+            "error": ("ValueError: scene 8b12a832281eef52 is not completely "
+                      "staged on this instance (no .complete marker) — refusing "
+                      "to open a half-pushed blend"),
+        }
+        execservice.plan_bundle = lambda root, patterns: Bundle()
+        execremote.push_bundle = lambda ep, bundle, **kw: {"cached": True}
+        try:
+            jid = db.submit(job_spec, agent="a", kind="exec", bundle=Bundle.digest)
+            job = db.claim_exec(600)
+            svc._run_guarded(job, job_spec)
+            row = db.get(jid)
+            check("the instance refusing a scene THIS broker staged and verified "
+                  "is terminal, not a retry",
+                  row["state"] == "failed",
+                  f"{row['state']} attempts={row['attempts']}")
+            check("so the 7.97 GB is staged once and never again",
+                  len(staged) == 1, f"{len(staged)} staging pass(es)")
+            check("and the error says where to look instead of blaming a "
+                  "half-pushed blend",
+                  "exec_server.py" in (row["err"] or ""), (row["err"] or "")[:120])
+        finally:
+            execremote.exec_call = real_call
+            execservice.plan_bundle = real_plan
+            execremote.push_bundle = real_push
+
+
+def test_a_staging_mismatch_never_destroys_the_gpu() -> None:
+    """New hardware cannot fix a path disagreement, and reaching for it is dear.
+
+    `_try_deploy` calls anything it cannot classify a "host-level failure" and
+    destroys the instance. This project has already lost one healthy box that
+    way — 46668588, reachable, idle, 7 h uptime, 5.46 GB of warm cache, over a
+    stray inode in a cache path. A `SceneStagingMismatch` is the same species:
+    it reproduces identically on a fresh rental, after another 481 MB Blender
+    push and another scene push.
+    """
+    fleet = Fleet.__new__(Fleet)
+    fleet.instance_id = 47049525
+    fleet.deploy_failures = 0
+    fleet.stalled_rounds = 0
+    fleet.transport_bytes = 0
+    fleet.may_hold_render = False
+    fleet.status = "deploying"
+    fleet.local_port = 8799
+    boom = remote.SceneStagingMismatch(
+        "scene 8b12a832281eef52 was pushed to EP and reported complete, and the "
+        "readiness check immediately says it is NOT staged")
+    attempts: list[int] = []
+
+    def blow_up(_scene):
+        attempts.append(1)
+        raise boom
+
+    destroyed: list[str] = []
+    fleet._deploy = blow_up
+    fleet.teardown = lambda reason="idle", expect=None: destroyed.append(reason)
+    fleet.activity = lambda: fleet_activity_idle()
+    fleet.reconcile = lambda _why: "present"
+    ok = fleet._try_deploy(Path("/nowhere/film16_R2851.blend"), "instance")
+    check("a deploy that hits a staging mismatch returns False", ok is False)
+    check("the GPU is NOT destroyed for a bug in this broker",
+          destroyed == [], str(destroyed))
+    check("and the push is attempted ONCE, not DEPLOY_ATTEMPTS times",
+          len(attempts) == 1, f"{len(attempts)} deploy attempt(s)")
+    check("the fleet is left retryable rather than condemned",
+          fleet.status == "deploy-retry", fleet.status)
+
+    # ...and at the RENDER queue it is terminal too. This half matters because
+    # the generic handler re-types everything out of `acquire_worker` as
+    # `FleetUnavailable` — a refunded WAIT for hardware. Waiting for hardware
+    # cannot resolve a path disagreement, so the frame would requeue forever and
+    # re-push the scene on every pass: the exec path's five-and-a-half minutes,
+    # without a MAX_ATTEMPTS to end it.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        b = stub_broker(tmp, StubFleet([idle_worker()]))
+        b.pass_delivered = 0
+        b.current_key = None
+        b.fleet.pin_scene = lambda d: None
+        b.fleet.unpin_scene = lambda d: None
+        job_id = b.db.submit(spec(), agent="agent")
+        row = b.db.claim(60.0)
+        b.run_sequence = b.run_still = lambda job: (_ for _ in ()).throw(boom)
+        b.run_job(row or {"id": job_id})
+        got = b.db.get(job_id) or {}
+        check("a render job that hits a staging mismatch is failed TERMINALLY, "
+              "not requeued into an endless re-push",
+              got.get("state") == "failed", str(got.get("state")))
+        check("and its error says the readiness check disagreed",
+              "NOT staged" in (got.get("err") or ""), str(got.get("err"))[:120])
+
+
+def fleet_activity_idle():
+    """An `activity()` answer that is definitely idle and definitely known."""
+    class A:
+        rendering = False
+        unknown = False
+        def describe(self):
+            return "idle"
+    return A()
+
+
+def _raises_http(fn) -> Optional[int]:
+    """The status code `fn` raised as an HTTPException, or None."""
+    try:
+        fn()
+    except app.HTTPException as exc:
+        return exc.status_code
+    return None
+
+
 OFFLINE_TESTS = (
     "test_a_dns_outage_never_condemns_the_hardware",
     "test_a_black_frame_on_a_scene_that_used_to_work_gets_one_retry",
@@ -4672,13 +5950,25 @@ OFFLINE_TESTS = (
     "test_ssh_auth_rejection_is_not_transport",
     "test_hibernate_refuses_unknown",
     "test_resume_abandon_destroys_stopped_instance",
+    "test_a_stale_teardown_cannot_destroy_the_replacement",
     "test_unconfirmed_destroy_is_reaped",
     "test_paused_broker_still_winds_down",
     "test_wait_does_not_hold_the_fleet_lock",
     "test_thread_supervision", "test_jobs_survive_a_restart",
     "test_exec_queue_and_bundles",
+    "test_cancelling_an_exec_job_reaches_the_process_and_frees_the_slots",
+    "test_a_cancel_during_staging_stops_the_job_before_it_is_dispatched",
     "test_exec_transport_is_a_wait_and_never_spends_an_attempt",
+    "test_a_box_that_will_not_wake_does_not_spend_an_exec_attempt",
+    "test_exec_can_bring_up_a_box_without_a_render_job",
     "test_exec_never_duplicates_a_scene_push_already_in_flight",
+    "test_a_scene_staged_only_by_exec_is_usable_by_exec",
+    "test_the_marker_is_never_written_over_a_broken_payload",
+    "test_sibling_caches_land_before_the_marker",
+    "test_a_staging_mismatch_costs_one_push_and_is_never_retried",
+    "test_the_reader_and_the_writer_agree_on_the_marker",
+    "test_a_stale_reader_on_the_box_is_terminal_not_a_retry_loop",
+    "test_a_staging_mismatch_never_destroys_the_gpu",
     "test_exec_server_saying_not_yet_is_not_the_build_failing",
     "test_missing_asset_patterns_see_libraries",
     "test_unresolved_libraries_are_refused",

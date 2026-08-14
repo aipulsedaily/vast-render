@@ -124,6 +124,29 @@ class ExecMemoryShort(RuntimeError):
     """
 
 
+class ExecGpuRefused(RuntimeError):
+    """The exec server refused this job the GPU. TERMINAL ON SIGHT.
+
+    The mirror of `worker/exec_server.GpuContended`, and its own class for the
+    same reason `StaleBundle` and `SceneStagingMismatch` have theirs: the retry
+    budget is the wrong instrument. The thing the job collided with is the WARM
+    RENDER WORKER, which by design holds its scene for the whole campaign — so
+    three attempts buy three identical refusals, and the third one reports `3/3`
+    as though a build had been tried and found wanting.
+
+    Distinguished from `ExecMemoryShort`, which is the other "the box could not
+    fit this" and is a WAIT, precisely because memory comes back and a resident
+    render scene does not.
+
+    The defect, 2026-08-07: an exec job set `cycles.device = GPU` and put a
+    second 8 GB scene on the same 32 GB card as the render worker's. Another
+    agent's `carhero` render died twice with `Out of memory in CUDA queue
+    enqueue`, terminally the second time. Cancelling the exec job fixed the
+    victim within seconds. Nothing in this broker or that server had any opinion
+    about which process owned the card; both have one now.
+    """
+
+
 class StaleBundle(ValueError):
     """The code changed between submit and dispatch. TERMINAL ON SIGHT.
 
@@ -326,6 +349,21 @@ class ExecService:
         # the only thing that may rent or wake one — but it insists on a scene,
         # because the render path always has one.
         scene = fleet.scene_path or (config.SCENE if config.SCENE.exists() else None)
+        if scene is None and config.EXEC_BOOTSTRAP_SCENE.exists():
+            # Nothing loaded and no render default — so there is no render
+            # workload here to piggyback on, and waiting for one is waiting
+            # forever. Deploy with the bootstrap scene instead; see
+            # config.EXEC_BOOTSTRAP_SCENE for why this is its own knob and not
+            # a default for SCENE.
+            scene = config.EXEC_BOOTSTRAP_SCENE
+            log.info(
+                "no scene is loaded and the default scene %s does not exist, so "
+                "there is no render job to bring a box up — deploying with the "
+                "exec bootstrap scene %s (%.2f MB) instead of waiting for one. "
+                "It exists only so an instance can be rented; the first render "
+                "job switches the worker to its own scene.",
+                config.SCENE, config.EXEC_BOOTSTRAP_SCENE.name,
+                config.EXEC_BOOTSTRAP_SCENE.stat().st_size / 1e6)
         if scene is None:
             # Do NOT raise FileNotFoundError here. It is not in the transport
             # class, so it would burn an attempt and fail the job outright —
@@ -336,9 +374,12 @@ class ExecService:
             # render job to bring a box up.
             raise remote.FleetUnavailable(
                 f"exec needs a deployed instance and there is none: no scene is "
-                f"loaded and the default scene {config.SCENE} does not exist, so "
-                f"there is nothing to deploy with. Queue a render, or set "
-                f"VASTRENDER_SCENE to a real .blend.")
+                f"loaded, the default scene {config.SCENE} does not exist, and "
+                f"neither does the exec bootstrap scene "
+                f"{config.EXEC_BOOTSTRAP_SCENE}. With all three absent there is "
+                f"nothing to deploy with and no render job can be assumed to "
+                f"arrive. Point VASTRENDER_EXEC_BOOTSTRAP_SCENE at a small real "
+                f".blend, or VASTRENDER_SCENE at the assembly.")
         return fleet.ensure_ready(Path(scene))
 
     def ensure_ready(self) -> None:
@@ -398,6 +439,65 @@ class ExecService:
                         "configured for %d — using the server's number, because "
                         "it is the one enforcing it", total, self.slots)
             self.slots = total
+        self.check_deployed_code(pong)
+
+    # The last mismatch reported, so a disagreement is logged once per version
+    # pair rather than on every ping. It is a standing condition, not an event.
+    _reported_code_mismatch: str = ""
+
+    def check_deployed_code(self, pong: dict) -> None:
+        """Is the exec server on the box the one in this tree? ASK, don't assume.
+
+        THE DEFECT. On 2026-08-07 an 8 GB blend was pushed three times to the
+        legacy default `/workspace/scene.blend` and refused three times, and the
+        refusal that exists to make that terminal on first sight did not fire —
+        because the running broker predated its own fix by nearly two hours.
+        `SceneStagingMismatch`'s own message already names the symmetric case as
+        its first hypothesis: "the most likely cause is a stale
+        worker/exec_server.py on the box, which `ensure_ready` will NOT replace
+        while the exec server is running".
+
+        That hypothesis was never checkable. It is now: the exec server hashes
+        itself at startup and reports it on every ping, this broker hashes the
+        file it would have pushed, and the two are compared here — on the path
+        that already runs on every adopt, so nobody has to remember to look.
+
+        Warns, never refuses. A version skew is not automatically wrong (an
+        older server that lacks a field degrades gracefully, by design, in
+        several places in this file), and a broker that refused to dispatch on
+        one would be a broker that stops working every time a deploy is half
+        done. What it must never be is INVISIBLE.
+        """
+        theirs = pong.get("code_sha256")
+        if not theirs:
+            # An older exec server does not report it. Say so once, because
+            # "the field is missing" is itself evidence of an old deploy.
+            if self._reported_code_mismatch != "absent":
+                self._reported_code_mismatch = "absent"
+                log.info("the exec server on this instance does not report its "
+                         "own code hash — it predates the deployed-vs-tree "
+                         "check, which is itself a version skew worth knowing")
+            return
+        src = Path(__file__).resolve().parent.parent / "worker" / "exec_server.py"
+        try:
+            ours = hashlib.sha256(src.read_bytes()).hexdigest()[:12]
+        except OSError:                                        # pragma: no cover
+            return
+        key = f"{ours}!={theirs}"
+        if ours == theirs:
+            self._reported_code_mismatch = ""
+            return
+        if self._reported_code_mismatch == key:
+            return
+        self._reported_code_mismatch = key
+        log.warning(
+            "DEPLOYED CODE DOES NOT MATCH THE TREE: the exec server on this "
+            "instance is sha256:%s and %s is sha256:%s. `ensure_ready` will not "
+            "replace a RUNNING exec server, so this will not fix itself — stop "
+            "it explicitly on an idle box if the difference matters. A fix in "
+            "the tree and not on the box is a fix that does not exist; this is "
+            "the line that says which one you have.",
+            theirs, src, ours)
 
     # --- dispatch --------------------------------------------------------
 
@@ -569,14 +669,37 @@ class ExecService:
                 state=state)
         log.info("staging scene %s (%s, %.2f GB) for exec — the render worker "
                  "is not touched", name, digest[:12], size / 1e9)
-        seconds = remote.push_scene(ep, source)
-        # Sim caches and anything else the blend references relatively. Same
-        # call the render path makes: without them the scene opens and renders
-        # EMPTY rather than failing, which is the silent-wrong-output class.
+        # `stage_scene_tree` AND NOT A SECOND HAND-ROLLED SEQUENCE. This is
+        # where the defect was. The three lines that used to be here were
+        # `push_scene(ep, source)` — no `remote_path`, so the blend went to
+        # `push_scene`'s legacy default `/workspace/scene.blend` — followed by
+        # `push_scene_siblings`, which DID write to the content-addressed
+        # directory, and then nothing. No `.complete` was ever written by this
+        # path, by anyone, for any scene.
+        #
+        # So a scene that reached an instance via `rq exec` was unusable by
+        # `rq exec`, while the same scene on an instance where a RENDER job had
+        # pushed it worked perfectly — because `Fleet._ensure_scene_cached` did
+        # the full sequence. The feature appeared to work for as long as exec
+        # only ever ran on boxes the render path had already warmed.
+        #
+        # Sim caches matter here for the same reason they matter to the render
+        # path: without them the scene opens and renders EMPTY rather than
+        # failing, which is the silent-wrong-output class. They travel inside
+        # `stage_scene_tree`, before the marker, where they cannot be forgotten.
+        #
+        # No `on_phase`: `Fleet.status` narrates the RENDER worker, and an exec
+        # job that reported itself as "uploading-scene" there would read in
+        # `rq status` as the render path doing something it is not doing. The
+        # exec staging lines above and below are this path's own narration.
         siblings = scenes.sibling_dirs_for(source)
-        if siblings:
-            remote.push_scene_siblings(ep, digest, source.parent, siblings)
-        log.info("scene %s staged for exec in %.1fs", digest[:12], seconds)
+        seconds, files, cache_bytes = remote.stage_scene_tree(
+            ep, source, digest, siblings)
+        log.info("scene %s staged for exec in %.1fs — %s, %d sibling cache "
+                 "file(s) (%.1f MB), and %s written last and verified readable "
+                 "by the same check the exec server makes",
+                 digest[:12], seconds, remote.scene_cache_path(digest, name),
+                 files, cache_bytes / 1e6, remote.SCENE_COMPLETE)
 
     def _wait_out_the_frame(self) -> float:
         """Sleep off a busy render worker, HOLDING THIS JOB'S EXEC SLOT.
@@ -620,6 +743,27 @@ class ExecService:
         except Exception as exc:
             why = remote.diagnose(exc)
             self.last_error = why
+            # A CANCELLED JOB IS NOT RETRIED, AND IS NOT REPORTED AS ANYTHING
+            # ELSE. Every writer below already fails safe — `fail`,
+            # `fail_terminal` and `requeue` are all guarded on `state='running'`
+            # and a cancelled row is terminal — so this changes no state. What
+            # it changes is the story: without it, a cancel taken mid-child
+            # comes back through the transport branch and logs "requeued WITHOUT
+            # spending an attempt" about a job that was not requeued, or through
+            # the last branch and logs the deliberate stop at ERROR. Both read
+            # in `rq status -v` as a build that broke.
+            #
+            # And it is the SECOND half of what `rq cancel` has to mean.
+            # MAX_ATTEMPTS is 3, so before the row could go terminal a job that
+            # was cancelled mid-run would be re-dispatched — measured today by
+            # the r2851ab agent, whose crashed 12-minute build was automatically
+            # run a second time in full against code already known to be broken.
+            # Stopping this attempt and not the next one is not a cancellation.
+            row = self.db.get(job_id)
+            if row and row["state"] == "canceled":
+                log.info("exec job %s was canceled — not retried, not failed. "
+                         "The attempt ended with: %s", job_id, why)
+                return
             # An exec job that failed because the INSTANCE went away has not
             # failed — the broker merely lost the box. Requeue without spending
             # an attempt, exactly as the render path refunds a pass that lost
@@ -634,6 +778,46 @@ class ExecService:
                           "retried — the code moved under it, which no number of "
                           "attempts can fix. Resubmit to build the new code: %s",
                           job_id, why)
+            elif isinstance(exc, remote.SceneStagingMismatch):
+                # TERMINAL, AND THE WHOLE POINT IS THAT IT COSTS ONE PUSH.
+                #
+                # Job dea2b1d24914, 2026-08-07, 07:32-07:37: the exec staging
+                # path pushed film16_R2851.blend (7.97 GB) to instance 47049525
+                # and logged "staged for exec in 108.0s"; the exec server then
+                # refused it as "not completely staged". Because the refusal
+                # arrived as a plain `RuntimeError` it landed in the `else`
+                # branch below, `db.fail` spent an attempt, and the dispatcher
+                # re-claimed the job — three 8 GB pushes and three identical
+                # refusals over five and a half minutes, ending in a terminal
+                # failure whose message described a half-pushed blend. The blend
+                # was not half-pushed. It was whole, at a path nothing read.
+                #
+                # Retrying is not merely useless here, it is actively
+                # misleading: the retries are what made a fixed, deterministic
+                # path bug look like a flaky transfer. `stage_scene_tree` now
+                # raises this the moment its own read-back disagrees, so this
+                # branch is reached after ONE push, and the message names both
+                # paths so nobody has to infer them from a stack trace.
+                self.db.fail_terminal(job_id, why)
+                log.error(
+                    "exec job %s FAILED on a SCENE STAGING MISMATCH and will "
+                    "NOT be retried. The push succeeded and the readiness check "
+                    "disagreed — that is a bug in this broker, not a bad "
+                    "transfer, and re-pushing gigabytes to reproduce it is what "
+                    "this refusal exists to prevent. %s", job_id, why)
+            elif isinstance(exc, ExecGpuRefused):
+                # TERMINAL, AND ON THE FIRST REFUSAL. See ExecGpuRefused: the
+                # render worker holds its scene for the whole campaign, so a
+                # retry is not "later", it is the same collision with a longer
+                # log. Logged at ERROR with the server's own sentence, which
+                # names the scene and the card, because the caller's next move
+                # is to resubmit without `--gpu` or as a render job and neither
+                # is guessable from "the job failed".
+                self.db.fail_terminal(job_id, why)
+                log.error("exec job %s was REFUSED THE GPU and will NOT be "
+                          "retried — the card is held by something this broker "
+                          "did not put there, and three attempts would find it "
+                          "held three times: %s", job_id, why)
             elif isinstance(exc, remote.DiskFull):
                 # Terminal, and deliberately not retried — the same rule the
                 # render path applies. The preflight measured the disk, evicted
@@ -731,7 +915,48 @@ class ExecService:
     def run_one(self, job: dict, spec: dict) -> None:
         job_id = job["id"]
         started = time.time()
-        self.ensure_ready()
+        # GETTING A BOX IS NOT THE BUILD, AND ITS FAILURES ARE NOT THIS JOB'S.
+        #
+        # `_run_guarded` refunds the attempt for everything `remote` raises,
+        # on the stated rule that transport is never the caller's code. That
+        # rule was right and the implementation had a hole: `ensure_ready` ends
+        # up in `Fleet.ensure_ready`, and the resume path there raises
+        # `vastctl.NotReachable` — a `VastError`, which is not a `RemoteError`
+        # and never was. So it fell past every refunded branch into the final
+        # `else` and spent one of three attempts.
+        #
+        # Measured 2026-08-07: instance 47040457 hibernated at 04:30, and
+        # vast.ai then would not act on `start_instance` — `actual=exited,
+        # intended=stopped` through three calls, 902 s per resume attempt. Job
+        # 5534329f168f (agent occ-all6, a 2.41 GB bundle) was claimed at
+        # 05:04:52, waited out the whole timeout, and came back
+        # `attempts=2` with `err=NotReachable` — two thirds of its retry budget
+        # gone to a control-plane fault, without a line of its own code having
+        # run. A third would have written `failed` on it for good.
+        #
+        # The render dispatcher already does exactly this, at
+        # `app.py:746` — every non-`WorkerBusy`/`FleetUnavailable`/`DiskFull`
+        # exception out of `acquire_worker` is re-typed as `FleetUnavailable`
+        # so a sequence stops and requeues instead of blaming the frame. This
+        # is the same wrapper on the same reasoning, and it is put HERE rather
+        # than in `_run_guarded` for the same reason it is there: the fix
+        # belongs where the fleet is asked for hardware, so it covers whatever
+        # `Fleet` raises next without needing a new name added to a list.
+        #
+        # `FleetUnavailable` is a refunded WAIT, not a verdict — the job goes
+        # back on the queue and the next claim meets a replacement instance.
+        try:
+            self.ensure_ready()
+        except (remote.WorkerBusy, remote.FleetUnavailable, remote.DiskFull):
+            # Already correctly typed. DiskFull in particular must stay
+            # terminal: re-typing it here would requeue forever against a disk
+            # that cannot grow.
+            raise
+        except Exception as exc:
+            raise remote.FleetUnavailable(
+                f"no instance available for exec job {job_id}: "
+                f"{remote.diagnose(exc)}"
+            ) from exc
         ep = self.fleet.ep
         if ep is None:
             raise remote.FleetUnavailable("no instance endpoint for exec dispatch")
@@ -762,6 +987,41 @@ class ExecService:
         payload["job_id"] = job_id          # broker-minted, always
         payload["bundle"] = bundle.digest
 
+        # A FALSE DECLARATION IS SENT AS SILENCE, AND THAT IS DELIBERATE.
+        #
+        # `worker/exec_server.validate` REJECTS unknown spec fields on purpose —
+        # "this server holds no job policy, so a field it does not understand is
+        # a client bug". That rule is right, and it makes every new optional
+        # field a deploy-order hazard in exactly the direction this whole
+        # incident is about: `ensure_ready` will not replace a RUNNING exec
+        # server, so a freshly restarted broker can be talking to a server from
+        # before `gpu` existed. Sending `gpu: false` to that server would refuse
+        # EVERY exec job on the box, on a field whose whole meaning is "carry
+        # on as before".
+        #
+        # Omitting it costs nothing, because the server defaults it to False and
+        # the clamp is applied on absence exactly as on `false`. The declaration
+        # only ever needs to travel when it is TRUE — which is when it is also
+        # true that an old server, unable to honour it, must refuse rather than
+        # silently run the job on the card.
+        if not payload.get("gpu"):
+            payload.pop("gpu", None)
+
+        # LAST CHECK BEFORE THE CHILD EXISTS. Everything above this line —
+        # ensure_ready, the memory refusal, staging an 8 GB scene, pushing the
+        # bundle — is minutes of work during which the job is `inflight` here
+        # and completely unknown to the exec server, so `ExecService.cancel`
+        # has nothing to signal and plants a tombstone instead. Reading the row
+        # here catches the same window from this side and, unlike the
+        # tombstone, catches it before the pushes rather than after. The row is
+        # flipped terminal by the endpoint before it signals anything, so this
+        # ordering is what makes the check meaningful.
+        row = self.db.get(job_id)
+        if row and row["state"] == "canceled":
+            log.info("exec job %s was canceled while its inputs were being "
+                     "staged — not dispatching it to the instance", job_id)
+            return
+
         renew = threading.Event()
 
         def keep_lease() -> None:
@@ -780,6 +1040,20 @@ class ExecService:
                 payload, timeout=int(spec["timeout_s"]) + execremote.EXEC_CALL_SLACK)
         finally:
             renew.set()
+
+        # A CANCEL IS NOT A FAILURE AND MUST NOT BE RETRIED. The exec server
+        # marks it on the reply, exactly as it marks a `wait`, and for the same
+        # reason: `fail()` on a cancelled row is already a no-op, but it would
+        # log the deliberate stop at ERROR and read in `rq status -v` as a build
+        # that broke. Returning here also releases the job directory, which the
+        # error paths do not.
+        if reply.get("canceled"):
+            log.info("exec job %s: the instance confirms the cancel — %s",
+                     job_id, reply.get("error") or "child stopped")
+            with contextlib.suppress(Exception):
+                execremote.exec_call({"cmd": "release", "job_id": job_id},
+                                     timeout=120)
+            return
 
         if not reply.get("ok"):
             # THE FAR SIDE IS ALLOWED TO SAY "NOT YET". `wait: true` means the
@@ -805,9 +1079,45 @@ class ExecService:
                 raise ExecMemoryShort(
                     f"exec job {job_id} was not admitted by the exec server: "
                     f"{reply.get('error') or 'no reason given'}")
+            # THE FAR SIDE REFUSED THE CARD, AND THAT IS NOT A BUILD FAILURE
+            # EITHER. Same shape as `wait` above and the same reason for
+            # believing the far side: the exec server is the only thing that can
+            # see who holds the GPU, it looked, and it named what it found. An
+            # older exec server does not send this field, in which case the job
+            # is failed exactly as it is today and nothing regresses.
+            if reply.get("gpu_refused"):
+                raise ExecGpuRefused(
+                    f"exec job {job_id} was refused the GPU by the exec server: "
+                    f"{reply.get('error') or 'no reason given'}")
+            err = reply.get("error") or "no reason given"
+            # THE INSTANCE SAYS THE SCENE IS NOT STAGED, AND THIS SIDE JUST
+            # STAGED IT AND VERIFIED IT. That is not a build failure and it is
+            # not a transport failure; it is the reader and the writer looking
+            # at different places, and it is the exact condition that cost three
+            # 8 GB pushes on job dea2b1d24914. Re-typed here so it is terminal
+            # on the FIRST refusal instead of the third.
+            #
+            # `ensure_scene_staged` ran minutes ago in this same call, and it
+            # either found the scene cached or pushed it and read it back
+            # through `scene_cached`. So reaching this line means the broker's
+            # own predicate and the exec server's predicate disagree — most
+            # likely an exec server binary older than this broker, which is a
+            # live possibility because the two deploy separately.
+            if remote.NOT_STAGED_MARK in err and spec.get("scene_digest"):
+                raise remote.SceneStagingMismatch(
+                    f"exec job {job_id}: this broker staged scene "
+                    f"{spec.get('scene_name')} ({str(spec['scene_digest'])[:12]}) "
+                    f"to {remote.scene_dir(spec['scene_digest'])} and verified it "
+                    f"readable, and the exec server on the instance still says: "
+                    f"{err}. The push is NOT being repeated — it would land in "
+                    f"the same place and be refused for the same reason. Two "
+                    f"things read this cache and they do not agree; the most "
+                    f"likely cause is a stale worker/exec_server.py on the box, "
+                    f"which `ensure_ready` will NOT replace while the exec "
+                    f"server is running — stop it explicitly on an idle box.")
             tail = (reply.get("log") or "").strip().splitlines()[-12:]
             raise RuntimeError(
-                f"exec job {job_id} failed: {reply.get('error') or 'no reason given'}"
+                f"exec job {job_id} failed: {err}"
                 + (f" — last lines of the child's log: " + " | ".join(tail) if tail else "")
             )
 
@@ -820,6 +1130,23 @@ class ExecService:
             # it later, so this is logged rather than raised.
             log.warning("could not release exec job %s on the instance (%s) — the "
                         "server's purge will collect it", job_id, remote.diagnose(exc))
+
+        # A CLAMP THAT NOBODY EVER READS IS A SILENT DOWNGRADE. The exec server
+        # gives every undeclared job an empty CUDA_VISIBLE_DEVICES, which is
+        # what keeps a build off the render worker's card — but a build that
+        # WANTED the card and quietly got the CPU is a wrong-looking-right
+        # result, and this project's whole defect log is that shape. So the
+        # files that asked are named here, at WARNING, against the job id.
+        hints = reply.get("gpu_hints") or []
+        if hints and reply.get("gpu_clamped"):
+            log.warning("exec job %s ran CPU-ONLY though %d file(s) in its bundle "
+                        "select a GPU device: %s. Exec jobs are clamped with "
+                        "CUDA_VISIBLE_DEVICES='' unless they declare gpu, because "
+                        "the render worker's scene is resident on that card. If "
+                        "this job really needs the GPU, submit it with --gpu and "
+                        "it will be refused by name when the worker holds the "
+                        "card rather than racing it for VRAM.",
+                        job_id, len(hints), ", ".join(map(str, hints[:6])))
 
         self.db.finish_exec(job_id, [str(p) for p in outputs],
                             float(reply.get("exec_sec") or 0.0))
@@ -875,6 +1202,102 @@ class ExecService:
         if not landed:
             raise RuntimeError(f"exec job {job_id} reported ok with no outputs")
         return landed
+
+    # --- cancellation ----------------------------------------------------
+
+    def cancel(self, job_id: str) -> dict:
+        """Actually stop a dispatched exec job on the instance.
+
+        THE HALF `rq cancel` NEVER HAD. `DELETE /jobs/{id}` flipped a SQLite row
+        and returned `{"canceled": true}`; there was no code path from it to the
+        process. Measured on instance 47040457 on 2026-08-07: job a39bd71095f9
+        was cancelled at 03:46, reported cancelled, and its Blender child kept
+        running until its own `timeout_s` expired at 04:44 — 58 minutes holding
+        6 of 12 exec slots and ~8 GB of a loaded assembly. In that same window
+        two of another agent's jobs were refused by the memory gate (`only
+        10.8G was ever available`, `only 3.7G`) and a third was OOM-killed
+        immediately after `Read blend`. The row said cancelled; the box said
+        otherwise, and the box is what other jobs run on.
+
+        WHAT IS TARGETED, AND WHAT IS NOT. This sends `{"cmd": "cancel",
+        "job_id": ...}` and nothing else. The exec server resolves that id to
+        the `Popen` it created and kills that process's own group. No pattern,
+        no `pgrep`, no name. Two entries in this project's defect log say why
+        that matters and both are about this exact box: a `pkill -f` pattern
+        matching the *remote* command line killed the render worker holding the
+        warm scene, and killing by name is how a stale worker silently served
+        the previous scene. `reap_orphans` is the precedent for the standard —
+        "the honest signal is the working directory" — and it cannot be borrowed
+        here, because every live exec child has a cwd inside the exec root, so
+        it identifies the whole population rather than one member. A job id is
+        strictly narrower than a cwd.
+
+        NEVER RAISES. A cancel that fails because the tunnel is down must still
+        leave the row cancelled — the caller asked for the job to stop, and
+        refusing the whole request because the box is unreachable would be
+        answering "I could not confirm it" with "I did nothing". It reports what
+        happened instead, and an unreachable exec server is a server that is
+        about to be restarted, which runs `reap_orphans` and collects the child
+        anyway.
+
+        WHO IS ASKED IS THE EXEC SERVER, NOT `self.inflight`. That dict is this
+        broker's *belief* about what is running, and this entire defect class is
+        "the row believed something the box did not". It can be wrong in the one
+        direction that matters: a job whose `_run_guarded` thread has already
+        exited — its socket timed out, its tunnel was reset, the broker was
+        restarted and re-adopted the instance — is gone from `inflight` while its
+        child runs on. Observed on 47040457 at 04:20 on 2026-08-07, and it is the
+        worst case rather than an edge one, because an orphan nothing owns is
+        exactly the one no other mechanism will collect: `rq status` showed one
+        exec job in flight and the exec server's own ping showed a different one,
+        `6f0e2c1d110a`, still holding 6 of 12 slots. Trusting `inflight` here
+        would make that job the one kind of orphan `rq cancel` cannot touch.
+
+        So the local view is reported and not obeyed. The remote call is skipped
+        only when the row proves the job was NEVER dispatched — `attempts == 0`,
+        meaning no dispatcher ever claimed it, meaning no child can exist. In
+        every other case the exec server is asked, and it answers `running:
+        false` harmlessly if it does not know the id.
+        """
+        with self.lock:
+            info = self.inflight.get(job_id)
+        row = self.db.get(job_id) or {}
+        attempts = int(row.get("attempts") or 0)
+        if info is None and attempts == 0:
+            # Never claimed by any dispatcher, so no child can exist for it.
+            # Cancelling the row is the whole of the cancellation.
+            return {"dispatched": False, "signalled": False,
+                    "detail": "never dispatched — no attempt was ever claimed, "
+                              "so nothing can be running on the instance"}
+        if self.tunnel is None or self.tunnel.poll() is not None:
+            log.warning("exec job %s cancel: no live tunnel to the exec server, so "
+                        "the child could not be signalled. The row is cancelled; "
+                        "the child will be reaped by reap_orphans when the exec "
+                        "server next starts.", job_id)
+            return {"dispatched": info is not None, "signalled": False,
+                    "error": "no live tunnel to the exec server",
+                    "detail": "the job row is cancelled but the child on the "
+                              "instance could NOT be signalled"}
+        try:
+            reply = execremote.exec_call({"cmd": "cancel", "job_id": job_id},
+                                         timeout=120)
+        except Exception as exc:
+            why = remote.diagnose(exc)
+            log.warning("exec job %s cancel: the exec server could not be reached "
+                        "(%s) — the row is cancelled but the child was not "
+                        "signalled", job_id, why)
+            return {"dispatched": info is not None, "signalled": False,
+                    "error": why,
+                    "detail": "the job row is cancelled but the child on the "
+                              "instance could NOT be signalled"}
+        log.info("exec job %s canceled on the instance: %s", job_id,
+                 reply.get("detail") or reply)
+        return {"dispatched": info is not None, "signalled": True,
+                "killed": bool(reply.get("killed")),
+                "was_running": bool(reply.get("running")),
+                "pid": reply.get("pid"), "pgid": reply.get("pgid"),
+                "detail": reply.get("detail"),
+                "cpu_slots": (info or {}).get("cpu_slots")}
 
     # --- reporting -------------------------------------------------------
 

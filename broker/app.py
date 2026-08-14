@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -737,11 +738,20 @@ class Broker:
         if reply is None:
             try:
                 reply = self.acquire_worker(key, scene, row_id=row_id)
-            except (remote.WorkerBusy, remote.FleetUnavailable, remote.DiskFull):
+            except (remote.WorkerBusy, remote.FleetUnavailable, remote.DiskFull,
+                    remote.SceneStagingMismatch):
                 # DiskFull passes through untouched. Re-typed as FleetUnavailable
                 # below it would be requeued forever against a disk that cannot
                 # grow — the queue would spin, the GPU would bill, and the one
                 # message naming the sizes would be buried under retries.
+                #
+                # SceneStagingMismatch is here for exactly that reason. It means
+                # the scene was pushed, reported complete, and read back as not
+                # staged — a disagreement inside this broker about where a cache
+                # entry lives. `FleetUnavailable` is a refunded WAIT for
+                # hardware, and waiting for hardware cannot resolve it: the
+                # queue would requeue this frame forever and re-push the scene
+                # on every pass. It goes terminal below, with DiskFull.
                 raise
             except Exception as exc:
                 # Getting a worker failed. That is the fleet's problem — no
@@ -978,6 +988,21 @@ class Broker:
             self.db.fail_terminal(job_id, remote.diagnose(exc))
             log.error("job %s FAILED on DISK and will NOT be retried — %s",
                       job_id, remote.diagnose(exc))
+        except remote.SceneStagingMismatch as exc:
+            # Terminal for the same reason as DiskFull, and for a sharper one:
+            # every retry re-pushes the scene. The bytes landed and the broker
+            # then could not find what it had just written; that is a bug in
+            # this code, it reproduces exactly, and it reproduces at gigabytes
+            # per attempt. Measured on the exec side of the same cache, where it
+            # was NOT terminal: exec job dea2b1d24914 pushed 7.97 GB three times
+            # in five and a half minutes to learn the same thing three times.
+            # The GPU is not at fault and is not touched.
+            self.db.fail_terminal(job_id, remote.diagnose(exc))
+            log.error("job %s FAILED on a SCENE STAGING MISMATCH and will NOT be "
+                      "retried — the push succeeded and the readiness check "
+                      "disagreed, which no number of retries resolves and every "
+                      "retry pays for in gigabytes. This is a broker bug, not a "
+                      "bad GPU: %s", job_id, remote.diagnose(exc))
         except scenes.SceneError as exc:
             # The .blend named by the job is not there — or is not a .blend, or
             # is outside every configured scene root. A verdict about the
@@ -1379,10 +1404,17 @@ class Broker:
         if not self.fleet.instance_id:
             return
 
+        # Read ONCE, and hand the ID to every decision made from it. Everything
+        # below is read outside `Fleet.lock` and acted on inside it, and that
+        # lock is held across resumes, rents and deploys — ten minutes is
+        # normal. `expect=` is what makes the fleet refuse a stale verdict; see
+        # `Fleet.teardown`, which lost a fully deployed instance to this.
+        doomed = self.fleet.instance_id
+
         if self.fleet.stopped_at:
             if self.fleet.hibernated_for > config.HIBERNATE_SEC:
                 log.info("hibernated %.0f min — destroying", self.fleet.hibernated_for / 60)
-                self.fleet.teardown("hibernation expired")
+                self.fleet.teardown("hibernation expired", expect=doomed)
             return
 
         idle = time.time() - self.last_work
@@ -1449,7 +1481,7 @@ class Broker:
 
             log.info("idle %.0fs — stopping instance (disk kept)", idle)
             try:
-                self.fleet.hibernate(force=stop_blind)
+                self.fleet.hibernate(force=stop_blind, expect=doomed)
             except remote.WorkerBusy as exc:
                 # The fleet re-checked under its own lock and found a render.
                 # Two checks disagreeing is exactly what a flapping endpoint
@@ -1459,7 +1491,10 @@ class Broker:
                 self.idle_unknown_since = None
             except Exception as exc:
                 log.error("stop failed (%s) — destroying instead", remote.diagnose(exc))
-                self.fleet.teardown("stop failed")
+                # Same `expect` rule: `hibernate` can block on the fleet lock
+                # for as long as a resume takes, so "the stop failed" may be
+                # news about an instance that has since been replaced.
+                self.fleet.teardown("stop failed", expect=doomed)
 
     def total_spend(self) -> float:
         """Everything spent across every instance this database has seen.
@@ -2330,9 +2365,51 @@ async def get_result(job_id: str):
 
 @app.delete("/jobs/{job_id}")
 async def cancel(job_id: str):
-    if not broker.db.get(job_id):
+    """Cancel a job, and for an exec job actually STOP IT ON THE BOX.
+
+    This used to be one line — `broker.db.cancel(job_id)` — and for a render job
+    that is still the whole of it: the render worker is a single warm process
+    serving one frame at a time, the row going terminal is what stops the next
+    dispatch, and `db.finish` refuses to write `done` over a cancelled row, so a
+    frame already in flight cannot resurrect it. Nothing about that path changes
+    here.
+
+    An exec job is a different shape and the same line was a lie about it.
+    Twelve children run at once, each in its own process group, each holding
+    slots and gigabytes, and none of them read SQLite. Instance 47040457,
+    2026-08-07: job a39bd71095f9 was cancelled at 03:46 and answered
+    `{"canceled": true}`; its Blender child ran on until its own `timeout_s`
+    expired at 04:44, holding 6 of 12 slots and ~8 GB the whole time. The same
+    log window has another agent's jobs refused by the memory gate for want of
+    exactly that memory, and one OOM-killed at `Read blend`.
+
+    ORDER MATTERS, AND IT IS ROW FIRST. `db.cancel` is what makes the state
+    terminal, and every path that could write over it — `fail`, `fail_terminal`,
+    `requeue`, `finish`, `finish_exec` — is guarded on `state='running'`. So
+    flipping first means the job thread's reaction to its child being killed
+    cannot turn a cancel into a `failed`, and cannot spend an attempt and
+    requeue it. Signalling first and flipping second would have both of those
+    races.
+
+    OFF THE EVENT LOOP. The remote call goes through the exec tunnel and waits
+    on SIGTERM-then-SIGKILL, up to fifteen seconds. The loop is what answers
+    `rq status`, and a handler that blocks on a socket here is how a busy broker
+    starts looking dead.
+    """
+    job = broker.db.get(job_id)
+    if not job:
         raise HTTPException(404, f"no such job: {job_id}")
-    return {"canceled": broker.db.cancel(job_id)}
+    canceled = broker.db.cancel(job_id)
+    reply = {"canceled": canceled, "kind": job.get("kind") or "render",
+             "was": job.get("state")}
+    if (job.get("kind") or "render") != "exec":
+        return reply
+    # Even when the row was ALREADY terminal, because the two can disagree and
+    # this is the endpoint that exists to reconcile them: a job whose row was
+    # failed or cancelled by an earlier call may still have a child running on
+    # the instance, and that child is the thing holding the slots.
+    reply["exec"] = await asyncio.to_thread(broker.execsvc.cancel, job_id)
+    return reply
 
 
 @app.get("/queue")
@@ -2513,10 +2590,60 @@ async def teardown():
     return snap
 
 
+def log_own_code() -> None:
+    """Write this process's OWN start time and module hashes to the log. Once.
+
+    THE DEFECT THIS IS FOR, 2026-08-07. The exec staging path pushed an 8 GB
+    blend to the legacy default `/workspace/scene.blend` and the exec server
+    refused it — which is exactly the condition `SceneStagingMismatch` was
+    written to make terminal on first sight. The refusal never fired, because:
+
+        broker process started      05:51
+        broker/execservice.py fixed 07:45
+
+    The running process predated its own fix. Everyone debugging the incident,
+    including the agent that wrote the fix, was reading a file nothing was
+    executing. **A fix in the tree and not on the box is a fix that does not
+    exist**, and there was no artefact anywhere that could have said so.
+
+    There is one now, and it is written at startup rather than on request,
+    because the moment it is needed is after the fact — reading yesterday's log
+    to find out what yesterday's broker was running. `scripts/drift.py` answers
+    the same question about a LIVE process from /proc; this answers it about a
+    dead one from its log, and the two together mean the question is always
+    answerable.
+
+    Cheap by construction: a few hundred KB of sha256 once per process start.
+    It never raises — a broker that will not start because it could not hash
+    itself is a far worse failure than the one this prevents.
+    """
+    try:
+        root = Path(__file__).resolve().parent.parent
+        rows = []
+        for pattern in ("broker/*.py", "worker/*.py", "vastctl/*.py", "rq"):
+            for path in sorted(root.glob(pattern)):
+                if not path.is_file():
+                    continue
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+                rows.append(f"{path.relative_to(root)}={digest}"
+                            f"@{time.strftime('%m-%dT%H:%M', time.localtime(path.stat().st_mtime))}")
+        log.info("CODE THIS PROCESS LOADED (pid %d, started %s, cwd %s): %s",
+                 os.getpid(), time.strftime("%Y-%m-%d %H:%M:%S"), os.getcwd(),
+                 " ".join(rows))
+        # The worker files are the ones that deploy separately and therefore
+        # drift hardest — `SceneStagingMismatch` names "a stale
+        # worker/exec_server.py on the box" as its most likely cause. Their
+        # hashes are in the line above so a later reader can compare what this
+        # broker WOULD have pushed against what the instance answered with.
+    except Exception as exc:                                   # pragma: no cover
+        log.warning("could not hash this process's own code: %s", exc)
+
+
 def main() -> None:
     import uvicorn
 
     diagnostics.install("main")
+    log_own_code()
     if os.environ.get("VASTRENDER_SUPERVISED") == "1":
         # Started by scripts/brokerd.sh. Tie our life to the supervisor's so a
         # dead supervisor can never leave an unsupervised broker holding the

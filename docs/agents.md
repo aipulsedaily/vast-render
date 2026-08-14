@@ -394,6 +394,13 @@ renders. Prefer fewer, deliberate renders over spraying variations.
 ./rq cancel <id>
 ```
 
+`cancel` on an **exec** job now stops the child on the instance, not just the
+row: the broker asks the exec server to kill that job's process group, the slots
+are released, and the job is not retried. The reply carries an `exec` section
+saying whether the child was actually signalled — if the box was unreachable the
+row is still cancelled, and the child is collected by `reap_orphans` when the
+exec server next starts. A `render` cancel is unchanged.
+
 `status` reports live spend for the session, so you can see what a batch is
 costing while it runs.
 
@@ -576,6 +583,7 @@ twelve of these run at once; wave 1 produced 28 GB of test blends.
 | `--timeout N` | seconds; hard kill of the child's whole process group. Max 3600 |
 | `--slots N` | exec slots the job occupies (default 1) |
 | `--blender-arg V` | flags for Blender itself; default `-b --factory-startup` |
+| `--gpu` | **declare** that this job uses the card. Off by default and enforced off — see below |
 | `--wait` | block until it finishes and print the fetched paths |
 
 `./rq status` shows exec slots in use and what is running in each.
@@ -588,3 +596,49 @@ undeclared comes back. It is not a defence against a script that means harm.
 
 It does not give you a GPU. Cycles renders still go through `rq render`; an
 exec child gets CPUs. Build remotely, then render the result remotely.
+
+**And that is now enforced rather than assumed.** Every exec child is launched
+with an empty `CUDA_VISIBLE_DEVICES`, so `scene.cycles.device = 'GPU'` in your
+script finds zero devices and Cycles renders on the CPU. If files in your bundle
+select a GPU device, they are named in the broker log at WARNING against your
+job id — the clamp is never silent.
+
+`--gpu` opts out, and the exec server then checks who holds the card **before**
+admitting the job. If the render worker is on it, the job is **refused by name**
+("refusing <id>: the render worker holds <scene> on <card>") and failed
+terminally on the first refusal — not retried, because the render worker holds
+its scene for the whole campaign and three attempts buy three identical
+collisions.
+
+Why: on 2026-08-07 an exec job set `cycles.device = GPU` and put a second 8 GB
+film scene on the same 32 GB card as an already-warm render worker. Another
+agent's render died twice with `Out of memory in CUDA queue enqueue`, the second
+time terminally. VRAM is the one resource on the box with no cgroup, no gate and
+no OOM score to bias: the card either fits both scenes or it kills one, and
+which one it kills is not a decision anybody made.
+
+## Is the broker running the code you are reading? — `rq drift`
+
+```bash
+./rq drift          # every broker on this box; exit 1 if anything drifted
+./rq drift --all    # every tracked file, not only the drifted ones
+```
+
+It reads `/proc` — never the broker's HTTP API, because "is that process running
+the code I am reading?" is the one question a process running the wrong code can
+answer wrongly. It compares each broker's start time and its bytecode cache
+against the tree, per file, with three verdicts: `STALE`, `ok`, and `?` for what
+cannot be determined. `?` is never rendered as `ok`.
+
+Why: on 2026-08-07 an 8 GB blend was pushed three times to a path nothing read,
+and the refusal written to make that terminal on first sight never fired —
+because the broker process had started at 05:51 and the fix landed at 07:45.
+Everyone debugging it, including the agent who wrote the fix, was reading a file
+nothing was executing. **A fix in the tree and not on the box is a fix that does
+not exist.**
+
+`rq drift` never restarts anything. A restart re-claims jobs mid-flight, so it
+is a human decision. Two more places now carry the same fact: the broker logs
+its own module hashes at startup, and the exec server reports `code_sha256` on
+every ping — which the broker compares against the file it would have pushed and
+warns about once when they differ.

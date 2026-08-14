@@ -135,6 +135,7 @@ EXEC_REQUIRED = frozenset({
 EXEC_OPTIONAL = frozenset({
     "scene_digest",  # digest of a scene already in this instance's scene cache
     "scene_name",    # bare filename INSIDE that digest's directory
+    "gpu",           # bool; DECLARE that this job wants the card. See below.
 })
 
 JOB_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -158,6 +159,13 @@ SLOT_WAIT_MAX_S = 600
 MAX_REQUEST_BYTES = 1 << 20
 LOG_TAIL_CHARS = 4000
 BUNDLE_COMPLETE = ".complete"
+# The SAME name, for the scene cache the render path fills, and spelled out
+# separately because it is read from a directory this server never writes.
+# `broker/remote.py` writes it (`SCENE_COMPLETE`) and mirrors this phrase as
+# `NOT_STAGED_MARK` so a refusal from here is recognisable on that side as a
+# path disagreement rather than a failed build. Keep the three in step; there is
+# a test on both sides that reads the other's source and fails if they drift.
+SCENE_COMPLETE = ".complete"
 
 # Blender flags that would give the spec a second way to execute code. `entry`
 # is the one sanctioned entry point precisely so there is one place to
@@ -173,6 +181,28 @@ _PRINT_LOCK = threading.Lock()
 def log(msg: str) -> None:
     with _PRINT_LOCK:
         print(f"[exec] {msg}", flush=True)
+
+
+def self_digest() -> str:
+    """sha256 of THIS FILE, so a deployed copy can be compared to the tree.
+
+    The broker pushes this file and starts it, and the two sides then live
+    independently — `ensure_ready` will not replace a running exec server. So
+    the only honest answer to "which version is on the box?" is one the box
+    gives, and it is 12 hex characters in the startup log and on every ping.
+    """
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()[:12]
+    except OSError:                                          # pragma: no cover
+        return "unknown"
+
+
+def self_mtime() -> float:
+    try:
+        return os.path.getmtime(os.path.abspath(__file__))
+    except OSError:                                          # pragma: no cover
+        return 0.0
 
 
 # --- memory ---------------------------------------------------------------
@@ -228,6 +258,272 @@ class ResourceWait(RuntimeError):
     one crosses as `wait: true` on the reply, and the broker turns it back into
     the wait it always was.
     """
+
+
+class Canceled(RuntimeError):
+    """Somebody asked for this job to stop. IT IS NOT A FAILURE OF THE BUILD.
+
+    Its own class for the same reason `ResourceWait` has one: the distinction
+    has to survive the wire, or the broker's `run_one` reads the non-ok reply as
+    "the caller's script is broken" and spends an attempt retrying work that was
+    deliberately stopped. It crosses as `canceled: true` on the reply.
+
+    The defect this exists for, measured on instance 47040457 on 2026-08-07:
+    `rq cancel a39bd71095f9` returned `{"canceled": true}` at 03:46 and the
+    remote Blender child kept running until its own `--timeout` expired at
+    04:44, holding 6 of 12 exec slots and about 8 GB of an assembly the whole
+    time. In the same window two of another agent's jobs were refused by the
+    memory gate (`only 10.8G was ever available`, `only 3.7G was ever
+    available`) and one was OOM-killed at `Read blend`. The broker's cancel
+    flipped a SQLite row and there was no path from it to the process. There is
+    one now.
+    """
+
+
+class GpuContended(RuntimeError):
+    """This job asked for the card and somebody else is holding it. TERMINAL.
+
+    THE DEFECT. This server is designed around a CPU-only assumption — every
+    sizing decision in this file is about a 23-CPU cgroup quota and a 90 GiB
+    memory cap, and `deprioritise_for_oom` exists specifically to keep an exec
+    child from being the thing that survives a squeeze the render worker loses.
+    Nothing enforced the assumption. A caller-supplied script is caller-supplied
+    Python: it can set `scene.cycles.device = 'GPU'` on line one, and until this
+    class existed the exec server would run it.
+
+    Measured on 2026-08-07: an exec job set `cycles.device = GPU` and put a
+    second 8 GB film scene on the same 32 GB card as an already-warm render
+    worker holding its own scene. Another agent's `carhero` render died with
+    `Out of memory in CUDA queue enqueue` TWICE, the second time terminally.
+    Cancelling the exec job fixed the victim within seconds; the re-run was
+    CPU-only and fine. VRAM is the one resource on this box with no cgroup, no
+    gate and no OOM score to bias — the card either fits both scenes or it kills
+    one of them, and which one it kills is not a decision anybody made.
+
+    WHY TERMINAL AND NOT A `ResourceWait`. A `ResourceWait` says "the moment is
+    not right", and it is right for memory because sibling builds end. The
+    render worker does not end: it is a WARM process holding a resident scene
+    for the whole campaign, by design and as the entire reason it exists. A wait
+    on that clears when the fleet tears the instance down, which is not a wait,
+    it is a queue that never drains — the job would sit through
+    SLOT_WAIT_MAX_S, be requeued without spending an attempt, and come back
+    forever. So this crosses the wire as `gpu_refused: true` and the broker
+    fails it terminally, on the FIRST refusal, the way `SceneStagingMismatch`
+    is failed.
+
+    WHY A REFUSAL AND NOT A DOWNGRADE. A downgrade to CPU is what
+    `CUDA_VISIBLE_DEVICES=""` already does for every job that did not declare
+    `gpu` (see `run_child`), and that clamp is the real protection because it
+    cannot be argued with. But a job that DECLARED `gpu: true` said something,
+    and silently doing the opposite of what it said is how this defect stayed
+    invisible in the first place. A declaration that is quietly ignored teaches
+    nobody anything; a refusal that names the scene and the card teaches the
+    caller exactly what it collided with.
+    """
+
+
+# --- the GPU --------------------------------------------------------------
+#
+# There is no cgroup for VRAM. `memory.max` bounds this container's RAM and
+# `await_memory` gates on it; the card has nothing of the kind, so two processes
+# that each fit alone will both be admitted and one of them will die inside
+# CUDA. Every function below therefore answers the only question that matters —
+# "is somebody else on the card right now" — by looking, and answers it in the
+# same THREE states `memory_available` and `remote.Activity` use: yes, no, and
+# "I could not tell". "I could not tell" is never rendered as "no".
+
+NVIDIA_SMI_TIMEOUT_S = 20.0
+
+# Source patterns that select a GPU device in Cycles. Advisory ONLY — used to
+# WARN, never to refuse. A regex over caller-supplied Python is trivially
+# defeated (`getattr(cy, "dev" + "ice")`) and just as trivially false-positived
+# (the string in a comment, a docstring, a branch behind a flag that is off), so
+# it is worth exactly one log line and one field on the reply. The enforcement
+# is `CUDA_VISIBLE_DEVICES` in `run_child`, which does not care what the source
+# looks like.
+GPU_SOURCE_PATTERNS = (
+    re.compile(rb"""cycles\s*\.\s*device\s*=\s*['"]GPU['"]"""),
+    re.compile(rb"""\.device\s*=\s*['"]GPU['"]"""),
+    re.compile(rb"""compute_device_type\s*=\s*['"](CUDA|OPTIX|HIP|ONEAPI|METAL)['"]"""),
+    re.compile(rb"""get_devices_for_type\s*\("""),
+    re.compile(rb"""cycles_compute_device"""),
+)
+
+MAX_SCAN_BYTES = 4 << 20          # per file; a .py bigger than this is not code
+
+
+def scan_for_gpu(root: str, limit: int = 4000) -> list[str]:
+    """Every .py under `root` that looks like it selects a GPU device.
+
+    Returns paths relative to `root`. Bounded by `limit` files so a bundle that
+    accidentally includes a site-packages tree cannot turn admission into a
+    filesystem walk of unknown length. Never raises: this is a warning, and a
+    warning that can break a build is worse than no warning.
+    """
+    hits: list[str] = []
+    seen = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in ("__pycache__", ".git")]
+            for name in filenames:
+                if not name.endswith(".py"):
+                    continue
+                seen += 1
+                if seen > limit:
+                    return hits
+                full = os.path.join(dirpath, name)
+                try:
+                    if os.path.getsize(full) > MAX_SCAN_BYTES:
+                        continue
+                    with open(full, "rb") as fh:
+                        blob = fh.read()
+                except OSError:
+                    continue
+                if any(p.search(blob) for p in GPU_SOURCE_PATTERNS):
+                    hits.append(os.path.relpath(full, root))
+    except OSError:
+        pass
+    return hits
+
+
+def gpu_compute_apps() -> Optional[list[dict]]:
+    """Every process on the card and how much VRAM it holds, or None.
+
+    None means UNKNOWABLE, not empty: no `nvidia-smi` on PATH, a driver that
+    will not answer, a timeout. A container can also be unable to see other
+    namespaces' pids while still seeing their memory, in which case pid comes
+    back as 0 — that is still a holder, and it is still reported.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-compute-apps=pid,used_gpu_memory,process_name",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=NVIDIA_SMI_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    apps: list[dict] = []
+    for line in out.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            pid = 0
+        try:
+            mib = int(parts[1])
+        except ValueError:
+            mib = 0
+        apps.append({"pid": pid, "vram_mib": mib,
+                     "name": parts[2] if len(parts) > 2 else ""})
+    return apps
+
+
+def gpu_names() -> list[str]:
+    """The card(s) this box has, for naming what is being protected."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total",
+                              "--format=csv,noheader"],
+                             capture_output=True, text=True,
+                             timeout=NVIDIA_SMI_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [line.strip() for line in out.stdout.splitlines() if line.strip()]
+
+
+def proc_cmdline(pid: int) -> list[str]:
+    """This pid's argv, or [] if it is gone or not ours to read."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return []
+    return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+
+
+def render_worker(workspace: str) -> Optional[dict]:
+    """The render worker's pid and the scene it holds, or None if it is not up.
+
+    IDENTIFIED THE SAME WAY `reap_orphans` identifies what it must NOT touch:
+    by the exact thing `remote.worker_launch_cmd` builds, which is
+
+        <root>/blender/blender -b <blend> -P <root>/server.py -- --port ...
+
+    So the signal is the literal `-P <workspace>/server.py` token — not the name
+    "blender", which on this box also matches this server, twelve exec children
+    and any orphan of either. `pkill -f blender` is in this project's defect log
+    twice over and this file will not add a third entry.
+
+    The scene comes free: `-b <blend>` is on the same argv, so "the worker holds
+    <scene>" is READ, not inferred and not tracked in a state file somebody has
+    to remember to update. Nothing is signalled, opened, connected to or asked —
+    the render worker is strictly serial and a ping to it blocks for the length
+    of a 4K frame, which is precisely the moment this answer is needed.
+    """
+    marker = os.path.join(workspace, "server.py")
+    try:
+        entries = os.listdir("/proc")
+    except OSError:                                      # pragma: no cover
+        return None
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        argv = proc_cmdline(pid)
+        if not argv:
+            continue
+        try:
+            i = argv.index("-P")
+        except ValueError:
+            continue
+        if i + 1 >= len(argv) or os.path.realpath(argv[i + 1]) != os.path.realpath(marker):
+            continue
+        if not proc_alive(pid):
+            continue
+        # The blend is positional after `-b`, but it is positional, so the
+        # honest read is "the argv token that is a .blend" with the position
+        # after `-b` as the preferred one. A worker whose scene cannot be named
+        # is still a worker; `scene` being None must not make this return None.
+        scene = None
+        if "-b" in argv:
+            j = argv.index("-b")
+            if j + 1 < len(argv) and argv[j + 1].endswith(".blend"):
+                scene = argv[j + 1]
+        if scene is None:
+            scene = next((a for a in argv if a.endswith(".blend")), None)
+        return {"pid": pid, "scene": scene, "rss_bytes": proc_rss(pid)}
+    return None
+
+
+class _Child:
+    """One admitted job's kill handle, and the only thing `cancel` targets.
+
+    NOT a name pattern. `pkill -f blender` on this box kills the render worker
+    holding a multi-gigabyte warm scene, and killing by name is also how a stale
+    worker silently served the previous scene — both already in the project's
+    defect log. `reap_orphans` picks its victims by cwd because "the honest
+    signal is the working directory"; a cancel can do better still, because it
+    knows the job id and therefore the exact `Popen` and the exact process group
+    that `start_new_session=True` created for it. Nothing else can be signalled
+    through this object even in principle.
+
+    `proc` is None between admission and the fork. That window is real — memory
+    waits there for up to ten minutes — so `canceled` is a flag as well as a
+    kill, and `event` wakes the waiter instead of making it sit out its poll.
+    """
+
+    __slots__ = ("proc", "canceled", "event", "started")
+
+    def __init__(self) -> None:
+        self.proc: Optional[subprocess.Popen] = None
+        self.canceled = False
+        self.event = threading.Event()
+        self.started = time.time()
 
 
 def memory_available() -> Optional[int]:
@@ -467,6 +763,19 @@ class ExecServer:
         # has started allocating". Without it twelve threads all read the same
         # comfortable number in the same millisecond and all admit.
         self.admit_lock = threading.Lock()
+        # job_id -> _Child, for every job between admission and reply. This is
+        # the whole of `cancel`'s reach: a job id that is not in here cannot be
+        # signalled, so no request can name a process this server did not start.
+        self.children: dict[str, _Child] = {}
+        self.child_lock = threading.Lock()
+        # job_id -> when it was cancelled, for cancels that arrived BEFORE the
+        # job did. See `handle_cancel`: the broker considers a job dispatched
+        # from the moment it hands it to a thread, and that thread may spend
+        # minutes pushing a bundle and an 8 GB scene before this server ever
+        # hears the job id. A cancel in that window has nothing to signal, and
+        # without a record of it the child starts afterwards — which is the
+        # original defect with a smaller window rather than a fix.
+        self.canceled_ids: dict[str, float] = {}
         self.slots = Slots(slots)
         self.started = time.time()
         self.jobs = 0
@@ -475,6 +784,11 @@ class ExecServer:
         # restart leaked, without anyone having to be logged into the instance
         # at the moment it happened.
         self.orphans_reaped: dict = {"count": 0, "rss_bytes": 0, "pids": []}
+        # job_id -> admitted-at, for every job that DECLARED `gpu: true` and was
+        # let through. Reported by `ping` so the broker can answer the reverse
+        # question — "may I start a render worker on this card right now?" —
+        # without having to guess from VRAM totals. See `gpu_state`.
+        self.gpu_jobs: dict[str, float] = {}
         self._count_lock = threading.Lock()
         os.makedirs(self.root, exist_ok=True)
         os.makedirs(self.bundles, exist_ok=True)
@@ -623,6 +937,101 @@ class ExecServer:
         """
         return os.path.isfile(os.path.join(self.bundle_dir(digest), BUNDLE_COMPLETE))
 
+    # --- the GPU ---------------------------------------------------------
+
+    @property
+    def workspace(self) -> str:
+        """The instance root, /workspace — the PARENT of the exec root.
+
+        Same derivation and same reason as `self.scenes`: `--root` is
+        /workspace/exec, and both the render worker and its server.py live one
+        level up. Joining onto self.root is the mistake that made a resident
+        scene read as "not completely staged"; it would make a live render
+        worker read as absent here, which is the more expensive direction.
+        """
+        return os.path.dirname(self.root)
+
+    def gpu_state(self) -> dict:
+        """Who is on the card, in three states. Never raises, never signals.
+
+        `holder` is the answer this exists for and it has three values:
+
+          * a dict          — somebody else is demonstrably on the card
+          * None            — demonstrably nobody is
+          * the "unknown" key is set when it COULD NOT BE DETERMINED, and then
+            `holder` is None only if the render worker is also absent
+
+        The render worker is the authoritative signal and it is read from /proc,
+        so it is available even when `nvidia-smi` is not — which is the case
+        that matters, because the container may not see other namespaces' pids
+        while the card is very much occupied.
+        """
+        worker = render_worker(self.workspace)
+        apps = gpu_compute_apps()
+        mine = set()
+        with self.child_lock:
+            for child in self.children.values():
+                if child.proc is not None and child.proc.pid:
+                    mine.add(child.proc.pid)
+        foreign = None
+        if apps is not None:
+            foreign = [a for a in apps
+                       if a["pid"] not in mine and a["pid"] != os.getpid()]
+        state: dict = {
+            "cards": gpu_names(),
+            "worker": worker,
+            "compute_apps": apps,
+            "foreign_apps": foreign,
+            "unknown": apps is None,
+            "gpu_jobs": sorted(self.gpu_jobs),
+        }
+        if worker is not None:
+            state["holder"] = {"what": "render worker", **worker}
+        elif foreign:
+            biggest = max(foreign, key=lambda a: a["vram_mib"])
+            state["holder"] = {"what": "another process on the card", **biggest}
+        else:
+            state["holder"] = None
+        return state
+
+    def refuse_if_gpu_contended(self, job_id: str) -> None:
+        """Raise `GpuContended` if this job may not have the card. Named refusal.
+
+        Called from `validate`, so it lands BEFORE the slot, before the memory
+        gate and before anything is staged: a refused job costs the box a /proc
+        walk and one `nvidia-smi`, not a slot and not an 8 GB scene push.
+
+        Deliberately refuses when the holder is unknown-but-a-worker-exists, and
+        deliberately does NOT refuse when nothing at all can be measured with no
+        worker present — the clamp in `run_child` is what makes the second case
+        safe, and refusing every GPU job on a box whose driver will not answer
+        would make this gate worse than not having one, exactly as
+        `await_memory` reasons about an unreadable memory.max.
+        """
+        state = self.gpu_state()
+        holder = state.get("holder")
+        if holder is None:
+            return
+        card = ", ".join(state["cards"]) or "the GPU"
+        if holder["what"] == "render worker":
+            raise GpuContended(
+                f"refusing {job_id}: the render worker holds "
+                f"{holder.get('scene') or 'a scene'} on {card} "
+                f"(pid {holder['pid']}, {holder.get('rss_bytes', 0) / 1e9:.1f}G "
+                f"resident). This job declared gpu: true, and a second scene on "
+                f"the same card is not shared, it is a race for VRAM that has "
+                f"no cgroup, no gate and no OOM score to bias — on 2026-08-07 "
+                f"it killed another agent's render twice with 'Out of memory in "
+                f"CUDA queue enqueue', the second time terminally. Resubmit "
+                f"without gpu (exec jobs run CPU-only by default and this one "
+                f"will be clamped to CPU anyway), or run it as a render job so "
+                f"the fleet serialises it against the worker.")
+        raise GpuContended(
+            f"refusing {job_id}: pid {holder['pid']} "
+            f"({holder.get('name') or 'unknown process'}) already holds "
+            f"{holder.get('vram_mib', 0)} MiB on {card}. This job declared "
+            f"gpu: true and the card is not free.")
+
     # --- job execution --------------------------------------------------
 
     def validate(self, spec: dict) -> dict:
@@ -711,12 +1120,53 @@ class ExecServer:
                 f"scene_name {scene_name!r} must be a bare filename — it is "
                 "resolved INSIDE the digest's own directory, never as a path")
 
+        # THE CARD IS A DECLARED RESOURCE NOW, AND ITS DEFAULT IS "NO".
+        #
+        # This is the whole of the fix for the 2026-08-07 VRAM collision. It has
+        # three parts and each one covers a hole the other two leave:
+        #
+        #   1. A job that says nothing gets NOTHING. `run_child` hands the child
+        #      an empty CUDA_VISIBLE_DEVICES, so `cycles.device = 'GPU'` in a
+        #      caller's script finds zero devices and Cycles renders on the CPU.
+        #      This is the part that cannot be argued with, because it is not a
+        #      predicate about the caller's code — the code never sees the card.
+        #   2. A job that says `gpu: true` is CHECKED, here, against who is
+        #      actually holding the card, and refused by name if anyone is.
+        #   3. A job that says nothing but LOOKS like it wants the card is
+        #      scanned for and reported — on the log line and on the reply — so
+        #      the clamp in (1) is never a silent downgrade. The defect this
+        #      file is fixing survived because nothing said anything; a clamp
+        #      that also said nothing would have hidden it just as well.
+        #
+        # `gpu` is in EXEC_OPTIONAL rather than EXEC_REQUIRED because the "no
+        # defaults in a warm process" law is about fields whose omission would
+        # inherit the PREVIOUS job's value. This one cannot: absent means False,
+        # every time, and False is enforced by the environment rather than
+        # remembered.
+        gpu = spec.get("gpu", False)
+        if not isinstance(gpu, bool):
+            raise ValueError(
+                f"gpu must be a boolean, got {gpu!r} — it is a declaration that "
+                f"this job intends to use the card, and a truthy string would "
+                f"make the declaration accidental")
+        if gpu:
+            self.refuse_if_gpu_contended(job_id)
+        gpu_hints: list[str] = []
+        if not gpu:
+            gpu_hints = scan_for_gpu(self.bundle_dir(digest))
+            if gpu_hints:
+                log(f"job {job_id}: {len(gpu_hints)} file(s) in bundle {digest} "
+                    f"select a GPU device but the job did not declare gpu — the "
+                    f"child gets CUDA_VISIBLE_DEVICES='' and will render on the "
+                    f"CPU: {', '.join(gpu_hints[:6])}")
+
         return {"job_id": job_id, "digest": digest, "timeout": timeout,
                 "cpu_slots": cpu_slots, "entry": str(spec["entry"]),
                 "argv": list(spec["argv"]),
                 "blender_args": list(spec["blender_args"]),
                 "outputs": list(spec["outputs"]),
-                "scene_digest": scene_digest, "scene_name": scene_name}
+                "scene_digest": scene_digest, "scene_name": scene_name,
+                "gpu": gpu, "gpu_hints": gpu_hints}
 
     def stage(self, plan: dict) -> dict:
         """Build the job directory and resolve every path inside it."""
@@ -755,13 +1205,23 @@ class ExecServer:
             digest = plan["scene_digest"]
             if not DIGEST_RE.fullmatch(digest):
                 raise ValueError(f"scene_digest {digest!r} is not a digest")
-            src = os.path.join(self.scenes, digest, plan["scene_name"])
-            marker = os.path.join(self.scenes, digest, ".complete")
+            # The name selects a file INSIDE the digest's directory and nothing
+            # else. It arrives from the broker, but the broker got it from a
+            # caller, and it is about to become a path — the same reason job ids
+            # are broker-minted. `basename` is not enough on its own because
+            # `..` survives it, so both are checked.
+            sname = plan["scene_name"]
+            if (not sname or os.path.basename(sname) != sname
+                    or sname in (".", "..")):
+                raise ValueError(f"scene_name {sname!r} is not a plain filename")
+            src = os.path.join(self.scenes, digest, sname)
+            marker = os.path.join(self.scenes, digest, SCENE_COMPLETE)
             if not os.path.isfile(marker):
                 raise ValueError(
                     f"scene {digest} is not completely staged on this instance "
-                    f"(no .complete marker) — refusing to open a half-pushed "
-                    f"blend, which reads as valid and renders as wrong")
+                    f"(no {SCENE_COMPLETE} marker) — refusing to open a "
+                    f"half-pushed blend, which reads as valid and renders as "
+                    f"wrong. Looked in {os.path.join(self.scenes, digest)}")
             if not os.path.isfile(src):
                 raise ValueError(
                     f"scene {digest} is staged but holds no {plan['scene_name']!r}")
@@ -787,8 +1247,9 @@ class ExecServer:
                 "entry": entry, "outputs": outputs,
                 "log": os.path.join(job, "job.log")}
 
-    def run_child(self, plan: dict, paths: dict) -> dict:
-        """Spawn, wait, and hard-kill the whole process group on timeout."""
+    def run_child(self, plan: dict, paths: dict,
+                  child: Optional[_Child] = None) -> dict:
+        """Spawn, wait, and hard-kill the whole process group on timeout or cancel."""
         cmd = [self.blender, *plan["blender_args"], "-P", paths["entry"]]
         if plan["argv"]:
             cmd += ["--", *plan["argv"]]
@@ -807,6 +1268,37 @@ class ExecServer:
         for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                     "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
             env[var] = "1"
+
+        # THE CPU-ONLY ASSUMPTION, ENFORCED RATHER THAN ASSUMED.
+        #
+        # Everything about this server's sizing is a CPU-and-RAM argument, and
+        # `deprioritise_for_oom` twenty lines below exists so that an exec child
+        # loses a memory squeeze the render worker would otherwise lose. None of
+        # that reaches VRAM: the card has no cgroup, so the only way an exec
+        # child cannot take memory from the resident render scene is for the
+        # child not to be able to SEE the card.
+        #
+        # A guard in the spec cannot do this. `entry` is caller-supplied Python
+        # — that is the entire point of the job type — so any predicate about
+        # what the script "intends" is a guess about a file that can compute its
+        # intent at runtime. An empty CUDA_VISIBLE_DEVICES is not a guess.
+        # Cycles enumerates zero devices, `scene.cycles.device = 'GPU'` still
+        # assigns cleanly, and the render falls to the CPU, which is what every
+        # exec job on this box was already assumed to be doing.
+        #
+        # HIP too, because the clamp should not depend on which vendor's card
+        # the fleet happened to rent this week.
+        if not plan.get("gpu"):
+            env["CUDA_VISIBLE_DEVICES"] = ""
+            env["HIP_VISIBLE_DEVICES"] = ""
+        else:
+            # Declared, checked against the holder in `validate`, and recorded
+            # so `ping` can answer the reverse question: the broker must not
+            # start a render worker on a card an exec job is holding either.
+            with self.child_lock:
+                self.gpu_jobs[plan["job_id"]] = time.time()
+            log(f"job {plan['job_id']} runs WITH THE GPU — declared gpu: true "
+                f"and the card was free at admission")
 
         def deprioritise_for_oom() -> None:
             """Make this child the cgroup OOM killer's first choice.
@@ -828,15 +1320,31 @@ class ExecServer:
         with open(paths["log"], "wb") as logfh:
             logfh.write((" ".join(cmd) + "\n").encode())
             logfh.flush()
-            proc = subprocess.Popen(
-                cmd, cwd=paths["job"], env=env, preexec_fn=deprioritise_for_oom,
-                stdin=subprocess.DEVNULL, stdout=logfh, stderr=subprocess.STDOUT,
-                # Its own process group, so a timeout can kill the child AND
-                # anything it spawned. Blender forks helpers; signalling only the
-                # pid leaves them holding memory and CPU on a box where the whole
-                # point is that twelve of these run at once.
-                start_new_session=True,
-            )
+            # FORK AND REGISTER UNDER ONE LOCK. Without it there is a window in
+            # which the child exists and `child.proc` is still None, and a
+            # cancel landing in that window would be told "admitted, not yet
+            # started" about a process that had in fact just been started —
+            # exactly the orphan this whole change exists to prevent, with a
+            # reply claiming success. `Popen` here is a fork/exec of a small
+            # supervisor, not of the 8 GB child, so the lock is held for
+            # milliseconds.
+            with self.child_lock:
+                if child is not None and child.canceled:
+                    raise Canceled(
+                        f"{plan['job_id']} was canceled before its child was "
+                        f"started — nothing was spawned")
+                proc = subprocess.Popen(
+                    cmd, cwd=paths["job"], env=env, preexec_fn=deprioritise_for_oom,
+                    stdin=subprocess.DEVNULL, stdout=logfh, stderr=subprocess.STDOUT,
+                    # Its own process group, so a timeout OR A CANCEL can kill
+                    # the child AND anything it spawned. Blender forks helpers;
+                    # signalling only the pid leaves them holding memory and CPU
+                    # on a box where the whole point is that twelve of these run
+                    # at once.
+                    start_new_session=True,
+                )
+                if child is not None:
+                    child.proc = proc
             timed_out = False
             try:
                 rc = proc.wait(timeout=plan["timeout"])
@@ -845,6 +1353,7 @@ class ExecServer:
                 self._kill_group(proc)
                 rc = proc.wait()
         return {"rc": rc, "timed_out": timed_out,
+                "canceled": bool(child is not None and child.canceled),
                 "elapsed": time.time() - started}
 
     @staticmethod
@@ -853,6 +1362,17 @@ class ExecServer:
             pgid = os.getpgid(proc.pid)
         except OSError:
             pgid = None
+        # NEVER killpg our own group — the same rule `reap_orphans` states, and
+        # for the same reason: a signal to this server's own group takes out the
+        # exec server and every other job's child with it. `start_new_session`
+        # makes that impossible by construction; this is the assertion of it,
+        # because "impossible by construction" is what the render worker was
+        # also said to be before `pkill -f` found it.
+        try:
+            if pgid is not None and pgid == os.getpgid(0):
+                pgid = None
+        except OSError:                                     # pragma: no cover
+            pass
         for sig, grace in ((signal.SIGTERM, 10.0), (signal.SIGKILL, 5.0)):
             if proc.poll() is not None:
                 return
@@ -906,6 +1426,22 @@ class ExecServer:
         plan = self.validate(spec)
         job_id = plan["job_id"]
 
+        # BEFORE THE SLOT, THE DISK CHECK AND THE MEMORY GATE. A job whose
+        # cancel overtook it must not consume any of the three, and above all
+        # must not fork. See `self.canceled_ids`.
+        with self.child_lock:
+            self._prune_cancels()
+            if job_id in self.canceled_ids:
+                self.canceled_ids.pop(job_id, None)
+                log(f"job {job_id} REFUSED on arrival: it was canceled while in "
+                    f"flight to this server")
+                return {"ok": False, "canceled": True, "job_id": job_id,
+                        "rc": None, "timed_out": False, "outputs": [],
+                        "missing": [], "exec_sec": 0.0, "log": "",
+                        "error": f"{job_id} was canceled before it reached this "
+                                 f"exec server — no slot was taken and no child "
+                                 f"was started"}
+
         free = shutil.disk_usage(self.root).free
         if free < self.min_free:
             raise RuntimeError(
@@ -924,13 +1460,30 @@ class ExecServer:
                 f"most `slots` jobs at once, so this means the two disagree about "
                 f"how many that is"
             )
+        # REGISTERED BEFORE ANY WAIT, NOT BEFORE THE FORK. Admission is where a
+        # job starts costing the box something a cancel would want back: the
+        # slot is taken from this line on, and `await_memory` can hold here for
+        # ten minutes. A registry that only covered running children would leave
+        # `cancel` answering "not running" about a job that is demonstrably
+        # occupying capacity.
+        child = _Child()
+        with self.child_lock:
+            # Re-read the tombstone under the SAME lock the registration takes.
+            # The check above ran before `slots.acquire`, which blocks: a cancel
+            # arriving during that wait would find no child to signal, plant a
+            # tombstone, and be overtaken by this job. Consuming it here means
+            # there is no instant at which a cancel can be lost — before this
+            # line it is a tombstone, after it the child object carries the flag.
+            if self.canceled_ids.pop(job_id, None) is not None:
+                child.canceled = True
+            self.children[job_id] = child
         try:
-            waited = self.await_memory(job_id, wait_budget)
+            waited = self.await_memory(job_id, wait_budget, child)
             paths = self.stage(plan)
             log(f"job {job_id} start entry={plan['entry']} slots={plan['cpu_slots']} "
                 f"timeout={plan['timeout']}s"
                 + (f" (waited {waited:.0f}s for memory)" if waited else ""))
-            result = self.run_child(plan, paths)
+            result = self.run_child(plan, paths, child)
             freed = self.scrub(paths)
 
             produced = []
@@ -943,10 +1496,16 @@ class ExecServer:
                 produced.append({"name": declared, "bytes": size, "sha256": digest,
                                  "path": path})
 
-            ok = result["rc"] == 0 and not result["timed_out"] and not missing
+            canceled = bool(result.get("canceled"))
+            ok = (result["rc"] == 0 and not result["timed_out"]
+                  and not canceled and not missing)
             with self._count_lock:
                 self.jobs += 1
-                if not ok:
+                # A cancel is NOT a failure of this server or of the caller's
+                # code, and counting it as one would make `ping`'s failure count
+                # — the number a human reads to decide whether the box is sick —
+                # go up every time somebody changed their mind.
+                if not ok and not canceled:
                     self.failures += 1
 
             reply = {
@@ -954,15 +1513,29 @@ class ExecServer:
                 "job_id": job_id,
                 "rc": result["rc"],
                 "timed_out": result["timed_out"],
+                "canceled": canceled,
                 "exec_sec": round(result["elapsed"], 3),
                 "outputs": produced,
                 "missing": missing,
                 "scrubbed_bytes": freed,
                 "out_dir": paths["out"],
                 "log": tail_file(paths["log"]),
+                # SO THE CLAMP IS NEVER SILENT. `gpu` is what the job asked
+                # for; `gpu_clamped` is what it got; `gpu_hints` names the files
+                # that made the difference visible. A downgrade nobody can see
+                # in `rq status -v` is a downgrade that hides its own cause,
+                # which is how the collision this guard exists for went
+                # unnoticed until it killed somebody else's render.
+                "gpu": bool(plan.get("gpu")),
+                "gpu_clamped": not plan.get("gpu"),
+                "gpu_hints": list(plan.get("gpu_hints") or []),
             }
             if not ok:
-                if result["timed_out"]:
+                if canceled:
+                    reply["error"] = (
+                        f"canceled by request after {result['elapsed']:.1f}s — the "
+                        f"child's process group was signalled and is gone")
+                elif result["timed_out"]:
                     reply["error"] = (f"killed after {plan['timeout']}s "
                                       f"(timeout_s), process group signalled")
                 elif result["rc"] != 0:
@@ -970,13 +1543,40 @@ class ExecServer:
                 else:
                     reply["error"] = (f"declared output(s) not produced: {missing} — "
                                       f"the child exited 0 without writing them")
-            log(f"job {job_id} {'ok' if ok else 'FAILED'} rc={result['rc']} "
-                f"{result['elapsed']:.1f}s outputs={len(produced)}/{len(plan['outputs'])}")
+            log(f"job {job_id} {'CANCELED' if canceled else 'ok' if ok else 'FAILED'} "
+                f"rc={result['rc']} {result['elapsed']:.1f}s "
+                f"outputs={len(produced)}/{len(plan['outputs'])}")
             return reply
+        except Canceled as exc:
+            # Cancelled between admission and the fork, so there is no child, no
+            # rc and no log — but there IS a reply, and it carries the same
+            # marker as the other branch. The broker must not have to tell the
+            # two apart to know that nothing is still running out there.
+            with self._count_lock:
+                self.jobs += 1
+            log(f"job {job_id} CANCELED before its child was started")
+            return {"ok": False, "canceled": True, "job_id": job_id,
+                    "rc": None, "timed_out": False, "outputs": [], "missing": [],
+                    "exec_sec": round(time.time() - child.started, 3),
+                    "error": str(exc), "log": ""}
         finally:
+            # BOTH, ALWAYS, AND IN THIS ORDER. The slot release is what makes a
+            # cancel worth doing at all — a kill that leaks its slots just moves
+            # the bug, and the orphan on 47040457 held 6 of 12 for an hour. It
+            # is in a `finally` rather than on each path precisely so that a
+            # kill, a timeout, a crash in `scrub` and a clean exit all release
+            # exactly once. The registry entry goes first so nothing can be
+            # signalled after the process it names is already reaped.
+            with self.child_lock:
+                self.children.pop(job_id, None)
+                # Same `finally`, same reason: a GPU claim that outlives its
+                # child would make `ping` report the card as busy forever and
+                # the reverse guard would refuse every render after it.
+                self.gpu_jobs.pop(job_id, None)
             self.slots.release(job_id, plan["cpu_slots"])
 
-    def await_memory(self, job_id: str, timeout: float) -> float:
+    def await_memory(self, job_id: str, timeout: float,
+                     child: Optional[_Child] = None) -> float:
         """Hold a job at the door until the container can afford to start it.
 
         A slot is a CPU promise, not a memory one, and on this box those two
@@ -990,6 +1590,11 @@ class ExecServer:
         without that pause twelve threads read the same comfortable number
         before any of them has grown.
         """
+        # THE CANCEL CHECK IS OUTSIDE THE `min_free_mem` SHORT-CIRCUIT. With the
+        # gate disabled this method used to return before reading anything, so a
+        # job cancelled between admission and here would have gone on to fork.
+        if child is not None and child.canceled:
+            raise Canceled(f"{job_id} was canceled while waiting to be admitted")
         if self.min_free_mem <= 0:
             return 0.0
         deadline = time.time() + timeout
@@ -997,6 +1602,10 @@ class ExecServer:
         warned = False
         with self.admit_lock:
             while True:
+                if child is not None and child.canceled:
+                    raise Canceled(
+                        f"{job_id} was canceled after {time.time() - began:.0f}s "
+                        f"waiting for memory — no child was ever started")
                 available = memory_available()
                 if available is None:
                     # Unmeasurable. Proceed — refusing every job on a kernel
@@ -1025,10 +1634,116 @@ class ExecServer:
                     warned = True
                     log(f"job {job_id} waiting for memory: {available / 1e9:.1f}G "
                         f"available, floor {self.min_free_mem / 1e9:.1f}G")
-                time.sleep(5.0)
+                # WAIT ON THE EVENT, NOT ON THE CLOCK. This gate holds
+                # `admit_lock`, so a job sleeping out a five-second poll here is
+                # also holding every sibling's admission behind it; a cancel
+                # that took five seconds to be noticed would be five seconds of
+                # the whole queue stopped for a job nobody wants any more.
+                if child is not None:
+                    child.event.wait(5.0)
+                else:
+                    time.sleep(5.0)
             # Let the admitted child actually grow before the next one reads.
             time.sleep(1.0)
         return time.time() - began
+
+    # How long a cancel for a job that has not arrived yet is remembered. The
+    # window it has to cover is the broker's dispatch-to-admission gap: a bundle
+    # push plus, at worst, an 8 GB scene push. An hour is far more than that and
+    # still bounded, which is the point — an unbounded set of ids on a server
+    # that never restarts is a leak, however small each entry is.
+    CANCEL_MEMORY_S = 3600.0
+
+    def _prune_cancels(self) -> None:
+        """Called under `child_lock` only."""
+        cutoff = time.time() - self.CANCEL_MEMORY_S
+        for job_id in [k for k, t in self.canceled_ids.items() if t < cutoff]:
+            self.canceled_ids.pop(job_id, None)
+
+    def handle_cancel(self, spec: dict) -> dict:
+        """Stop ONE job, by job id, by killing its own process group.
+
+        THE MISSING HALF OF `rq cancel`. The broker's cancel path updated a
+        SQLite row and stopped; there was no request that reached the process.
+        Observed on instance 47040457 on 2026-08-07: `{"canceled": true}` at
+        03:46 and a Blender child still running at 04:44, holding 6 of 12 slots
+        and ~8 GB while two of another agent's jobs were refused by the memory
+        gate and a third was OOM-killed at `Read blend`.
+
+        BY JOB ID, NEVER BY NAME. `self.children` is populated only by
+        `handle_exec`, keyed by the id the broker minted, and holds the actual
+        `Popen`. The process group comes from `os.getpgid` on that object's own
+        pid — not from a pattern, not from `pgrep`, not from anything a request
+        could steer. A job id this server does not know signals nothing at all
+        and says so. That is strictly narrower than `reap_orphans`'s cwd test,
+        which is already the standard here and which cannot be used for this
+        anyway: every live exec child has a cwd inside the exec root, so it
+        identifies the whole population rather than one member.
+
+        IDEMPOTENT, AND SILENCE IS NOT AN ERROR. A job that already finished, or
+        that was cancelled while still queued in the broker and so was never
+        dispatched, is `canceled: false, running: false` and `ok: true` — the
+        broker cancels the row either way, and turning "there was nothing to
+        kill" into a failure would make the common case look broken.
+        """
+        job_id = str(spec.get("job_id", ""))
+        if not JOB_ID_RE.fullmatch(job_id):
+            raise ValueError(f"unsafe job_id {job_id!r}")
+
+        with self.child_lock:
+            self._prune_cancels()
+            child = self.children.get(job_id)
+            if child is None:
+                # A TOMBSTONE, NOT A SHRUG. Job ids are broker-minted and never
+                # reused, so remembering one costs a dict entry and closes the
+                # window described at `self.canceled_ids`. It is equally correct
+                # for a job that already finished: nothing will ever present
+                # that id again, and `_prune_cancels` collects it.
+                self.canceled_ids[job_id] = time.time()
+                return {"ok": True, "job_id": job_id, "canceled": True,
+                        "running": False, "pid": None, "pgid": None,
+                        "detail": "no job of that id is admitted here — nothing "
+                                  "was signalled, and the id is recorded so that "
+                                  "a job still in flight to this server is "
+                                  "refused on arrival rather than started"}
+            child.canceled = True
+            child.event.set()
+            proc = child.proc
+
+        if proc is None:
+            # Admitted, holding a slot, waiting for memory — and now flagged.
+            # `await_memory` raises `Canceled` on the next pass, which the event
+            # above has already woken, and `handle_exec`'s `finally` gives the
+            # slot back. Nothing was forked, so there is nothing to kill.
+            log(f"job {job_id} cancel: admitted but not yet forked — flagged, "
+                f"it will not start")
+            return {"ok": True, "job_id": job_id, "canceled": True,
+                    "running": False, "pid": None, "pgid": None,
+                    "detail": "the job was waiting to be admitted and will not "
+                              "start; its slot is released by the job thread"}
+
+        try:
+            pgid = os.getpgid(proc.pid)
+        except OSError:
+            pgid = None
+        log(f"job {job_id} cancel: signalling process group {pgid} (pid {proc.pid})")
+        # OUTSIDE `child_lock`. This blocks for up to fifteen seconds between
+        # SIGTERM and SIGKILL, and the job's own thread needs that lock to
+        # deregister itself when the child dies.
+        self._kill_group(proc)
+        alive = proc.poll() is None
+        if alive:
+            log(f"WARNING job {job_id} survived SIGKILL — pid {proc.pid} is still "
+                f"alive and its memory stays charged to this cgroup")
+        else:
+            log(f"job {job_id} cancel: child is gone (rc {proc.returncode})")
+        return {"ok": True, "job_id": job_id, "canceled": True, "running": True,
+                "pid": proc.pid, "pgid": pgid, "killed": not alive,
+                "rc": proc.returncode,
+                "detail": ("the child's process group was signalled and is gone"
+                           if not alive else
+                           "the child SURVIVED SIGKILL — its slots and memory "
+                           "are still held")}
 
     def handle_release(self, spec: dict) -> dict:
         job_id = str(spec.get("job_id", ""))
@@ -1083,6 +1798,25 @@ class ExecServer:
             "orphans_reaped": self.orphans_reaped,
             "blender": self.blender,
             "root": self.root,
+            # DEPLOYED-VS-TREE, ANSWERED BY THE BOX. This server and
+            # broker/execservice.py deploy separately, and every disagreement
+            # between them so far has been diagnosed by argument rather than by
+            # comparison. The broker can hash the file it would push and see in
+            # one line whether that is what is running.
+            "code_sha256": self_digest(),
+            "code_mtime": self_mtime(),
+            # THE REVERSE DIRECTION OF THE GPU GUARD, made answerable.
+            #
+            # `refuse_if_gpu_contended` stops an exec job from climbing onto a
+            # card the render worker holds. The other order is just as real —
+            # the broker relaunching the render worker while an exec job that
+            # declared `gpu: true` is mid-render — and the broker cannot see
+            # inside this server to know. Now it can: `gpu_jobs` is the list of
+            # admitted GPU jobs and `holder` is who is on the card, both read at
+            # the moment of the ping. `remote.ensure_ready` already pings this
+            # server before it will touch the worker, so the fact is available
+            # exactly where the decision is made.
+            "gpu": self.gpu_state(),
         }
 
     # --- protocol -------------------------------------------------------
@@ -1119,6 +1853,8 @@ class ExecServer:
             try:
                 if cmd == "ping":
                     reply = self.ping()
+                elif cmd == "cancel":
+                    reply = self.handle_cancel(spec)
                 elif cmd == "release":
                     reply = self.handle_release(spec)
                 elif cmd == "purge":
@@ -1143,6 +1879,14 @@ class ExecServer:
                 # "your job did not run" is to spend an attempt on it.
                 if isinstance(exc, ResourceWait):
                     reply["wait"] = True
+                # AND THE ONE BIT THAT MAKES A REFUSAL SURVIVE IT. Same
+                # argument, opposite verdict: `wait` means "come back", this
+                # means "do not come back, and do not spend two more attempts
+                # rediscovering that the render worker is still warm". The
+                # broker fails it terminally on sight, as it does a
+                # SceneStagingMismatch.
+                if isinstance(exc, GpuContended):
+                    reply["gpu_refused"] = True
             conn.sendall(json.dumps(reply).encode() + b"\n")
         except Exception as exc:
             log(f"connection dropped: {type(exc).__name__}: {exc}")
@@ -1169,6 +1913,19 @@ class ExecServer:
         if swept:
             log(f"swept {swept} stale job director(ies) — a fresh exec server is by "
                 f"definition executing nothing")
+        # WHAT THIS PROCESS IS, IN ITS OWN LOG, BEFORE IT SERVES ANYTHING.
+        #
+        # This file and `broker/execservice.py` deploy separately and they are
+        # each other's most likely source of disagreement — `SceneStagingMismatch`
+        # names "a stale worker/exec_server.py on the box" as its first
+        # hypothesis, and there was never a way to check it without an SSH
+        # session and a guess. The digest below is the check: `rq status -v`
+        # already shows this server's ping, and the broker knows the hash of the
+        # file it WOULD have pushed, so "the box is running something else" is
+        # now one comparison rather than an argument.
+        log(f"this exec_server.py is sha256:{self_digest()} "
+            f"mtime={time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(self_mtime()))} "
+            f"pid={os.getpid()} python={sys.version.split()[0]}")
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((host, port))
