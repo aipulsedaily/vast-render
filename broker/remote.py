@@ -742,8 +742,166 @@ def scene_cached(ep: Endpoint, digest: str, size: int, name: str) -> bool:
 
 
 def mark_scene_complete(ep: Endpoint, digest: str) -> None:
-    """Written last, once the .blend and every sibling directory have landed."""
-    run(ep, f"touch {shlex.quote(scene_dir(digest))}/{SCENE_COMPLETE}", timeout=60)
+    """Written last, once the .blend and every sibling directory have landed.
+
+    Written ATOMICALLY, via a rename inside the same directory. `touch` creates
+    the file and then writes its mtime, and a marker that exists before it is
+    finished is a marker that can be read by a concurrent `scene_cached` — the
+    exec path and the render path both poll this directory, from different
+    threads, without a shared lock. `mv` inside one directory is a single rename
+    syscall on the instance's filesystem: the marker either is not there or is
+    there complete, and there is no instant in between.
+    """
+    d = shlex.quote(scene_dir(digest))
+    run(ep, f"touch {d}/{SCENE_COMPLETE}.part && "
+            f"mv -f {d}/{SCENE_COMPLETE}.part {d}/{SCENE_COMPLETE}", timeout=60)
+
+
+# THE READER'S OWN WORDS, matched so the broker can recognise its own bug in a
+# reply. `worker/exec_server.py` raises this phrase when a job asks for a scene
+# whose `.complete` marker it cannot find; it comes back to the broker as an
+# error string on a non-ok reply, and a string is all there is — the exec server
+# is a standalone script on the instance with no shared exception types.
+#
+# Matching a remote string is fragile and is done anyway, because the
+# alternative is what actually happened: an unrecognised refusal is a plain
+# `RuntimeError`, a plain `RuntimeError` spends an attempt, and spending
+# attempts on this means re-pushing gigabytes. `test_the_reader_and_the_writer_
+# agree_on_the_marker` reads the worker source and fails if the phrase drifts,
+# so the coupling is checked at test time rather than discovered at 8 GB.
+#
+# This stays load-bearing even with `stage_scene_tree`'s read-back in place: the
+# exec server is a SEPARATE artefact with its own deploy, so an instance can run
+# an older one that reads a different path than the broker writes. That is not
+# hypothetical — the exec server's own comment records a version that looked in
+# `/workspace/exec/scenes/<digest>/` and "reported a scene that was demonstrably
+# resident as not completely staged". The broker's read-back would pass and the
+# instance would still refuse. Catch it on the first refusal, not the third.
+NOT_STAGED_MARK = "is not completely staged on this instance"
+
+
+class SceneStagingMismatch(Exception):
+    """A scene push reported success and the readiness check still says no.
+
+    NOT a `RemoteError`, and the distinction is the entire point. Everything
+    `remote` raises is refunded and retried on the stated rule that transport is
+    never the caller's fault. This is neither: the bytes moved, the wire was
+    fine, and the broker then could not find what it had just written. That is a
+    disagreement between a WRITER and a READER inside this codebase, and no
+    number of retries resolves it — each one repeats the identical disagreement
+    at the identical cost.
+
+    It cost exactly that on 2026-08-07. Exec job dea2b1d24914 wanted
+    film16_R2851.blend (7.97 GB, digest 8b12a832281eef52) on instance 47049525.
+    `ExecService.ensure_scene_staged` called `push_scene(ep, source)` with no
+    `remote_path`, so it took that function's legacy default and wrote 7.97 GB
+    to `/workspace/scene.blend`. `worker/exec_server.py` reads
+    `/workspace/scenes/<digest>/<name>` and refuses without
+    `/workspace/scenes/<digest>/.complete`. The push logged "staged for exec in
+    108.0s", the reader logged "not completely staged", and because the reader's
+    complaint arrived as a plain `RuntimeError` it fell through to `db.fail` and
+    was retried: three 8 GB pushes, 5.5 minutes, and a terminal failure whose
+    message blamed a half-pushed blend that had never been pushed at all.
+    Verified afterwards on the instance itself — `/workspace/scene.blend` was
+    7,969,661,807 bytes at 07:37 and `/workspace/scenes/` held one unrelated
+    directory.
+
+    So this is raised the moment the write-then-read-back disagrees, before a
+    second push can be started, and `ExecService._run_guarded` makes it terminal
+    on sight. One push and a clear sentence, instead of three pushes and a
+    misleading one.
+    """
+
+
+def stage_scene_tree(ep: Endpoint, scene: Path, digest: str,
+                     siblings: Optional[list[Path]] = None,
+                     on_phase: Optional[Callable[[str], None]] = None,
+                     ) -> tuple[float, int, int]:
+    """Land a scene, its sibling cache trees and its `.complete` marker. ONE writer.
+
+    THIS FUNCTION EXISTS BECAUSE THERE WERE TWO WRITERS AND THEY DISAGREED.
+    `Fleet._ensure_scene_cached` did the whole sequence correctly —
+    `<final>.part`, size verification, rename, siblings, marker last.
+    `ExecService.ensure_scene_staged` did an abbreviated version of the same
+    sequence from memory: it called `push_scene` without a `remote_path` and it
+    never called `mark_scene_complete` at all. Both were "the code that stages a
+    scene", only one of them produced something the reader would accept, and
+    which one you got depended on which job type happened to want the scene
+    first. See `SceneStagingMismatch` for what that cost.
+
+    A cache entry is now made in exactly one place, so "the writer forgot a
+    step" stops being a thing a caller can do. What the caller still owns is the
+    part that legitimately differs — the disk preflight and the eviction policy,
+    which the render path and the exec path weigh differently and should.
+
+    ORDER IS THE SAFETY PROPERTY, and it is not negotiable:
+
+      1. `mkdir -p` the scene's own directory.
+      2. Stream the .blend to `<final>.part`.
+      3. Verify the byte count on the instance. A short .blend in a
+         content-addressed cache is indistinguishable from a good one on every
+         later lookup, so a mismatch deletes the part file and raises.
+      4. Rename into place — atomic, so the blend never exists at its final
+         path in a partial state.
+      5. Push the sibling directories. AFTER the blend, because they are
+         verified by file count and byte count of their own.
+      6. `.complete` LAST. Only now does the entry mean "the whole scene is
+         here" rather than "a .blend is here and its caches may be".
+      7. Read the entry back through `scene_cached` — the same predicate the
+         reader uses — and raise `SceneStagingMismatch` if it still says no.
+
+    Step 7 is not paranoia about the filesystem, it is a guard on step 1-6
+    against this module's own future. It is one round trip against a push that
+    takes minutes, and it converts "the next writer/reader divergence" from
+    three multi-gigabyte pushes and a wrong diagnosis into one push and the
+    right one.
+
+    `on_phase` reports "uploading-scene" / "uploading-caches" for `rq status`;
+    the render path wires it to `Fleet.status` and the exec path does not,
+    because an exec job must not narrate itself as a render.
+
+    Returns (seconds spent pushing the blend, sibling files, sibling bytes).
+    """
+    size = scene.stat().st_size
+    final = scene_cache_path(digest, scene.name)
+    run(ep, f"mkdir -p {shlex.quote(scene_dir(digest))}", timeout=60)
+
+    if on_phase:
+        on_phase("uploading-scene")
+    elapsed = push_scene(ep, scene, remote_path=final + ".part")
+
+    landed = probe(ep, f"stat -c %s {shlex.quote(final + '.part')}", timeout=60)
+    got = int(landed.out.split()[-1]) if landed.ok and landed.out.split() else -1
+    if got != size:
+        run(ep, f"rm -f {shlex.quote(final + '.part')}", timeout=60, check=False)
+        raise TransferError(
+            f"scene push of {scene.name}", str(ep),
+            f"remote holds {got} bytes, expected {size}", elapsed,
+            sent=max(got, 0), expected=size,
+        )
+    run(ep, f"mv -f {shlex.quote(final + '.part')} {shlex.quote(final)}", timeout=60)
+
+    files = cache_bytes = 0
+    if siblings:
+        if on_phase:
+            on_phase("uploading-caches")
+        files, cache_bytes = push_scene_siblings(ep, digest, scene.parent, siblings)
+
+    mark_scene_complete(ep, digest)
+
+    # Step 7. Ask the reader's own question, now, while there is still exactly
+    # one push on the meter.
+    if not scene_cached(ep, digest, size, scene.name):
+        raise SceneStagingMismatch(
+            f"scene {digest} ({scene.name}, {size} bytes) was pushed to {ep} and "
+            f"reported complete, and the readiness check immediately says it is "
+            f"NOT staged. Nothing was retried, because a second identical push "
+            f"would produce a second identical disagreement. The writer put the "
+            f"blend at {final} and the marker at "
+            f"{scene_dir(digest)}/{SCENE_COMPLETE}; whatever is reading is not "
+            f"looking there, or the instance did not keep what it acknowledged. "
+            f"Go and look at {scene_dir(digest)} on the box.")
+    return elapsed, files, cache_bytes
 
 
 def touch_scene(ep: Endpoint, digest: str) -> None:
@@ -1328,14 +1486,29 @@ def scene_zstd_level(scene: Path) -> tuple[int, str]:
         return default, f"level {default}"
 
 
-def push_scene(ep: Endpoint, scene: Path, remote_path: str = "",
+def push_scene(ep: Endpoint, scene: Path, remote_path: str,
                level: Optional[int] = None) -> float:
     """Stream the scene through zstd into place. No temp file either end.
+
+    `remote_path` IS REQUIRED, and used to have a default of
+    `{REMOTE_ROOT}/scene.blend` — a leftover from when the worker loaded one
+    scene from one fixed path, kept alive after the cache became
+    content-addressed because the one remaining caller that relied on it was
+    never revisited. That caller was `ExecService.ensure_scene_staged`, and the
+    default silently sent 7.97 GB to `/workspace/scene.blend` three times while
+    the exec server looked in `/workspace/scenes/<digest>/`. See
+    `SceneStagingMismatch`.
+
+    A default destination on a function whose whole job is to put bytes
+    somewhere specific is an invitation to omit the one argument that decides
+    whether the result can ever be found. There is no default now, so omitting
+    it is a `TypeError` at import-adjacent test time rather than a wrong path at
+    8 GB. Prefer `stage_scene_tree`, which owns the whole sequence; this is the
+    transfer primitive under it.
 
     `level` defaults to whatever `scene_zstd_level` measures for this file
     rather than to a constant; pass one explicitly to override.
     """
-    remote_path = remote_path or f"{config.REMOTE_ROOT}/scene.blend"
     if level is None:
         level, why = scene_zstd_level(scene)
         log.info("compressing %s at zstd -%d (%s)", scene.name, level, why)

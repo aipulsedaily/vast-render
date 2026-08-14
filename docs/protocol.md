@@ -231,6 +231,39 @@ and a spec carrying a field the server does not know is rejected too.
 | `timeout_s` | int | 1..3600. Hard kill of the child's whole **process group** |
 | `blender_args` | `list[str]` | e.g. `["-b", "--factory-startup"]`. May not contain `-P` or any `--python*` flag |
 | `cpu_slots` | int | slots this job occupies; must be ≤ the server's total |
+| `scene_digest` | string | optional; digest of a scene in the **scene cache**, linked into the job as `scene.blend`. Given together with `scene_name` or not at all |
+| `scene_name` | string | optional; the blend's original filename **inside** that digest's directory. A bare filename — never a path |
+
+### The scene cache is one directory with one contract
+
+    /workspace/scenes/<digest>/<original-name>.blend
+    /workspace/scenes/<digest>/blendcache_<name>/   sibling cache trees
+    /workspace/scenes/<digest>/.complete            written LAST, atomically
+
+`.complete` is the whole of what "staged" means. It is written only after the
+blend has landed at its final path and every sibling cache tree has been
+verified by file count and byte count, so a half-copied cache tree can never
+read as cached — Blender answers a missing physics cache by *simulating*, which
+produces a different image and no error.
+
+**Both job types read this directory and there is exactly one writer for it:**
+`remote.stage_scene_tree`. That is not a style preference. There used to be two
+writers — `Fleet._ensure_scene_cached` for renders and
+`ExecService.ensure_scene_staged` for exec — and the second one wrote the blend
+to `/workspace/scene.blend` (an old default of `remote.push_scene`) and never
+wrote a marker at all. A scene whose only push came from `rq exec` was therefore
+unusable by `rq exec`, while the same scene on an instance a render job had
+warmed worked perfectly. Job dea2b1d24914 paid for that with three 7.97 GB
+pushes in five and a half minutes.
+
+`worker/exec_server.py` reads this path from `dirname(--root)/scenes` — the exec
+root's **parent** — and refuses a scene with no marker. A refusal carrying
+`is not completely staged on this instance` is matched by the broker
+(`remote.NOT_STAGED_MARK`) and made **terminal on the first occurrence**: it
+means the reader and the writer disagree about a path, which no retry resolves
+and every retry pays for in gigabytes. The most likely cause is an
+`exec_server.py` on the instance older than the broker — `ensure_ready` will not
+replace one while the exec server is running, so it must be stopped explicitly.
 
 ## What a job gets, and what it may touch
 
@@ -278,16 +311,47 @@ and has already signalled the process group.
 | command | effect |
 |---|---|
 | `{"cmd": "ping"}` | slots, in-flight job ids, free disk, **container** memory available |
+| `{"cmd": "cancel", "job_id": …}` | kill that one job's process group; frees its slots |
 | `{"cmd": "release", "job_id": …}` | delete one job directory; refuses while it is running |
 | `{"cmd": "purge", "older_than_s": N}` | sweep job directories older than N seconds |
 | `{"cmd": "bundles"}` | staged bundles and whether each is complete |
 | `{"cmd": "shutdown"}` | exit |
 
+### `cancel` targets one job id, never a name
+
+`rq cancel` on an exec job used to flip a SQLite row and nothing else — there
+was no path from the broker to a dispatched child. Instance 47040457,
+2026-08-07: job `a39bd71095f9` was cancelled at 03:46 and answered
+`{"canceled": true}`; its Blender child ran until its own `timeout_s` expired at
+04:44, holding 6 of 12 slots and ~8 GB of a loaded assembly. Another agent's
+jobs were refused by the memory gate for want of exactly that memory in the same
+window, and one was OOM-killed at `Read blend`.
+
+The exec server resolves the job id to the `Popen` **it** created and kills that
+process's own group — the group `start_new_session=True` made, which is why the
+whole tree dies rather than just the process the supervisor holds a handle to.
+It is never a pattern and never a process name: `pkill -f` matching a remote
+command line has already killed the render worker holding a warm scene once, and
+killing by name is how a stale worker silently served the previous scene.
+`reap_orphans` identifies its victims by cwd because "the honest signal is the
+working directory", and that test cannot be reused here — every live exec child
+has a cwd inside the exec root, so it names the whole population.
+
+The reply carries `canceled: true`, on both the cancel and on the cancelled
+job's own reply, so a deliberate stop is never read as a failing build and never
+spends a retry. A cancel for a job the server has not heard of is recorded for
+an hour and the job is **refused on arrival**: the broker calls a job dispatched
+from the moment it hands it to a thread, and that thread may spend minutes
+pushing an 8 GB scene before this server learns the id.
+
+Slots are released by the job thread's own `finally`, so a killed child gives
+them back exactly as a finished one does. A kill that leaked its slots would
+just move the bug.
+
 ## Memory is measured from the cgroup, never from `free`
 
 `nproc`, `/proc/meminfo` and `/proc/loadavg` inside this container are all the
-**host's** and all overstate what may be used. Measured on the instance running
-this campaign:
+**host's** and all overstate what may be used. Measured on instance 46819442:
 
     /sys/fs/cgroup/cpu.max      2304000 100000  ->  23.04 CPUs
     /sys/fs/cgroup/memory.max   97169440768     ->  90.5 GiB
@@ -295,7 +359,28 @@ this campaign:
     MemTotal                    188 GB
     loadavg                     99.5   (mostly other tenants)
 
+**THOSE TWO LIMITS ARE PROPERTIES OF ONE RENTAL, NOT OF "the container".**
+They vary by offer, by a lot, and planning concurrency against the numbers
+above will overcommit a smaller box. Measured on instance 47049525, rented from
+a different offer six days later:
+
+    /sys/fs/cgroup/cpu.max      3071999 100000  ->  30.72 CPUs
+    /sys/fs/cgroup/memory.max   62403903488     ->  58.1 GiB
+    nproc                       32
+    MemTotal                    63.5 GB
+
+More CPU and a third less memory, on the same image, for the same price. So the
+only number worth planning against is the one the box you actually got reports,
+which the exec server prints the moment it comes up and answers on every ping:
+
+    exec server ready: 12 slot(s), 84.4 GB free disk, 60.1 GB memory available
+
+`memory_available()` is `memory.max - memory.current`, so it also falls as page
+cache accumulates — a large figure early in a rental is not a promise.
+
 A job is held at the door until the container has `--min-free-mem-gb`
 available, and each child sets `oom_score_adj=800` — because a cgroup OOM picks
 by RSS, and the largest RSS on this box is the render worker holding a
-multi-gigabyte scene resident.
+multi-gigabyte scene resident. The broker's `ExecMemoryShort` gate reasons
+against the **live** `mem_available` from that ping, never against a constant,
+which is why it is correct on both boxes above without knowing either.
