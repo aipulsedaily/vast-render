@@ -1,0 +1,33 @@
+vast-render
+Copyright (C) 2026 the vast-render authors.
+
+This product includes software developed by the vast-render authors.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License in the accompanying LICENSE file, or at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+--------------------------------------------------------------------------------
+
+THIRD-PARTY CODE: none is vendored in this repository. `vastai`, FastAPI and
+uvicorn are declared dependencies, installed separately, and carry their own
+licences; nothing from them is copied into this tree.
+
+RELATED WORK: this broker was built to render the film in the companion
+repository `f1-round2`, which is licensed GPL-3.0-or-later. The two are separate
+works communicating over a process boundary and a network; neither is a
+derivative of the other.
+
+OPERATIONAL WARNING, restated here because a NOTICE file is the thing that
+travels with a redistribution: this software rents billable GPU hardware on the
+operator's own cloud account, and rented hardware keeps billing until it is
+explicitly destroyed. Sections 7 and 8 of the License disclaim all warranty and
+all liability for that. Anyone redistributing a modified version should keep this
+paragraph.

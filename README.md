@@ -311,7 +311,53 @@ Test suites live beside the code they cover (`broker/test_broker.py`,
 `worker/test_worker.py`, `worker/test_exec_server.py`, `farm/test_*.py`) and are
 the main thing standing between a bad edit and a dead render pipeline.
 
+## Contributing, and one thing to set before your first commit
+
+**Set your git identity to a noreply address before you commit.** This
+repository's `.git/config` is preconfigured with
+
+```
+user.email = noreply@users.noreply.github.com
+```
+
+which keeps a personal address out of future commits. That generic form works,
+but GitHub will not attribute the commits to you. Replace it with your own
+address — the numeric ID is on `https://api.github.com/users/<username>`:
+
+```bash
+git config user.email 'ID+username@users.noreply.github.com'
+git config user.name  'Your Name'
+```
+
+This is local configuration only. It changes nothing that is already committed:
+**the existing history still carries a personal address on 40 of its 61
+commits.** Rewriting that history is cheap in this repository — 57-odd commits,
+no culture of citing commit SHAs in the docs — so `git filter-repo --mailmap` is
+a real option here in a way it is not in the companion repository. That is a
+decision for the owner, before publishing.
+
+Tests live beside the code they cover and are the contribution bar: a change to
+the broker without a test in `broker/test_broker.py` will not be believed.
+
 ## Licence
 
-**Not yet chosen — see `LICENSE`.** Until one is added, default copyright
-applies and all rights are reserved.
+**Apache-2.0** — see `LICENSE` for the full text and `NOTICE` for the
+attribution notice that travels with redistributions.
+
+Chosen over MIT for two reasons specific to this tool rather than by habit.
+First, the **express patent grant**: this is infrastructure other people may
+deploy commercially, and MIT's silence on patents protects neither side.
+Second, the **warranty and liability disclaimers**, which are load-bearing for
+software that rents billable hardware on somebody else's cloud account —
+sections 7 and 8 exist so that nobody can argue the author warranted their bill.
+
+The `bpy`/GPL question that pushes the companion repository `f1-round2` to
+GPL-3.0-or-later barely reaches here: only `worker/server.py` runs inside
+Blender, and nothing else imports `bpy`. Apache-2.0 is one-way compatible with
+GPL-3.0 anyway, so anyone who wants that file under the GPL can take it there.
+
+**The owner can change this before publishing.** It was applied so the
+repository would not go public in the no-licence, all-rights-reserved default
+state, which for a broker whose whole value is that other people can run it
+would defeat the point. After the first public copy the position is asymmetric:
+future versions can be relicensed, copies already released cannot be recalled.
