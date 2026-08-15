@@ -1,0 +1,83 @@
+PLACEHOLDER — NO LICENCE HAS BEEN CHOSEN YET. THIS IS A DECISION FOR THE OWNER.
+
+Until this file is replaced with a real licence, the default applies:
+ALL RIGHTS RESERVED. Nobody may copy, modify or redistribute this work.
+
+Publishing a repository without a licence does NOT make it open source. A
+public repository with no licence is "all rights reserved" by default: readers
+may view it, but they have no legal right to use, fork, modify or redistribute
+any of it. For a piece of infrastructure like this one, that is usually the
+opposite of the intent — the whole value of publishing a broker is that other
+people can run it.
+
+--------------------------------------------------------------------------------
+WHAT THIS REPOSITORY CONTAINS
+--------------------------------------------------------------------------------
+
+Original Python and shell: a job queue and dispatcher, GPU rental lifecycle
+management, a remote execution protocol, a warm Blender worker, image
+verification, and the tests for all of it. Plus ~5,300 lines of operational
+documentation.
+
+Unlike the companion repository, this one is uncomplicated:
+
+  * It is a NETWORK/INFRASTRUCTURE tool. It talks to Blender by launching it as
+    a subprocess and by sending it scripts to run — it does not link Blender,
+    and `worker/exec_server.py` deliberately never imports `bpy` at all.
+    `worker/server.py` does run inside Blender, so if you want to be strict,
+    that one file is the only place the bpy/GPL question below arises.
+
+  * It has no vendored third-party code. It depends on the `vastai` SDK,
+    FastAPI and uvicorn, all of which are permissively licensed and are
+    dependencies rather than included code.
+
+  * It contains no creative work and no artistic output.
+
+--------------------------------------------------------------------------------
+THE ONE THING TO CHECK
+--------------------------------------------------------------------------------
+
+Blender is GPL, and the Blender Foundation's position is that Python scripts
+using the `bpy` API and distributed publicly must be GPL-compatible. In this
+repository that argument reaches, at most, `worker/server.py` — the script the
+broker sends to Blender to run — and not the broker, the CLI, the fleet
+management or the tests, none of which import `bpy`.
+
+Options, if you care about being precise:
+
+  * license the whole repository under a permissive licence and accept that
+    `worker/server.py` is arguably in scope; or
+  * license the repository permissively and mark `worker/server.py` GPL; or
+  * license the whole thing GPL-3.0-or-later, matching the companion repository
+    and sidestepping the question entirely.
+
+This is a judgement call, not a settled fact, and nothing here is legal advice.
+
+--------------------------------------------------------------------------------
+RECOMMENDATION, TO BE ACCEPTED OR REJECTED BY THE OWNER
+--------------------------------------------------------------------------------
+
+    Apache-2.0
+
+Recommended over MIT for two specific reasons rather than by habit:
+
+  * It includes an EXPRESS PATENT GRANT. This is infrastructure that others may
+    build on and deploy commercially; Apache-2.0 protects both them and you in
+    a way MIT's silence on patents does not.
+
+  * It requires changes to be marked, which is worth something for a tool whose
+    misbehaviour costs real money on somebody's cloud account.
+
+Choose MIT instead if you want the shortest, most permissive thing possible and
+do not care about the patent grant. Choose GPL-3.0-or-later if you would rather
+that improvements come back, or if you want both repositories to carry the same
+licence and want the bpy question closed rather than reasoned about.
+
+A NOTE WORTH KEEPING WHATEVER YOU CHOOSE: whichever licence lands here, it
+should be accompanied by a disclaimer of warranty — all three options above
+include one. This software rents billable hardware. It has safeguards, and it
+has still misjudged instance state in development. Nobody should be able to
+argue you warranted their cloud bill.
+
+DO NOT PUBLISH WITH THIS PLACEHOLDER STILL IN PLACE without at least deciding
+that "all rights reserved" is what you want.

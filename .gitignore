@@ -54,3 +54,33 @@ blender-*.tar.zst
 __pycache__/
 *.pyc
 .venv/
+
+# CREDENTIALS. Defence in depth, and deliberately BROAD.
+#
+# Nothing here is currently a credential file, and the rules above already cover
+# the three key-bearing paths on disk (`state*/` for the databases and logs,
+# `out*/` for returned frames, `farm/bad_hosts.json`). This block is not about
+# today's tree; it is about the day somebody writes a key to disk in a hurry and
+# the ignore file has nothing to say about it.
+#
+# The API key must come from the `VAST_API_KEY` environment variable, which the
+# vast.ai SDK prefers over every config file it looks at (see README). It must
+# never be written into this tree at all — this block is the backstop for when
+# that rule is broken, not a place to keep keys safely.
+#
+# `id_*` is wide on purpose: it catches `id_rsa`, `id_ed25519` and the
+# `id_vast_render` key this broker authenticates instances with. Verified
+# against `git ls-files` when added — no tracked file matches any pattern here,
+# so nothing became invisible. Re-check that before extending the list, because
+# a rule that silently hides a tracked source file is its own incident.
+.env
+.env.*
+.envrc
+.netrc
+*.pem
+*.key
+id_*
+*api_key*
+*secret*
+*token*
+credentials*
