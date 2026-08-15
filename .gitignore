@@ -34,10 +34,33 @@ state[0-9]*/
 # rather than a `state*/` directory because it belongs to the fleet and not to
 # any one broker (see broker/fleet.py CondemnedIds), but it is still machine
 # state: it changes whenever a rental fails and it is a statement about today's
-# market. `farm/hostrates.json` beside it IS tracked, because that one is a
-# measurement of hardware we chose to keep.
+# market.
 farm/bad_hosts.json
 farm/bad_hosts.json.tmp
+
+# `farm/hostrates.json` was TRACKED until 2026-08-15, on the reasoning that a
+# measurement of hardware is worth keeping. It is excluded now, because of what
+# it is keyed ON rather than what it measures.
+#
+# The file is `machine_id -> {spec_hash: {dph, sec_per_frame, ...}}` (see
+# `farm/procure.py load_rates`), so it carries real vast.ai machine ids beside
+# the exact rate values that `docs/fleet.md` publishes under the aliases
+# "host A-D". Anyone holding both files joins them on those values and recovers
+# every identifier the aliasing was for. While this file was tracked, the docs'
+# redaction was cosmetic.
+#
+# UNTRACKED RATHER THAN GENERICISED, and that way round on purpose: the machine
+# id IS the lookup key (`rates.get(str(machine))` in `procure.rate_for`), so
+# opaque labels would not break the leak, they would break the TABLE -- every
+# lookup missing, every estimate silently falling back to PRIOR_SEC_PER_FRAME
+# while still reading as measured. That is exactly the "wrong by factors"
+# failure this file was created to prevent.
+#
+# Nothing needs it in a fresh clone: `load_rates()` returns {} when it is absent
+# and `rate_for` then reports a labelled "PRIOR -- never measured", which is the
+# designed path for an unmeasured host. `fleetctl record` rebuilds it for about
+# $0.02 a host. It is machine state, like `bad_hosts.json` above it.
+farm/hostrates.json
 
 # Scene copies pushed to the worker -- these are f1-round2 artefacts, tracked
 # (or deliberately not tracked) over there

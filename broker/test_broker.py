@@ -6237,7 +6237,92 @@ def test_a_condemnation_outlives_the_retirement_and_reaches_every_broker() -> No
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_the_api_key_never_survives_a_logged_failure() -> None:
+    """`redact()`, on the exact string that leaked — the test it never had.
+
+    The vast.ai SDK puts the API key in the QUERY STRING of every request, so
+    the HTTPError it raises carries the account's live key in `str(exc)`. On
+    2026-07-28 one failed offer lookup put that key into three places at once:
+    `state/broker.log`, the job's stored `err` column, and
+    `out/seq/animtest/manifest.json` — the last of which `seq.write_manifest`
+    builds SPECIFICALLY so that a directory can travel without its database. A
+    credential sitting in a file designed to be handed to somebody is the worst
+    of the three, and it is the one nobody would think to look in.
+
+    `redact()` is the whole of the fix, and until now the one function standing
+    between that key and every log line had no test at all.
+
+    So this proves the danger before it proves the cure: step 1 asserts that the
+    raw text really does still carry the key, because a test that only checked
+    the redacted output would pass just as happily against a `redact()` that had
+    been quietly reduced to `return text`.
+
+    KNOWN BOUND, asserted at the end so it cannot rot into a surprise: this
+    redacts the key only where it follows `api_key=`. A bare key, or one moved
+    into a header or a renamed parameter by some future SDK, goes straight
+    through. The query string is where this SDK puts it today; that is the
+    reason for the shape of the regex, not evidence that no other shape exists.
+    """
+    # A synthetic key with the shape of the real one (64 hex). NEVER the real
+    # key: a test fixture is a tracked file, which is how this whole thing
+    # started.
+    fake = "0123456789abcdef" * 4
+    url = f"https://console.vast.ai/api/v0/asks/43687899/?api_key={fake}"
+    raw = f"400 Client Error: Bad Request for url: {url}"
+
+    # 1. THE DANGER IS REAL — unredacted, the key is simply present.
+    check("the raw SDK error really does carry the key (the leak is reachable)",
+          fake in raw, f"...{raw[-24:]}")
+
+    # 2. THE CURE.
+    clean = remote.redact(raw)
+    check("redact() removes the key", fake not in clean, clean[-60:])
+    check("redact() leaves evidence that something WAS removed",
+          "api_key=<redacted>" in clean, clean[-60:])
+    check("redact() keeps the diagnostic context that makes the line useful",
+          "400 Client Error" in clean and "asks/43687899" in clean, clean[:64])
+
+    # 3. `diagnose()` is the funnel every logged failure passes through, and
+    #    app.py stores its output into jobs.err. It must redact too.
+    quiet = remote.diagnose(urllib.error.HTTPError(url, 400, raw, {}, None))
+    check("diagnose() redacts what it wraps", fake not in quiet, quiet[-60:])
+
+    # 4. The shapes that ACTUALLY occurred, plus the neighbours of each. The
+    #    manifest embedded the URL in a JSON string (key terminated by `"`); the
+    #    log had it mid-sentence (terminated by whitespace); a retry logged two
+    #    in one line.
+    for what, text in (
+        ("inside a JSON string value", json.dumps({"err": raw})),
+        ("mid-sentence, with text after it", f"{raw} — instance 46077186 left alone"),
+        ("twice in the same line", f"{raw} then again {url}"),
+        ("with a following query parameter", f"{url}&owner=1"),
+        ("upper-cased by some other layer", raw.replace("api_key=", "API_KEY=")),
+    ):
+        out = remote.redact(text)
+        check(f"redact() catches the key {what}", fake not in out, out[-70:])
+
+    # The `&` case must redact the key WITHOUT eating the parameter after it.
+    check("redact() stops at the parameter boundary",
+          remote.redact(f"{url}&owner=1").endswith("&owner=1"),
+          remote.redact(f"{url}&owner=1")[-30:])
+
+    # 5. It must not eat prose that merely mentions the key or its file.
+    benign = "the key is read from ~/.config/vastai/vast_api_key (0600)"
+    check("redact() leaves prose about the key FILE alone",
+          remote.redact(benign) == benign, remote.redact(benign))
+
+    # 6. The bound, stated as a test so it is a decision rather than a gap
+    #    somebody discovers in a log. If a future SDK moves the key into a
+    #    header, THIS is the check that will still be passing while the key
+    #    leaks — so it is written to say so out loud.
+    bare = f"Authorization: Bearer {fake}"
+    check("KNOWN BOUND: a key NOT written as `api_key=` is not redacted — if "
+          "the SDK ever moves it, _SECRET_RE must move too",
+          fake in remote.redact(bare), "documented limitation, not a pass")
+
+
 OFFLINE_TESTS = (
+    "test_the_api_key_never_survives_a_logged_failure",
     "test_a_condemnation_outlives_the_retirement_and_reaches_every_broker",
     "test_the_live_http_guard_refuses_before_it_opens_a_socket",
     "test_a_dns_outage_never_condemns_the_hardware",

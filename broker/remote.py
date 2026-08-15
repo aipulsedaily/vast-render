@@ -387,7 +387,7 @@ class DiskFull(RemoteError):
 # around. Observed verbatim in broker.log:
 #
 #     HTTPError: 400 Client Error: Bad Request for url:
-#     https://console.vast.ai/api/v0/asks/43687899/?api_key=942dc099...
+#     https://console.vast.ai/api/v0/asks/43687899/?api_key=<64 hex chars>
 #
 # That key IS the account: it can rent, destroy and spend. `diagnose` is the one
 # function every logged failure passes through, so it is the one place this can
