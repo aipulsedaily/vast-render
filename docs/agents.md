@@ -83,7 +83,7 @@ Every returned PNG is decoded and its luminance measured, and the numbers are
 printed whether or not anything is wrong:
 
 ```
-7f3a91c2b004  done in 182.7s -> /home/zany/vast-render/out/7f3a91c2b004.png
+7f3a91c2b004  done in 182.7s -> ~/vast-render/out/7f3a91c2b004.png
           image     OK  mean 0.5173  sd 0.1686  range 0.082-1.000  234 levels
 ```
 
@@ -135,7 +135,7 @@ a41f9c2b7e10  queued — sequence beat3_breach
           frames 620-980  (361 total)
           0 already delivered, 361 to render
           scene beat3.blend (99d8f30a6e51)  spec 23773a092160b4b5
-          -> /home/zany/vast-render/out/seq/beat3_breach
+          -> ~/vast-render/out/seq/beat3_breach
           PROJECTED COST $14.82 — 361 frames x 412s = 41.3 GPU-hours ...
 ```
 
@@ -348,16 +348,16 @@ what is waiting per scene.
 Scene names are validated against the broker's scene **roots** — a list, not one
 directory, so several projects can be served at once:
 
-    /home/zany/opus5-car-render/work      round 1
-    /home/zany/f1-round2/world            round 2
-    /home/zany/f1-round2/render
-    /home/zany/vast-render/scenes         test and preview scenes
+    ~/opus5-car-render/work      round 1
+    ~/f1-round2/world            round 2
+    ~/f1-round2/render
+    ~/vast-render/scenes         test and preview scenes
 
 Set `VASTRENDER_SCENE_ROOTS` (colon-separated) to override the list wholesale;
 the defaults live in `broker/config.py` and are included only when the directory
 exists. Anything resolving outside every root is rejected with HTTP 400 at
 submit time — resolved first, symlinks and `..` included, then checked for
-containment, so `/home/zany/f1-round2-evil/` does not slip past on a prefix.
+containment, so `~/f1-round2-evil/` does not slip past on a prefix.
 
 ## Running many agents at once
 
@@ -534,7 +534,7 @@ Ship code, not blends: the whole input for an item build is `world/*.py`,
 and cached — and nothing else goes up.
 
 ```bash
-./rq exec --root /home/zany/f1-round2 \
+./rq exec --root ~/f1-round2 \
           --include 'world/*.py' --include 'world/items/*.py' \
           --include 'tools/*.py' --include 'docs/*.json' \
           --entry tools/build_item.py \
@@ -559,7 +559,7 @@ output **fails the job** — this is the check that catches a build reporting
 success while producing nothing.
 
 **Paths must stay inside the job.** `--save tmp/x.blend` is fine;
-`--save /home/zany/f1-round2/world/items/x_test.blend` is refused. The project
+`--save ~/f1-round2/world/items/x_test.blend` is refused. The project
 trees are read-only to this system and they do not exist on the instance
 anyway. Write to `out/` what you want back and to `tmp/` what you do not.
 

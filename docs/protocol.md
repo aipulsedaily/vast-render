@@ -320,7 +320,7 @@ and has already signalled the process group.
 ### `cancel` targets one job id, never a name
 
 `rq cancel` on an exec job used to flip a SQLite row and nothing else — there
-was no path from the broker to a dispatched child. Instance 47040457,
+was no path from the broker to a dispatched child. On a rented instance,
 2026-08-07: job `a39bd71095f9` was cancelled at 03:46 and answered
 `{"canceled": true}`; its Blender child ran until its own `timeout_s` expired at
 04:44, holding 6 of 12 slots and ~8 GB of a loaded assembly. Another agent's
@@ -351,7 +351,7 @@ just move the bug.
 ## Memory is measured from the cgroup, never from `free`
 
 `nproc`, `/proc/meminfo` and `/proc/loadavg` inside this container are all the
-**host's** and all overstate what may be used. Measured on instance 46819442:
+**host's** and all overstate what may be used. Measured on one rental:
 
     /sys/fs/cgroup/cpu.max      2304000 100000  ->  23.04 CPUs
     /sys/fs/cgroup/memory.max   97169440768     ->  90.5 GiB
@@ -361,8 +361,8 @@ just move the bug.
 
 **THOSE TWO LIMITS ARE PROPERTIES OF ONE RENTAL, NOT OF "the container".**
 They vary by offer, by a lot, and planning concurrency against the numbers
-above will overcommit a smaller box. Measured on instance 47049525, rented from
-a different offer six days later:
+above will overcommit a smaller box. Measured on a second rental, from a
+different offer six days later:
 
     /sys/fs/cgroup/cpu.max      3071999 100000  ->  30.72 CPUs
     /sys/fs/cgroup/memory.max   62403903488     ->  58.1 GiB

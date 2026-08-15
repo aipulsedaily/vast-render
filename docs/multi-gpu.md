@@ -51,9 +51,9 @@ differs.
 
 | host | $/hr all-in | $/GPU-hr | frame 30 |
 |---|---|---|---|
-| `47039886` Florida, 1x, Ryzen 9 9950X3D 32c/61.6 GB | 0.4488 | 0.4488 | **151.0 s** |
-| `47065580` S. Africa, 1x, Ryzen 9 7950X 32c/63.4 GB | 0.39987 | 0.39987 | **166.8 s** |
-| `47083562` California, 8x, EPYC 192c/503 GB | 2.7100 | **0.3387** | **219.65 s** one GPU |
+| Florida, 1x, Ryzen 9 9950X3D 32c/61.6 GB | 0.4488 | 0.4488 | **151.0 s** |
+| S. Africa, 1x, Ryzen 9 7950X 32c/63.4 GB | 0.39987 | 0.39987 | **166.8 s** |
+| California, 8x, EPYC 192c/503 GB | 2.7100 | **0.3387** | **219.65 s** one GPU |
 | — the same box, all 8 GPUs on that ONE frame | | | **172.8 s** |
 | — the same box, 8 concurrent workers, one GPU each | | | **225.42 s** mean |
 
@@ -150,7 +150,7 @@ Not free of friction, just free of code:
 
 ## Corrections to specific claims below this line
 
-* **"exclusive 8x (`46354162`) $0.3337/GPU-hr, ~9 h, $24.0"** — the rate is
+* **"exclusive 8x $0.3337/GPU-hr, ~9 h, $24.0"** — the rate is
   right and the conclusion drawn from it is not. It assumes a GPU-hour on a wide
   box does the same work as a GPU-hour on a narrow one. Measured, it does 69 %
   as much.
@@ -193,7 +193,7 @@ ladder pass (2,978 frames @ 63.4 s = 52.4 render-hours):
 | **exclusive 1×** | 0.455 | 0.455 | 64 h | $29.1 |
 | exclusive 2× | 0.8014 | 0.4007 | ~33 h | $26.4 |
 | exclusive 4× | 1.5481 | 0.3870 | ~17 h | $26.3 |
-| exclusive 8× (`46354162`) | 2.6694 | **0.3337** | ~9 h | $24.0 |
+| exclusive 8× | 2.6694 | **0.3337** | ~9 h | $24.0 |
 
 **Every shape lands within about $5 of the others on a ~$25 pass.** The
 per-GPU saving on the 8-way box is real and is the best on the exclusive
@@ -219,7 +219,7 @@ the master renders, which is the whole reason the ladder discipline exists.
 > and beats 1-3 at `beat1_anim.blend`'s 60.2 s. Neither is the film. Nine
 > frames of `film16_breach.blend` — the ship candidate — were rendered at
 > 3840×2160 / 512 samples on an exclusive 5090 (`gpu_frac 1.0`, $0.4444/hr
-> all-in, instance 47039886), sampled across all six beats because the ladder
+> all-in, the Florida card above), sampled across all six beats because the ladder
 > had already shown beat 1 costing 72 s/frame against the close-out's 43 s:
 >
 > | beat | frames | measured s/frame | sampled at |

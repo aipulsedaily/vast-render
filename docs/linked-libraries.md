@@ -81,7 +81,7 @@ Stated because the answer above is only as good as its coverage.
 
 `work/f1_exploded_posed_hq.blend` stores
 `//../../../../usr/share/blender/5.2/datafiles/assets/nodes/geometry_nodes_essentials.blend`.
-The instance has no `/usr/share/blender` (verified on 46712525) and the scene
+The instance has no `/usr/share/blender` (verified on a rented box) and the scene
 is uploaded to `/workspace/scenes/<digest>/`, from which that relative path
 resolves to nothing. It still renders correctly.
 
@@ -166,7 +166,7 @@ be readable *on the instance*:
 * a `//`-relative reference that stays inside the scene's own directory and
   whose first component is a directory `sibling_dirs_for` uploads.
 
-Everything else is refused, naming each path. An absolute `/home/zany/...`
+Everything else is refused, naming each path. An absolute `/home/<user>/...`
 library can never resolve: nothing creates that tree on a rented box.
 
 ## R2-360 — the gate, at load
@@ -183,8 +183,8 @@ linked, all resolved`, or `MISSING LIBRARY: <path>` — so "no libraries" and
 the blank gate fell into.
 
 Blender's own bundled libraries are not special-cased in the worker and do not
-need to be: they resolve against the running installation, and 46712525 carries
-`/workspace/blender/5.2/datafiles/assets/`.
+need to be: they resolve against the running installation, and the rented image
+carries `/workspace/blender/5.2/datafiles/assets/`.
 
 ## R2-361 — `missing_assets` now matches every way Blender says "not found"
 

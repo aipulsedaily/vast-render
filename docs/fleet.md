@@ -6,7 +6,7 @@ that wins, and what it actually measured.
 
 ```
 .venv/bin/python fleetctl plan   -n 4 --frames 2715-2762 --sec-per-frame 235 --push-sec 300
-.venv/bin/python fleetctl up     -n 4 --scene /home/zany/f1-round2/render/film17_R2943.blend --cap 8
+.venv/bin/python fleetctl up     -n 4 --scene $SCENE_ROOT/film17_R2943.blend --cap 8
 .venv/bin/python fleetctl submit -n 4 --scene ... --frames 2715-2762 --name proof \
                                  --res 3840 2160 --samples 512 --cam ONER
 .venv/bin/python fleetctl status -n 4
@@ -112,12 +112,12 @@ and a 4.5× fetch spread between two live hosts.
 
 **Four brokers pushed `film17_R2943.blend` (7,980 MB) concurrently:**
 
-| broker | host | blender 481 MB | scene 7,980 MB | scene MB/s raw | rent→ready |
-|---|---|---|---|---|---|
-| 5 | 192.0.2.20 | 8.9 s (54.4 MB/s) | **191.5 s** | 41.7 | 258 s |
-| 6 | 192.0.2.21 | 15.7 s (30.7 MB/s) | **242.6 s** | 32.9 | 356 s |
-| 3 | 192.0.2.22 | 44.3 s (10.9 MB/s) | **389.8 s** | 20.5 | 613 s |
-| 4 | 192.0.2.23 | 63.8 s (7.5 MB/s) | **439.9 s** | 18.1 | 625 s |
+| broker | blender 481 MB | scene 7,980 MB | scene MB/s raw | rent→ready |
+|---|---|---|---|---|
+| 5 | 8.9 s (54.4 MB/s) | **191.5 s** | 41.7 | 258 s |
+| 6 | 15.7 s (30.7 MB/s) | **242.6 s** | 32.9 | 356 s |
+| 3 | 44.3 s (10.9 MB/s) | **389.8 s** | 20.5 | 613 s |
+| 4 | 63.8 s (7.5 MB/s) | **439.9 s** | 18.1 | 625 s |
 
 All four overlapped for 106 s; three for a further 119 s. 31,920 MB of source
 moved in 527 s wall = **60.6 MB/s aggregate**, and the blend compresses **5.43×
@@ -162,12 +162,12 @@ continuously on this platform. Four cards rented within two minutes of each
 other, `dph_total` **off the API** (which includes storage; the broker's
 headline `dph` does not, and is 1.5–8.9 % low):
 
-| instance | machine | API $/hr | gpu_frac |
-|---|---|---|---|
-| 47088518 | 144732 | 0.4237 | 1.000 |
-| 47088546 | 127280 | 0.4356 | 1.000 |
-| 47088573 | 137580 | 0.4741 | 1.000 |
-| 47088605 | 43130 | 0.4889 | 1.000 |
+| host | API $/hr | gpu_frac |
+|---|---|---|
+| A | 0.4237 | 1.000 |
+| B | 0.4356 | 1.000 |
+| C | 0.4741 | 1.000 |
+| D | 0.4889 | 1.000 |
 
 **Mean $0.4556/hr, 15 % spread, all four exclusive.** Against the $0.4488 /
 $0.3999 the original comparison was built on, the market has moved up ~7–14 %,
@@ -178,14 +178,14 @@ so every dollar figure in `multi-gpu.md` is low by roughly that much.
 Same scene hash, same `spec_hash`, 12 frames each, all four rented within two
 minutes of one another:
 
-| machine | API $/hr | s/frame | **$/frame** |
+| host | API $/hr | s/frame | **$/frame** |
 |---|---|---|---|
-| 144732 | 0.4237 | 248.3 | **0.02922** ← cheapest per frame |
-| 127280 | 0.4356 | 249.7 | 0.03021 |
-| 137580 | **0.4741** | **233.4** ← fastest | 0.03074 |
-| 43130 | 0.4889 | 282.9 | 0.03843 |
+| A | 0.4237 | 248.3 | **0.02922** ← cheapest per frame |
+| B | 0.4356 | 249.7 | 0.03021 |
+| C | **0.4741** | **233.4** ← fastest | 0.03074 |
+| D | 0.4889 | 282.9 | 0.03843 |
 
-**The fastest card is not the cheapest per frame** — 137580 renders 6 % faster
+**The fastest card is not the cheapest per frame** — host C renders 6 % faster
 for 12 % more money, so it is 5 % dearer per frame. Price spread 1.15×, speed
 spread 1.21×, and they compounded: **$/frame spread 1.32×**.
 
@@ -203,7 +203,7 @@ reachable today with three to spare, and that is not comfortable margin — see
 the fleet-width note in `STAGING-R2-1241-to-R2-1270.md`.
 
 One real fleet-scale effect: **broker 6 tried to rent the offer broker 4 had
-just taken** (37398591) and got a 400. `_rent` fell through to the next offer in
+just taken** and got a 400. `_rent` fell through to the next offer in
 1 second and nothing was lost — but N brokers shopping one market converge on
 the same cheapest listing, and at N=8 that happens more often.
 

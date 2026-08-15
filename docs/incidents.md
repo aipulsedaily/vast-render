@@ -3,6 +3,10 @@
 Diagnoses worth keeping, because each one cost hours and none of them was the
 thing it first looked like. Newest first.
 
+> Rented-host identifiers (instance, machine and offer ids, addresses, ports)
+> are redacted. Where two events have to be linked, a stable alias is used
+> instead — `machine A`, `offer P`. Aliases are local to this document.
+
 ---
 
 ## #169 — a per-broker blacklist with a 6 h TTL burned a job's last retry attempt
@@ -14,9 +18,9 @@ This one cost a job.
 ### What happened
 
 ```
-18:22:57  fleet05  machine 58073 blacklisted for this session (ssh key injection failed)
-18:34:32  fleet04  renting offer 38769886 (machine 58073)          <- 12 minutes later
-18:39:10  fleet04  machine 58073 blacklisted for this session (ssh key injection failed)
+18:22:57  fleet05  machine A blacklisted for this session (ssh key injection failed)
+18:34:32  fleet04  renting offer P (machine A)                     <- 12 minutes later
+18:39:10  fleet04  machine A blacklisted for this session (ssh key injection failed)
 18:39:22  broker   job 467247848cc6 FAILED: sequence master4k stopped at frame 1766
                    after 0 frame(s) this pass: FleetUnavailable (0/3 rounds)
 ```
@@ -39,8 +43,8 @@ Measured lifetimes of `authorized_keys` failures on the same machine:
 
 | machine | first condemned | condemned again | interval |
 | --- | --- | --- | ---: |
-| 8512 | 2026-08-09 16:37 | 2026-08-12 05:56 | **61 h 19 min** |
-| 142281 | 2026-08-10 05:00 | 2026-08-11 05:02 | **24 h 02 min** |
+| B | 2026-08-09 16:37 | 2026-08-12 05:56 | **61 h 19 min** |
+| C | 2026-08-10 05:00 | 2026-08-11 05:02 | **24 h 02 min** |
 
 **No condemned host in this render ever recovered.** The TTL's rationale — *"a
 machine having a bad hour is not written off for the week"* — describes a
@@ -51,7 +55,7 @@ verdict expires before the cycle that could use it.**
 
 A create that returns **HTTP 400** never produces an instance, so the
 "destroyed as unusable" path that blacklists an offer is never reached. Offer
-46851284 400'd for **all three brokers** across two days and stayed top of the
+Q 400'd for **all three brokers** across two days and stayed top of the
 cheapest-first list each time, costing a price rung per re-rent.
 **The blacklist only learns from failures that got far enough to be destroyed.**
 
@@ -59,7 +63,7 @@ cheapest-first list each time, costing a price rung per re-rent.
 > state files.** `_rent` already condemns the offer on a create failure —
 > `except Exception: self.bad_offers.add(offer_id)`, right around the
 > `vastctl.create` call — and it always has. `state3/bad_hosts.json` contains
-> exactly one entry, `{"offers": {"46851284": ...}}`, written by that path at
+> exactly one entry, `{"offers": {"Q": ...}}`, written by that path at
 > 17:17:35 on 2026-08-11. So each broker *did* record the 400 and did not buy
 > that offer again. What produced the three-brokers-two-days pattern was cause
 > **2**: fleet03 condemned it at 17:17:35, fleet05 bought it at 17:29:06 and
@@ -113,7 +117,7 @@ that is easy to miss: every write merges under an `flock` before it writes, so
 one broker's verdict never erases another's; every write publishes immediately;
 and **`refresh()` re-reads before the list is used**. A shared file nobody
 re-reads is still a private file — fleet04 had been up for hours when fleet05
-condemned machine 58073, so a load that happens only at construction misses the
+condemned machine A, so a load that happens only at construction misses the
 verdict by exactly as much as a separate file did. `_rent` refreshes.
 
 Two consequences fell out of sharing:
@@ -138,19 +142,19 @@ null, and there is now a test so it stays closed.
 
 | check | pre-fix |
 | --- | --- |
-| a host still broken 61 h later is still condemned | machine 8512 gone from the list |
+| a host still broken 61 h later is still condemned | machine B gone from the list |
 | the TTL exceeds the longest measured defect | 24 h vs 61 h 19 m |
 | the TTL exceeds the retirement period that re-asks | 24 h vs 4 x 12 h |
-| the re-rent skips the machine a sibling just condemned | bought offer 38769886 |
+| the re-rent skips the machine a sibling just condemned | bought offer P |
 | two brokers condemning at once keep both verdicts | one verdict lost to the read-modify-write race |
 | the fleet's verdicts survive an empty market | file emptied by one broker's `clear()` |
 
 And separately, because a single-process test cannot show it, the incident's own
 shape was replayed with **two real processes** — a sibling broker started,
 left running, and sent shopping only after the other one condemned machine
-58073 and took a 400 on offer 46851284. Pre-fix it bought both
-(`attempted=[38769886, 46851284, 46285754]`); post-fix it bought neither
-(`attempted=[46285754]`). 1/5 → 5/5.
+A and took a 400 on offer Q. Pre-fix it bought both
+(`attempted=[P, Q, R]`); post-fix it bought neither
+(`attempted=[R]`). 1/5 → 5/5.
 
 #### One more defect, found by writing that proof
 
@@ -173,7 +177,7 @@ path where the lock could not be taken.
 
 The eight surviving `state<n>/bad_hosts.json` files were merged into
 `farm/bad_hosts.json` (newest stamp per id, 7 d TTL applied): 13 offers and 8
-machines carried forward, including 58073, 8512 and 46851284.
+machines carried forward, including machines A and B and offer Q.
 
 ---
 
@@ -367,7 +371,7 @@ it. **Narrow `--include` to the files the script actually reads.**
 
 `mkdir -p /workspace/scenes/139698d62abee3bf` (relief_2light_A2.blend) failed
 three times in nine seconds with `File exists`. The deploy retry gave up,
-`_deploy` classified it a **host-level failure**, and instance 46668588 was
+`_deploy` classified it a **host-level failure**, and the instance was
 destroyed: reachable, idle, 7 h uptime, 28 scenes and **5.46 GB of warm
 cache**. The replacement cost a 900 s rental wait, a 481 MB Blender push, a
 148 s deploy, an empty cache, and ~17 minutes of queue starvation.
@@ -412,7 +416,7 @@ else does it, the log will say what it was.
 `./rq status` showed the farm stopped dead:
 
     queue  {'canceled': 101, 'done': 1477, 'failed': 50, 'queued': 32}  depth=32
-    gpu    starting-worker  instance=46668588  up=2368.2s  idle=1574.7s
+    gpu    starting-worker  instance=<id>  up=2368.2s  idle=1574.7s
 
 Nothing `running`, `done` frozen at 1477, 32 jobs from four agents behind it.
 
@@ -617,7 +621,7 @@ whether a delivery is a delivery.
 ## 2026-07-28 — fixing the probe unmasked a misclassification, and it cost two GPUs
 
 Immediately after the `unknown`-forever wedge above was fixed, the fleet
-destroyed two **healthy** instances and blacklisted a **good** machine (96679).
+destroyed two **healthy** instances and blacklisted a **good** machine.
 The trigger was on this machine, not on vast.ai:
 
     bind [127.0.0.1]:8798: Address already in use
@@ -665,7 +669,7 @@ condemning good hardware for a fault that travels with the scene.
 
 `Fleet.contacted` became `Fleet.may_hold_render`, because those are not the same
 question. It had been set by any successful ssh command — but running `true` on
-a box cannot start a render, and instance 46124078 proved the gap: ssh worked
+a box cannot start a render, and one instance proved the gap: ssh worked
 long enough to provision, the Blender push then failed at 3.5% on all four
 retries, and the flag insisted a box that had never had Blender on it might be
 mid-frame. It is now set only where `start_worker` is called, plus
@@ -688,10 +692,10 @@ branch on belong in the type, not the prose.
 
 ## 2026-07-28 — a host that never wrote our ssh key wedged the broker permanently
 
-Every job failed for sixteen minutes against rented instance 46118513 while a
+Every job failed for sixteen minutes against a rented instance while a
 5090 billed at $0.356/hr. The broker's own message named the wrong cause:
 
-    SshNeverReady: sshd on 192.0.2.11:29502 never accepted a command within
+    SshNeverReady: sshd on <host>:<port> never accepted a command within
     240s of trying. The port answers TCP ... but the container behind it is not
     serving.
 
@@ -705,19 +709,19 @@ Two independent faults, one on vast.ai's side and one ours.
 and was worth doing before reading any code — showed a completed handshake, a
 vast.ai banner, our key offered, and a refusal:
 
-    debug1: Offering public key: /root/.ssh/id_vast_render ED25519 SHA256:5IW5/...
+    debug1: Offering public key: /root/.ssh/id_vast_render ED25519 SHA256:<redacted>
     debug1: Authentications that can continue: publickey
-    root@192.0.2.11: Permission denied (publickey).
+    root@<host>: Permission denied (publickey).
 
 Not a young container, not a port-mapping error, not our ssh options. Proved by:
 the account has exactly one key and it is the right one (`GET /api/v0/ssh/`);
 vast's control plane reported that key attached to that instance
-(`GET /api/v0/instances/46118513/ssh/`); `attach_ssh` answered *"SSH key already
+(`GET /api/v0/instances/<id>/ssh/`); `attach_ssh` answered *"SSH key already
 associated with instance"*; the **proxy relay refused it identically**, which
 rules out the direct port mapping; and `detach_ssh` + `attach_ssh` did not repair
 it in the following five minutes. Meanwhile the container's own onstart watchdog
 ran and self-destructed the instance at the 30-minute stale-heartbeat mark — so
-the container was healthy and only `authorized_keys` was missing. Machine 42763
+the container was healthy and only `authorized_keys` was missing. The machine
 simply failed to inject it.
 
 **Our fault, and the one that actually cost the evening.** `exit 255` is ssh's
@@ -982,7 +986,7 @@ failures it was never having.
 **Symptom.** An 8K frame reached the queue as
 
 ```
-job 54ed3b8bd22f  ->  failed: "WorkerBusy: refusing to restart the worker on 38.4..."
+job 54ed3b8bd22f  ->  failed: "WorkerBusy: refusing to restart the worker on <host>..."
 ```
 
 while the same instance, at the same moment, reported
@@ -1117,7 +1121,7 @@ tunnel 599 times over 30 minutes and blaming the process at the other end.
 **This instance's SSH endpoint flapped**, visible directly as
 
 ```
-ssh: connect to host 192.0.2.19 port 53303: Connection refused
+ssh: connect to host <host> port <port>: Connection refused
 mux_client_request_session: read from master failed: Broken pipe
 ```
 

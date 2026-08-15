@@ -7,7 +7,7 @@ Runbook for whoever owns the money. Agents should read
 
 ```bash
 cd ~/vast-render
-scripts/brokerd.sh start /home/zany/opus5-car-render/work/f1_complete.blend
+scripts/brokerd.sh start /path/to/scene.blend
 scripts/brokerd.sh status
 scripts/brokerd.sh stop        # stops supervising, then kill -9 (keeps the GPU)
 ```
@@ -18,7 +18,7 @@ section before starting one any other way.
 In the foreground, for a quick look:
 
 ```bash
-VASTRENDER_SCENE=/home/zany/opus5-car-render/work/f1_complete.blend \
+VASTRENDER_SCENE=/path/to/scene.blend \
   .venv/bin/python -m broker.app
 ```
 
@@ -235,8 +235,8 @@ cases and the idle timer against a stub fleet.
 
 The probe that produces those three answers is itself SSH, so on a host that
 refuses SSH it returns `unknown` **forever** — and "unknown blocks everything
-destructive" then means the broker can never replace the instance. Instance
-46118513 sat exactly there: correct host-level diagnosis, correct refusal to
+destructive" then means the broker can never replace the instance. One
+instance sat exactly there: correct host-level diagnosis, correct refusal to
 destroy a possibly-rendering GPU, three deploy rounds, every job failed, and no
 way out while the GPU billed. See [incidents.md](incidents.md).
 
@@ -254,7 +254,7 @@ still blocks unconditionally, whatever the flag says.
 
 The first version keyed on "has any ssh command succeeded", which sounds
 equivalent and is not: running `true` on a box cannot start a render, yet it
-permanently blocked replacement. Instance 46124078 proved it — ssh worked long
+permanently blocked replacement. One instance proved it — ssh worked long
 enough to provision, the 481 MB Blender push then failed at 3.5% on every
 retry, and the flag insisted a box that had never had Blender on it at all
 might be mid-frame.
@@ -283,12 +283,12 @@ Retrying it cannot succeed.
 ### "Retry, keep the GPU" needs an exit, and the exit is not a count
 
 "A failed transfer is transport, so retry rather than condemn" is right, and it
-assumes the retry can eventually succeed. On 2026-08-02 it could not: machine
-55313 (offer 43856614, `192.0.2.16`) reset every SSH connection it was
+assumes the retry can eventually succeed. On 2026-08-02 it could not: one
+machine (call it **host A**) reset every SSH connection it was
 given. The broker spent **3 rounds x 3 attempts x 4 push attempts, 80 minutes
-and $0.41 of GPU** on instance 46579745 learning that, destroyed it — and
+and $0.41 of GPU** on an instance there learning that, destroyed it — and
 re-rented the *same offer* one second later, because it was still the cheapest.
-The replacement, 46585570, was a different container on the same host and failed
+The replacement was a different container on the same host and failed
 identically.
 
 What separates a hiccup from a host that will never work is **not how many times
@@ -325,8 +325,8 @@ editing it while they run is safe.
 
 ### What the far end's sshd is actually configured to do
 
-Measured 2026-08-02 with `sshd -T` on a live vast.ai container
-(`192.0.2.17`, instance 46589007) — these are the numbers the parallel
+Measured 2026-08-02 with `sshd -T` on a live vast.ai container — these are
+the numbers the parallel
 push is sized against, not guesses:
 
 ```
@@ -350,7 +350,7 @@ clientaliveinterval 10    clientalivecountmax 2 tcpkeepalive yes
   at once, and 20 s later the server closes all eight at once. That is a
   candidate mechanism for "every stream died at the same moment" that does not
   require the host to be broken, and it is worth checking before condemning a
-  machine — although it was *not* what happened on machine 55313, which also
+  machine — although it was *not* what happened on host A, which also
   reset lone pre-auth connections.
 
 ### Nothing else asks whether the instance still exists
@@ -358,7 +358,7 @@ clientaliveinterval 10    clientalivecountmax 2 tcpkeepalive yes
 Every liveness signal runs over SSH, so "the instance answers" and "the instance
 exists" were the same question asked the same way. An instance destroyed out of
 band — by hand, by `vastctl reap`, or by a **bid being preempted** — left the
-broker reporting `waiting-for-ssh instance=46585570` for a box that was verified
+broker reporting `waiting-for-ssh instance=<id>` for a box that was verified
 gone, on course to spend a 900 s ssh timeout and then a full deploy budget on it.
 
 `Fleet.reconcile()` asks vast.ai directly. It runs after a round of transport
@@ -540,7 +540,7 @@ can see *slow*. A link that delivers, however slowly, never times out, never
 stalls a round, never spends the budget — so an instance that cannot return
 results passes every probe, reports `ready`, and bills.
 
-Measured 2026-08-03 on instance 46695656 (192.0.2.12), three independent
+Measured 2026-08-03 on one instance, three independent
 ways — a multiplexed fetch, a dedicated no-mux fetch that ruled out our own
 `ControlMaster`, and a raw `dd` in each direction:
 
@@ -581,7 +581,7 @@ one that gets switched off.
 
 The table above lists 265 ms next to 14 KB/s, and it would be easy to read the
 latency as part of the signature. It is not, and the same day proved it:
-instance 46705078 measured **264 ms RTT — and 1.3–2.6 MB/s down**, roughly 100x
+another instance measured **264 ms RTT — and 1.3–2.6 MB/s down**, roughly 100x
 the condemned box, over both a multiplexed and a no-mux fetch. It pushed the
 481 MB Blender bundle at 4.04 MB/s and rendered normally.
 
@@ -641,7 +641,7 @@ what "bounded" now means and what it measures.
 the instance's disk actually looks like:
 
 ```
-scene    default=/home/zany/opus5-car-render/work/iter.blend
+scene    default=/path/to/work/iter.blend
 loaded   f1_exploded_posed_hq.blend  (batch 2 job(s) served)
 waiting  iter.blend=8  f1_exploded_posed_hq.blend=2
 disk     8.7G used of 30.0G (29%)  free 22.9G   cache 7.76G in 18 scene(s) (budget 8.0G)  measured 41s ago
@@ -649,8 +649,8 @@ disk     8.7G used of 30.0G (29%)  free 22.9G   cache 7.76G in 18 scene(s) (budg
 
 ### The disk preflight
 
-The cap used to be 12 GB and it had **never fired**. Measured live on instance
-46133943, nine hours into a 435-item campaign:
+The cap used to be 12 GB and it had **never fired**. Measured live on one
+instance, nine hours into a 435-item campaign:
 
     /workspace/scenes      8.8 G  across 41 cached scenes, none ever evicted
     /workspace/blender     1.2 G  (the install)
@@ -705,7 +705,7 @@ re-pushes the scene to reach the identical verdict — and it fails the job
 **terminally**, with every number in the message:
 
 ```
-NOT ENOUGH DISK on 192.0.2.18:28922 (instance 46133943) for 3.90G of scene.
+NOT ENOUGH DISK on <host>:<port> (instance <id>) for 3.90G of scene.
 After evicting 12 scene(s) (4.31G) the disk holds 14.8G of 16.0G with 1.15G
 free; the upload needs 3.90G plus a 2.00G reserve, i.e. 4.75G more than exists.
 Scene cache is 9.12G in 6 scene(s); non-cache use (image, Blender, output) is
@@ -798,7 +798,7 @@ paths**, and the blend does not carry their contents. The broker shipped only
 the blend, so every remote frame rendered with:
 
 ```
-WARNING Image file /home/zany/opus5-car-render/assets/city.exr does not exist.
+WARNING Image file /path/to/assets/city.exr does not exist.
 ERROR Failed to load 1 image files
 ```
 
@@ -900,9 +900,8 @@ Verified against the vast CLI source, none of these exist:
 - scheduled destruction (their scheduler supports five commands; destroy is not
   one of them)
 
-The only real ceilings are **prepaid credit with autobilling off** (currently
-$25.00, autobill `None` — correct) and the in-container watchdog described
-below.
+The only real ceilings are **prepaid credit with autobilling off** (autobill
+`None` — correct) and the in-container watchdog described below.
 
 ### The watchdog
 
@@ -932,8 +931,8 @@ Worked example at 60 GPU-hours (900 frames @ 4 min):
 
 | offer | $/hr | disk $/GB/mo | GPU | disk | **total** |
 |---|---|---|---|---|---|
-| 39996098 | 0.308 | 0.133 | $18.48 | $0.66 | **$19.17** |
-| 44128497 | 0.313 | 0.867 | $18.78 | $4.27 | **$23.18** |
+| A | 0.308 | 0.133 | $18.48 | $0.66 | **$19.17** |
+| B | 0.313 | 0.867 | $18.78 | $4.27 | **$23.18** |
 
 Same GPU, $4 apart, almost entirely disk. The second one's advantage is a 4 Gbps
 network — which at 63 MB per scene upload buys about two seconds.
@@ -990,9 +989,9 @@ were on. Cheaper exclusive hosts exist (~$0.394) but they are small boxes —
 `MIN_CPU_CORES_EFFECTIVE`**; that floor is itself an incident fix, and a 23-CPU
 cgroup is what made the remote-exec A/B measure the wrong thing.
 
-**`reliability2` is the sound field; ignore the number on the web page.** Offer
-`46354162` shows **94.6 %** in vast's UI and `reliability2: 0.9920577` over the
-API. They are different statistics, the API field is the one `build_query`
+**`reliability2` is the sound field; ignore the number on the web page.** One
+exclusive 8x offer showed **94.6 %** in vast's UI and `reliability2: 0.9920577`
+over the API. They are different statistics, the API field is the one `build_query`
 filters on, and it is the one to quote. **A screenshot is not evidence about a
 host** — settle this from `probe_offers.py`, not from the console.
 
@@ -1367,7 +1366,7 @@ three sequences: **0.69 s render, 5.7–6.0 s wall clock**. Unchanged.
 
 Projected from measurements on **this** hardware and **this** scene, not a
 model. The basis is four-figure-second 4K stills of
-`render/world/assembly/r2/render3.blend` (4.2 GB) on instance 46589007:
+`render/world/assembly/r2/render3.blend` (4.2 GB) on one rented instance:
 
 | | measured |
 |---|---|
@@ -1451,7 +1450,7 @@ Same procedure as always, and the scene is still a POSITIONAL argument:
 
 ```bash
 scripts/brokerd.sh stop
-scripts/brokerd.sh start /home/zany/f1-round2/world/beat1_anim.blend
+scripts/brokerd.sh start /path/to/scene.blend
 ```
 
 Omitting the scene silently switches the default. Wait for the queue to drain
@@ -1583,9 +1582,8 @@ against" by its own author. Re-run on a box that clears the plan's floor:
   cgroup verified on the box, not read off the offer: `cpu.max 4608000 100000`
   -> 46.08 CPUs, `memory.max` 259.3 GB. **Exactly 2x the CPU of the box the
   reject was measured on.**
-* **Total cost $0.24** — 24 min of instance life, credit $45.47 -> $45.23,
-  teardown confirmed against the vast.ai API (0 instances) rather than a state
-  file.
+* **Total cost $0.24** — 24 min of instance life, teardown confirmed against
+  the vast.ai API (0 instances) rather than a state file.
 
 **The local baseline was re-measured rather than reused, and it moved.** 75.9
 items/h today against the recorded 95.3, entirely explained by the item mix:
