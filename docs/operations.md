@@ -3,6 +3,11 @@
 Runbook for whoever owns the money. Agents should read
 [agents.md](agents.md) instead.
 
+> Rented-host identifiers (instance, machine and offer ids, addresses, ports)
+> are redacted. Where two events have to be linked, a stable alias is used
+> instead — `host A`, offers `A` and `B`. **The aliases are local to this
+> document**: `machine A` in [incidents.md](incidents.md) is a different host.
+
 ## Running the broker
 
 ```bash

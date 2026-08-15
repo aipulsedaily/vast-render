@@ -5,7 +5,8 @@ thing it first looked like. Newest first.
 
 > Rented-host identifiers (instance, machine and offer ids, addresses, ports)
 > are redacted. Where two events have to be linked, a stable alias is used
-> instead — `machine A`, `offer P`. Aliases are local to this document.
+> instead — `machine A`, `offer P`. **The aliases are local to this document**:
+> `host A` in [operations.md](operations.md) is a different host.
 
 ---
 
@@ -178,6 +179,61 @@ path where the lock could not be taken.
 The eight surviving `state<n>/bad_hosts.json` files were merged into
 `farm/bad_hosts.json` (newest stamp per id, 7 d TTL applied): 13 offers and 8
 machines carried forward, including machines A and B and offer Q.
+
+---
+
+## Measured over the master render — about a quarter of rentals draw a host that never installs our SSH key
+
+**Provenance, stated first, because it is weaker than every other measurement on
+this page.** This number was never written to a file. It
+came from watching the fleet during the four-day master render and counting
+condemnations against rentals as they happened; the state files that would let
+anyone re-derive it have since been merged and TTL'd. It is recorded because a
+finding that lives only in a conversation is a finding that is already lost —
+which is the failure this page spends most of its length documenting.
+
+**The rate, with the sample beside it:**
+
+| sampled at | hosts condemned | rentals | rate |
+| --- | ---: | ---: | ---: |
+| mid-campaign | 7 | ~28 | ~25 % |
+| end of campaign | 9 | ~34 | ~26 % |
+
+Early sampling put it nearer **21 %** and it converged upward as the sample
+grew, so **21–26 % is the honest range and ~25 % the working number.** What
+matters is that it held steady rather than drifting as the denominator doubled.
+
+Do not difference these against #169's *"4 of 10 condemnations"* above. That
+counts condemnation **events** — repeats included, which is the entire point it
+is making — over one 7-cycle render inside this campaign, where the table counts
+hosts over the whole of it. Two windows, two units. Reconciling them properly
+would need both re-derived, and the state files that would allow it are gone.
+
+**Read the sample size as part of the figure.** This is ~30 rentals, on one
+account, over four days, against the production offer filter of the time. It is
+a useful planning number — it says a fleet of eight should expect to throw away
+roughly two rentals on the way up — and it is **not a property of the
+marketplace**. Anyone quoting it elsewhere should re-measure it.
+
+**One failure mode, not several.** Every condemnation in the campaign was the
+same defect: the rented host never wrote our key to `authorized_keys`. It is
+established during the SSH handshake, before any data transfer, so it is cheap
+to discover and it is discovered the same way every time — the `auth_rejected`
+exit-255 described further down this page, never a timeout and never a slow
+link.
+
+**No condemned host ever recovered.** Two were re-drawn from the market later in
+the campaign and condemned again on sight, at **24 h** and **61 h 19 m** — the
+durability table under #169 above. That is the whole justification for a TTL
+measured in days.
+
+**The cost of one bad host is small and does not accumulate:** ~5 minutes and
+about **$0.05** of billed rental to discover it, plus a price rung when `_rent`
+falls through to the next-cheapest offer. The rung is **transient, not
+cumulative** — once the session blacklist has absorbed the bad hosts the fleet
+returns to the cheap tier. So at ~25 % the base rate is an argument for
+remembering condemnations across brokers and across days, which is #169, and
+**not** an argument for renting more expensively on purpose.
 
 ---
 
