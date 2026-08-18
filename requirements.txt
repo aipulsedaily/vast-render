@@ -1,0 +1,49 @@
+# vast-render — Python dependencies for the LOCAL side (broker, rq, fleetctl,
+# vastctl). The rented instance installs its own Blender and needs nothing from
+# this file.
+#
+#     python3 -m venv .venv
+#     .venv/bin/pip install -r requirements.txt
+#
+# There is no packaging here: no setup.py, no pyproject, no console scripts.
+# The repository is run from its own checkout, out of its own virtualenv. That
+# is a real limitation and it is listed as one in the README.
+#
+# Versions are FLOORS, not pins. The versions this project is actually run and
+# tested on are recorded in the comment beside each one, so a future breakage
+# can be bisected against a known-good set rather than guessed at.
+
+# ---------------------------------------------------------------- required
+# The vast.ai SDK. Every instance search, create, destroy and status goes
+# through it. It also owns credential resolution: explicit argument, then
+# VAST_API_KEY, then ~/.config/vastai/vast_api_key, then ~/.vast_api_key.
+# The broker never passes an explicit key, so the environment variable wins.
+vastai>=1.5.0                 # known good: 1.5.0
+
+# The broker's HTTP surface. Clients (rq, fleetctl, agents) talk to this and
+# never to vast.ai directly, because vast.ai rate-limits per endpoint AND per
+# client IP with unpublished thresholds.
+fastapi>=0.115                # known good: 0.140.0
+uvicorn>=0.30                 # known good: 0.51.0
+
+# ---------------------------------------------------------------- optional
+# Both of these have working fallbacks, so the tool runs without them. They are
+# listed because the fallbacks are slower, not because they are decorative —
+# and one of them exists precisely so a check cannot quietly stop running.
+#
+# Pillow decodes returned PNGs for the blank-frame check in ~0.5 s at 4K. Without
+# it a pure-stdlib decoder does the same job, correctly, but much slower. The
+# stdlib path is not a stub: it is the reason a rebuilt virtualenv cannot
+# silently disable pixel verification.
+Pillow>=10.0                  # known good: 12.2.0; optional
+
+# zstandard is used to read a zstd-compressed .blend. Without the module the
+# code shells out to the `zstd` binary instead; if neither exists it reports
+# that clearly rather than mis-reading the file.
+zstandard>=0.22               # known good: not installed in the reference venv; optional
+
+# ---------------------------------------------------------------- not here
+# `bpy` is deliberately NOT a dependency. worker/server.py runs INSIDE a real
+# Blender binary on the rented instance, not against the pip wheel — the wheel
+# works but installs no signal handlers, which means no crash logs. Nothing on
+# the local side imports bpy at all.

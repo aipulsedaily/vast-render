@@ -8,11 +8,49 @@ It exists because a local 8 GB card cannot hold a 4K Cycles frame in one pass,
 and because renting GPUs by hand is how you end up paying for an instance you
 forgot about. Every design decision here is downstream of one of those two.
 
+**Start at [`docs/quickstart.md`](docs/quickstart.md)** — a fresh clone to a
+rendered frame in about twenty minutes, for well under a dollar. You do not need
+the rest of this file first.
+
 > **Money warning.** This software rents hardware that bills by the second
 > against your vast.ai account. It has several independent safeguards (below)
 > and it has still, in development, stopped an instance that was mid-frame and
 > kept one alive longer than intended. Set a budget, keep prepaid credit as your
 > ceiling, and read `docs/operations.md` before pointing it at real work.
+
+It was built to render [the companion repository `f1-round2`](#the-film-this-was-built-for):
+a 124-second, 2,978-frame 4K short film shot as one unbroken camera take, which
+is the best demonstration either project has.
+
+## What renting GPUs by hand actually costs you
+
+Not a feature list — this is what the repository learned the expensive way, and
+it is the honest argument for using something like this rather than a shell
+script and a browser tab. Each one is expanded further down or in `docs/`.
+
+- **A failed schedule leaves a *stopped* instance that still bills for storage.**
+  `--cancel-unavail` on every create is the fix; without it you have built an
+  orphan generator. Storage bills while an instance *exists*, so **destroy,
+  never stop**.
+- **An instance outlives the process responsible for it.** Broker crash, laptop
+  lid, power cut — something has to reap it. Here that is four independent
+  destroy paths plus an on-instance watchdog that self-destructs the box if the
+  heartbeat goes stale.
+- **A machine that passes every health probe can still be unusable.** One
+  measured 14 KB/s downstream against 731 KB/s up, so a 7.5 MB frame took six
+  minutes to fetch against a 16-second render, and it billed 68% of a rental
+  before anyone noticed. Slow is not a failure, so nothing counting failures can
+  see it.
+- **The same bad host gets rented again tomorrow** unless something remembers
+  it. Blacklists here are fleet-wide with a 7-day TTL.
+- **A returned frame can be a perfectly valid, correctly sized, sha256-matching
+  PNG with nothing in it.** That happened; every file-level check passed it. So
+  every frame is decoded and measured.
+- **The vast.ai API rate-limits per endpoint *and* per client IP**, returns 429
+  with no `Retry-After`, and the thresholds are unpublished. One poller, and
+  everyone else reads a cache.
+- **A long render has to resume**, and "already done" has to mean "fetched,
+  hashed and looked at", not "we submitted it once".
 
 ## Architecture
 
@@ -38,7 +76,8 @@ cache.
     worker/     the warm Blender server, deployed to the instance
     vastctl/    instance lifecycle — search, create, reap, destroy
     scripts/    panic button, offer probe, supervisor
-    docs/       agent guide, operations runbook, protocol, incidents
+    docs/       quickstart, agent guide, operations runbook, protocol, incidents
+    tools/      the publication gate and the fresh-init builder
     state/      sqlite db, logs, heartbeat        (gitignored)
     out/        returned frames                   (gitignored)
 
@@ -51,9 +90,13 @@ box's CPUs and never imports `bpy`.
 
 - **A vast.ai account with prepaid credit, and an API key.** There is no free
   mode. Prepaid credit is the only hard spend ceiling vast.ai offers.
-- **Python 3.13+** locally, with the `vastai` SDK installed. The repository is
-  run from a virtualenv; there is no `requirements.txt` or packaging, so create
-  one and install `vastai`, `fastapi` and `uvicorn` into it.
+- **Python 3.13+** locally. `python3 -m venv .venv && .venv/bin/pip install -r
+  requirements.txt`. That file lists floors and the known-good version beside
+  each; two of the five entries are optional and say why. There is **no
+  packaging** — no `pip install .`, no console scripts — so the tools are run
+  out of the checkout: `./rq`, `./fleetctl`, `.venv/bin/python -m broker.app`.
+- **Linux.** `flock`, `fcntl`, `ssh`, `scp` and POSIX signal handling are used
+  directly. Nothing else is tested.
 - **An SSH keypair** dedicated to this, ed25519, **without a passphrase** — the
   broker is unattended and cannot answer a prompt.
 - **Blender 5.2.0.** The version installed on the instance must match the build
@@ -149,7 +192,19 @@ refused until you set `VASTRENDER_SCENE_ROOTS`.** That refusal is the intended
 behaviour: an allowlist that fails open is not an allowlist.
 `VASTRENDER_BUNDLE_ROOTS` behaves the same way for `rq exec` bundles.
 
+The directory holding `VASTRENDER_SCENE` is always a root, so a single-scene
+setup needs no allowlist configuration at all. Print what yours resolved to
+before you rent anything:
+
+```bash
+.venv/bin/python -c 'from broker import config; print(*config.SCENE_ROOTS, sep="\n")'
+```
+
 ## Running it
+
+The narrated version, with credentials, an SSH key and a throwaway scene you can
+generate in one command, is [`docs/quickstart.md`](docs/quickstart.md). The
+short version:
 
 ```bash
 # 1. start the broker, pointed at a locally assembled scene
@@ -163,12 +218,22 @@ VASTRENDER_SCENE=/path/to/scene.blend \
 # 3. watch queue and spend
 ./rq status
 
-# 4. stop everything, works even with the broker dead
+# 4. stop paying — destroy the GPU now
+./rq teardown
+
+# 5. or stop everything, by label, working even with the broker dead
 scripts/panic.sh
 ```
 
-The projected cost is printed before anything is rented. The instance destroys
-itself a few minutes after the last job.
+The projected cost is printed before anything is rented, and `vastctl` refuses
+to create at all below a $2.00 credit floor.
+
+**Left alone, an idle instance is *stopped* after 5 minutes and *destroyed*
+after an hour — and storage bills for the whole time it exists.** Stopping only
+ends the GPU meter. If you are finished, tear it down and then confirm with
+`.venv/bin/python vastctl/vastctl.py status`, which lists every instance on the
+account rather than only this tool's, because the other half of your bill is the
+half nothing here created.
 
 ### Frame ranges
 
@@ -296,13 +361,19 @@ to cost you real money or real time. Read `docs/incidents.md` before a long run.
 
 ## Docs
 
-- **`docs/agents.md`** — for clients that just want renders. Start here.
+- **`docs/quickstart.md`** — fresh clone to a rendered frame, including how to
+  stop paying. **Start here.**
+- **`docs/agents.md`** — for clients that just want renders.
 - **`docs/operations.md`** — the runbook for whoever owns the money: safety
   commands, host selection, tuning, and the measured A/B results.
 - **`docs/protocol.md`** — job spec reference and wire format.
 - **`docs/incidents.md`** — what has gone wrong, and what each fix actually was.
+  The most useful document here once something is misbehaving.
 - **`docs/fleet.md`**, **`docs/multi-gpu.md`**, **`docs/linked-libraries.md`** —
   running many brokers, multi-GPU boxes, and Blender library linking.
+- **`docs/publication.md`** — the pre-publication checklist and the secret-scan
+  gate. Relevant if you fork this and publish your own copy.
+- **`CONTRIBUTING.md`** — the bar, the house style, and what will be declined.
 
 ## Design notes
 
@@ -336,44 +407,109 @@ signal handlers, which means no crash logs.
 **On-demand, not interruptible.** Preemption mid-render costs more than the bid
 spread saves.
 
-## Status
+## Scope, state and limitations
 
 Working and in production use: this broker rendered a 2,978-frame 4K film as a
 multi-day, multi-GPU job. It is nonetheless a single-operator tool that grew
-around one project, and it shows — see the hardcoded default paths noted under
-Configuration, and the absence of packaging.
+around one project, and pretending otherwise would waste your time.
+
+**What it does.** Rent instances on vast.ai against measured criteria; hold a
+fleet-wide bad-host blacklist; keep one poller between you and a rate-limited
+API; queue and dispatch frame ranges across rented machines; keep a warm Blender
+worker resident; move scenes and results over ssh; verify the returned pixels;
+retire and destroy instances by four independent paths.
+
+**What it does not do.**
+
+- **It does not build scenes.** An assembled `.blend` is an input here, never
+  something this produces.
+- **No packaging.** No `pip install .`, no console scripts, no versioning. You
+  run it out of the checkout.
+- **Linux only**, and only tested on one distribution. `flock`, `fcntl`, `ssh`,
+  `scp` and POSIX signals are used directly.
+- **vast.ai only.** There is no provider abstraction. The seam exists — the
+  lifecycle lives in `vastctl/` — but nobody has run it against a second
+  provider, so treat "it would port easily" as an untested claim.
+- **No authentication on the broker's HTTP API.** It binds `127.0.0.1` by
+  default and the security model is that loopback boundary. If you set
+  `VASTRENDER_HOST` to anything else you have published an unauthenticated API
+  that spends money.
+- **Single operator, cooperative clients.** Queue-depth and per-agent caps exist,
+  but they bound accidents, not adversaries.
+- **No spot/interruptible bidding, no multi-region logic, no web UI.**
+
+**What is rough.**
+
+- Configuration is close to ninety environment variables in `broker/config.py`
+  (`grep -c '_env(' broker/config.py`). They are each documented with the
+  measurement that produced them, which is better than the alternative, but it
+  is not a small surface.
+- Defaults are tuned for 4K Cycles frames on 5090-class cards. Small scenes on
+  small cards will find several thresholds pessimistic.
+- `out2/`…`out12/`, `state2/`…`state12/` are per-broker directories from running
+  a fleet by hand. They are gitignored working state, not a design.
+- The exec (CPU) path is measured worth **3.65x on a 46-CPU box and 1.66x on a
+  23-CPU one** against an adoption bar of 2x — so it is a lever that is only
+  sometimes worth pulling, and it says so rather than pretending otherwise.
+
+**Generally reusable versus specific to this project.** The brokering,
+blacklisting, retirement, queueing and cost-control layers know nothing about
+Blender and are the part worth stealing. `worker/server.py` and
+`worker/exec_server.py` are Blender-shaped, and the scene-cache, physics-cache
+and linked-library handling are shaped by one film's assembly conventions. The
+seam between those two halves is the wire protocol in `docs/protocol.md`.
 
 Test suites live beside the code they cover (`broker/test_broker.py`,
 `worker/test_worker.py`, `worker/test_exec_server.py`, `farm/test_*.py`) and are
-the main thing standing between a bad edit and a dead render pipeline.
+the main thing standing between a bad edit and a dead render pipeline. All but
+`test_worker.py` run fully offline and rent nothing.
 
-## Contributing, and one thing to set before your first commit
+## The film this was built for
+
+The companion repository **`f1-round2`** is a 124-second, 2,978-frame, 4K short
+film of a Formula 1 car rendered as **one unbroken camera take with no cuts** —
+the car, the 3,675 m circuit, the terrain, 27,968 trees, the barriers, the
+architecture, the sky and the entire soundtrack generated from scripts, with no
+downloaded models, no HDRIs, no photo textures and nothing AI-generated.
+
+This broker is what rendered it, and that job is the best evidence either
+repository has: multi-day, multi-GPU, resumable, and verified frame by frame.
+The numbers quoted throughout this README — the 502-second cold start, the
+1,425-second scene switch, the black frame that passed every file-level check,
+the host that billed 68% of a rental at 14 KB/s — are all from that run.
+
+`f1-round2` is licensed GPL-3.0-or-later because it is almost entirely `bpy`
+code. The two projects are separate works that talk over a process boundary and
+a network; neither is a derivative of the other.
+
+## Contributing
+
+**[`CONTRIBUTING.md`](CONTRIBUTING.md)** has the whole of it: which offline test
+suites to run, what shape of change fits, what will be declined and why, and the
+house rule that a default carries the measurement or the incident that produced
+it. Two things worth repeating here.
+
+**Tests are the bar.** They live beside the code they cover, and a change to the
+broker without a test in `broker/test_broker.py` will not be believed.
 
 **Set your git identity to a noreply address before you commit.** This
 repository's `.git/config` is preconfigured with
-
-```
-user.email = noreply@users.noreply.github.com
-```
-
-which keeps a personal address out of future commits. That generic form works,
-but GitHub will not attribute the commits to you. Replace it with your own
-address — the numeric ID is on `https://api.github.com/users/<username>`:
+`user.email = noreply@users.noreply.github.com`, which keeps a personal address
+out of future commits but means GitHub will not attribute them to you. Replace
+it with your own — the numeric ID is on
+`https://api.github.com/users/<username>`:
 
 ```bash
 git config user.email 'ID+username@users.noreply.github.com'
 git config user.name  'Your Name'
 ```
 
-This is local configuration only. It changes nothing that is already committed:
-**the existing history still carries a personal address on 40 of its 61
-commits.** Rewriting that history is cheap in this repository — 57-odd commits,
-no culture of citing commit SHAs in the docs — so `git filter-repo --mailmap` is
-a real option here in a way it is not in the companion repository. That is a
-decision for the owner, before publishing.
-
-Tests live beside the code they cover and are the contribution bar: a change to
-the broker without a test in `broker/test_broker.py` will not be believed.
+That is local configuration only and changes nothing already committed:
+**the existing history carries a personal address on 40 of its 66 commits.**
+Rewriting it is cheap here — the docs cite exactly two commit SHAs, against 82
+in 214 places in the companion repository — so `git filter-repo` is a real
+option in this repository in a way it is not in that one. It is the owner's
+decision, and `docs/publication.md` prices all three ways of going public.
 
 ## Licence
 

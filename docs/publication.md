@@ -105,6 +105,11 @@ included.
 | history blobs scanned | 219 | 243, including unreachable |
 | secrets in history | unverified claim | **7 locations: 6 blobs + 1 commit message**, all the same 8-hex fragment |
 
+The "after" column is that round's measurement and is left as it was taken. A
+later documentation round added `CONTRIBUTING.md`, `requirements.txt` and
+`docs/quickstart.md`, so the gate now scans **56** tracked files and reports the
+same 21 findings, all still inside `PUBLICATION-AUDIT.md`. Nothing else moved.
+
 ### The remaining working-tree finding is one file
 
 Every outstanding tree finding is inside `docs/PUBLICATION-AUDIT.md` — the
@@ -322,6 +327,52 @@ secret looks like. Full findings and the trace of every path are in
 
 ---
 
+## Repository metadata — what to put in the GitHub fields
+
+These are the two fields a stranger reads before they read anything else, and
+GitHub leaves both empty by default.
+
+**Description** (350 characters max; this one is 168):
+
+> Rent GPUs on vast.ai, render Blender frame ranges across them, verify the
+> pixels came back, and destroy the fleet. Cost controls, bad-host blacklists,
+> resumable sequences.
+
+**Topics** — GitHub allows 20; these are the ones people actually search:
+
+```
+vast-ai  gpu  cloud-rendering  render-farm  blender  cycles  blender-render
+gpu-rental  distributed-rendering  cost-control  render-queue  python
+fastapi  broker  infrastructure  devops
+```
+
+`vast-ai`, `render-farm`, `gpu-rental` and `cloud-rendering` are the load-bearing
+ones: they are how somebody with this exact problem finds this repository.
+`blender` and `cycles` are honest about what the worker half assumes.
+
+Two more settings worth a deliberate answer rather than the default:
+
+- **Website field** — leave empty, or point it at the companion repository.
+  Do not point it at any private infrastructure.
+- **Issues and Discussions** — this is a single-operator tool. If nobody is
+  going to answer, say so in the description rather than leaving an unread
+  issue tracker open.
+
+### A licence-detection detail worth knowing
+
+`LICENSE` is the byte-exact Apache-2.0 text (verified: the 201 lines from the
+`Apache License` heading onward match independent canonical copies exactly)
+**preceded by an 86-line explanation** of why Apache-2.0 was chosen, what the
+`bpy`/GPL question is, and that the choice is the owner's to change.
+
+GitHub decides the "Apache-2.0" badge by similarity to a known licence text, and
+a preamble of that size is likely to push it below the threshold, so the sidebar
+may read "View license" instead. **Nothing about the licence grant is affected** —
+the full text and the SPDX identifier are both present. If the badge matters,
+move the preamble into `docs/licensing.md` and leave `LICENSE` as the copyright
+line plus the plain Apache text. That is a presentation decision, and it is the
+owner's.
+
 ## Before you publish — the list
 
 - [ ] **Rotate the vast.ai API key.** Hard blocker. Only the account owner can.
@@ -332,4 +383,17 @@ secret looks like. Full findings and the trace of every path are in
 - [ ] `.venv/bin/python -m broker.test_broker` passes (508/508 offline).
 - [ ] `LICENSE` (Apache-2.0) and `NOTICE` are the licence you actually want —
       they landed as a *recommendation* and are still yours to change.
+- [ ] Fill in the GitHub **description** and **topics** above. An unlabelled
+      repository is not findable by the people this is useful to.
+- [ ] Walk `docs/quickstart.md` yourself on a machine that is not the
+      development box, with a clean clone and a clean virtualenv. It is the one
+      document whose failure a stranger cannot work around.
 - [ ] `git remote -v` is empty. Nothing in this repository adds one.
+
+**The stranger-facing documents**, for whoever reviews this before it goes out:
+`README.md` (what it is, what it does not do, what it costs),
+`docs/quickstart.md` (clone to rendered frame, and how to stop paying),
+`CONTRIBUTING.md` (the bar and the house style), `requirements.txt` (the
+dependency floors and which two are optional). If any of those has drifted from
+the code, it is worse than absent — a stranger cannot tell a stale instruction
+from a broken tool.
