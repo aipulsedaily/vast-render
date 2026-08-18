@@ -23,7 +23,8 @@ document:
   readable, in backups, in shell history, in agent transcripts, in terminal
   scrollback.
 - The leading 8 hex characters of the real key are **still in this repository's
-  git history**, in six blobs — see [History](#the-history-decision) below.
+  git history**, in six blobs *and in one commit message* — see
+  [History](#the-history-decision) below.
 - The key is a **live billing credential**. It can rent GPUs, destroy instances
   and spend money. The exposure is financial, not reputational.
 
@@ -65,9 +66,26 @@ of that miss.
 |---|---|
 | personal paths | `/home/<someone>` in any tracked file. `/home/user`, `/home/you`, `/home/<user>` are the accepted placeholders |
 | email | any address that is not a `users.noreply.github.com`, `sshN.vast.ai`, `example.com` or `example.invalid` placeholder |
+| third-party IPs | any address that is not loopback, private, or an RFC 5737 documentation range. Rented hosts belong to **other people** |
 | secrets | vast 64-hex keys, truncated `api_key=` fragments, AWS/GitHub/Slack/OpenAI/Anthropic/Google tokens, JWTs, private-key blocks |
 | entropy | any base64/hex run of 40+ chars at ≥4.4 bits/char that is not a known-benign digest |
+| commit messages | the same secret patterns, over `git log --all` — **not** just file contents |
 | config safety | `.env` really is ignored, and `.env.example` really can be committed |
+
+Three of those rows exist because the first draft of this tool did not have them
+and was wrong:
+
+- **commit messages.** A blob scan cannot see them, and in this repository the
+  commit that *removed* the key fragment quotes it in its own message to explain
+  what it was removing. The cleanup commit is a seventh copy of the secret.
+- **third-party IPs.** The scanner as first written looked only for credentials
+  and would have passed a tree containing thirteen strangers' IP addresses
+  without a word. Found by a parallel audit, not by this tool.
+- **placeholder suppression, scoped.** `.env.example` exists to contain fake
+  values, so the assignment rule ignores obvious placeholders. Applying that
+  filter to *every* rule was tried and the canary caught it in seconds: AWS's own
+  documentation key id is `AKIAIOSFODNN7EXAMPLE`, which contains the word
+  EXAMPLE, so a blanket filter switched off AWS detection entirely.
 
 ---
 
@@ -76,30 +94,58 @@ of that miss.
 Run on the working tree and the full object database, unreachable objects
 included.
 
-| | result |
-|---|---|
-| tracked files scanned | 48 |
-| personal paths in tracked files | **0** (was 9 files) |
-| non-placeholder emails in tracked files | **0** (the 3 hits were `noreply@users.noreply.github.com` and `root@sshN.vast.ai`) |
-| secrets in the working tree | **0** |
-| history blobs scanned | 219, including unreachable |
-| secrets in history | **6 hits, all the same 8-hex key fragment** |
+| | before this round | after |
+|---|---|---|
+| tracked files scanned | 48 | 53 |
+| personal paths in tracked files | 9 files | **0 in source; 4 remain in `PUBLICATION-AUDIT.md`** |
+| non-placeholder emails in tracked files | 0 | **0** (the 3 hits were `noreply@users.noreply.github.com` and `root@sshN.vast.ai` — documentation, not PII) |
+| third-party IPs in tracked **source** | 5 addresses, 10 occurrences | **0** — replaced with RFC 5737 addresses |
+| third-party IPs in tracked **docs** | 13 | **13, all in `PUBLICATION-AUDIT.md`** |
+| secrets in the working tree | 0 | **0** |
+| history blobs scanned | 219 | 243, including unreachable |
+| secrets in history | unverified claim | **7 locations: 6 blobs + 1 commit message**, all the same 8-hex fragment |
+
+### The remaining working-tree finding is one file
+
+Every outstanding tree finding is inside `docs/PUBLICATION-AUDIT.md` — the
+parallel audit that *reported* the IP exposure and, in doing so, listed all
+thirteen addresses in the clear, along with four `/home/zany` paths inside
+`git clone` transcripts. Its 64-hex string is **not** a leak: it is the SHA-256
+*of* the API key, published deliberately so the owner can confirm which key was
+audited, and a digest of a 256-bit random secret is not reversible.
+
+**That file is left as its author wrote it.** It argues, correctly, for exactly
+the RFC 5737 substitution that has now been applied to the source, and it
+explicitly deferred making that change itself because it touches tested code.
+The source change has been made and the tests pass; aliasing the addresses in
+the audit document is the last step and is the owner's call, because the
+document's argument depends on naming what it found.
 
 ### The one finding
 
 ```
-[api_key-fragment] blob 430a14baa8 (<unreachable>):390  api_key=942dc099
-[api_key-fragment] blob 68e595b038 (broker/remote.py):390  api_key=942dc099
-[api_key-fragment] blob 934ff29931 (broker/remote.py):390  api_key=942dc099
-[api_key-fragment] blob a8fbbeb07a (broker/remote.py):390  api_key=942dc099
-[api_key-fragment] blob cc9011ce39 (broker/remote.py):390  api_key=942dc099
-[api_key-fragment] blob e33cded3a5 (broker/remote.py):390  api_key=942dc099
+[api_key-fragment] blob 430a14baa8 (<unreachable>):390  api_key=<8 hex of the live key>
+[api_key-fragment] blob 68e595b038 (broker/remote.py):390  api_key=<8 hex of the live key>
+[api_key-fragment] blob 934ff29931 (broker/remote.py):390  api_key=<8 hex of the live key>
+[api_key-fragment] blob a8fbbeb07a (broker/remote.py):390  api_key=<8 hex of the live key>
+[api_key-fragment] blob cc9011ce39 (broker/remote.py):390  api_key=<8 hex of the live key>
+[api_key-fragment] blob e33cded3a5 (broker/remote.py):390  api_key=<8 hex of the live key>
+```
+
+…plus a seventh location that a blob scan cannot reach:
+
+```
+[api_key-fragment] commit message d056d4bae0:6  api_key=<8 hex of the live key>
 ```
 
 A code comment in `broker/remote.py` quoted the leaked log line **verbatim**,
 including the first 8 hex characters of the live key, to explain why `redact()`
 exists. Commit `d056d4b` replaced it with `<64 hex chars>`; `git grep` on `HEAD`
-finds nothing, and the working tree is clean. The blobs remain.
+finds nothing, and the working tree is clean. The blobs remain — **and so does
+the message of the very commit that removed it**, which quotes the fragment to
+explain what it was deleting. Any rewrite must therefore rewrite commit
+*messages*, not just trees. `git filter-repo --email-callback` alone will not do
+it; add `--message-callback`.
 
 **How bad is 8 hex characters?** 32 bits of a 256-bit key. It does not
 reconstruct the key and it is not brute-forceable into one. It *is* a
@@ -125,7 +171,7 @@ git log --all --format='%an <%ae>' | sort | uniq -c | sort -rn   # who authored 
 git rev-list --all --count                                        # 62
 ```
 
-- **62 commits**, of which **40 carry `alec200500600@gmail.com`** in the author
+- **62 commits**, of which **40 carry `the author's personal gmail address`** in the author
   and committer fields. The rest are agent identities (`agent@local`,
   `r2-3001@f1round2`) and one already-clean `noreply` address.
 - **Exactly 2 commit SHAs are cited anywhere in the documentation, in 2 places.**
@@ -156,10 +202,16 @@ rewritten along with everything else.
 ```bash
 cp -a ~/vast-render ~/vast-render-rewrite-test   # work on a clone, never the only copy
 cd ~/vast-render-rewrite-test
-git filter-repo --email-callback \
-  'return b"noreply@users.noreply.github.com" if b"@gmail.com" in email else email'
+git filter-repo \
+  --email-callback \
+    'return b"noreply@users.noreply.github.com" if b"@gmail.com" in email else email' \
+  --message-callback \
+    'import re; return re.sub(rb"api_key=[0-9a-f]+", b"api_key=<redacted>", message)'
 
-# then, and this is not optional:
+# --message-callback is NOT optional. The commit that removed the key fragment
+# quotes it in its own message; rewriting only the trees leaves it in `git log`.
+
+# then, and this is not optional either:
 .venv/bin/python tools/publication/check_publication.py --history   # fragment should be gone
 git log --all --format='%ae' | sort -u                              # no gmail address
 grep -rn "<the two old SHAs>" docs/                                 # re-point them

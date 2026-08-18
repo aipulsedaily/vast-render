@@ -79,10 +79,11 @@ SECRETS = (
         rb"(?i)(api[_-]?key|apikey|vast[_-]?key)\s*[:=]\s*[\"']?([A-Za-z0-9_\-]{16,})")),
     # A TRUNCATED key is still a key fragment, and the rule above cannot see one:
     # it demands 16+ characters. The first version of this scanner therefore
-    # reported this repository's history as clean while `api_key=942dc099` — the
-    # leading 8 hex of the real vast.ai key, quoted verbatim in a code comment in
-    # `broker/remote.py` — sat in six historical blobs. It was found by a
-    # hand-written grep, not by this tool, which is exactly the wrong way round.
+    # reported this repository's history as CLEAN while an `api_key=` followed by
+    # the leading 8 hex of the real vast.ai key — quoted verbatim in a code
+    # comment in `broker/remote.py` — sat in six historical blobs. It was found
+    # by a hand-written grep, not by this tool, which is exactly the wrong way
+    # round for a tool whose whole job is to be believed.
     #
     # 8 hex is 32 bits and does not reconstruct a 256-bit key. It is still a
     # confirmation oracle for a candidate key, and it is still a live credential's
@@ -111,9 +112,55 @@ SECRETS = (
 BENIGN_64HEX = {
     b"0123456789abcdef" * 4,          # the synthetic key in test_broker.py
     b"a" * 64,                        # the synthetic sha256 in test_broker.py
+    # The SHA-256 *of* the vast.ai API key, published deliberately in
+    # docs/PUBLICATION-AUDIT.md so the owner can confirm WHICH key was audited
+    # without the document containing the key. A digest of a 256-bit random
+    # secret is not reversible and not a credential; listing it here is a
+    # judgement about this one value, not a hole in the 64-hex rule.
+    b"8e41ee3c9ac96fd77d06379d6bd18ec66d7b90a07fe409f131a2d64a11224aed",
 }
 
+# Values that are obviously placeholders rather than credentials. Without this,
+# a well-written `.env.example` — whose entire job is to carry fake values — is
+# reported as a secret leak, and a gate that fires on its own example file is a
+# gate people learn to ignore.
+PLACEHOLDER = re.compile(
+    rb"(?i)(replace[-_]?me|your[-_]|example|changeme|placeholder|xxx+|"
+    rb"<[^>]*>|\.\.\.|TODO|FIXME|fake|dummy|probe)")
+
 B64ISH = re.compile(rb"\b[A-Za-z0-9+/_\-]{40,}={0,2}\b")
+
+# ------------------------------------------------------------- third-party IPs
+# The rented hosts belong to OTHER PEOPLE. Their addresses appeared in this
+# repository's docstrings and test fixtures because they were pasted out of real
+# error messages, and they are third-party infrastructure data, not ours to
+# publish. This check was added after a parallel audit found thirteen of them —
+# the scanner as first written looked only for credentials and would have passed
+# a tree full of strangers' IP addresses without a word.
+#
+# Replacements use RFC 5737 / RFC 3849 documentation ranges, which are reserved
+# precisely so an example address can never be somebody's real machine.
+IP_SHAPE = re.compile(r"(?<![\d.])((?:\d{1,3}\.){3}\d{1,3})(?![\d.])")
+IP_OK = {
+    "127.0.0.1",        # loopback, architecturally load-bearing here
+    "0.0.0.0",          # a bind address
+    "255.255.255.255",
+    "1.1.1.1", "8.8.8.8",   # public resolvers, used as ping targets
+    "1.2.3.4",          # the conventional throwaway example
+}
+
+
+def ip_is_documentation(ip: str) -> bool:
+    """True for the ranges reserved for use in documentation."""
+    o = [int(x) for x in ip.split(".")]
+    return (
+        (o[0], o[1], o[2]) == (192, 0, 2)         # TEST-NET-1
+        or (o[0], o[1], o[2]) == (198, 51, 100)   # TEST-NET-2
+        or (o[0], o[1], o[2]) == (203, 0, 113)    # TEST-NET-3
+        or o[0] == 10                             # private
+        or (o[0] == 192 and o[1] == 168)          # private
+        or (o[0] == 172 and 16 <= o[1] <= 31)     # private
+    )
 
 
 def git(*a, cwd=None, binary=False):
@@ -138,6 +185,18 @@ def scan_bytes(data: bytes, where: str, out: list) -> None:
             tok = m.group(0)
             if name == "vast-key-64hex" and tok in BENIGN_64HEX:
                 continue
+            # Placeholder suppression applies ONLY to the assignment-shaped rule,
+            # whose value is free text and is therefore genuinely ambiguous.
+            #
+            # It must NOT apply to the strongly-typed token rules. Applying it
+            # everywhere was tried and the canary caught it within seconds:
+            # AWS's own documentation key id is `AKIAIOSFODNN7EXAMPLE`, which
+            # contains the word EXAMPLE, so a blanket placeholder filter
+            # silently switched off AWS key detection entirely. A prefix like
+            # `AKIA`, `ghp_` or `xox` is unambiguous on its own and needs no
+            # help deciding what it is.
+            if name == "api_key-assign" and PLACEHOLDER.search(tok):
+                continue
             line = data[:m.start()].count(b"\n") + 1
             out.append((name, where, line, tok[:80].decode("utf-8", "replace")))
     for m in B64ISH.finditer(data):
@@ -150,11 +209,29 @@ def scan_bytes(data: bytes, where: str, out: list) -> None:
 
 
 # ------------------------------------------------------------------- checks
+# The file you are reading DEFINES the patterns, so it necessarily contains
+# things shaped like secrets: AWS's own published example key id, the base64
+# magic that starts an OpenSSH private key, and the `/home/zany` literals in
+# PATH_RULES that exist so the rules can match. Scanning it is self-indictment.
+#
+# THE EXCLUSION IS NARROW AND IT IS NOT A HIDING PLACE. It is the same decision
+# f1-round2's `sanitise_docs.py` makes with `OWNED_BY_OTHERS` — the file that
+# carries the redaction scheme as its subject matter cannot be rewritten by it —
+# and it is paired with a rule for this repository: NOTHING IN HERE MAY QUOTE A
+# REAL SECRET. The real 8-hex key fragment was written out in these comments in
+# the first draft and was replaced with `<8 hex>`, precisely so that the
+# exclusion cannot be quietly covering a genuine leak. Every value left in this
+# file is either a published example or a regex.
+SELF = "tools/publication/check_publication.py"
+
+
 def check_tree(root: str) -> tuple[int, list]:
     """Personal paths, PII and secrets in every TRACKED file."""
     problems = []
     files = [f for f in git("ls-files", cwd=root).split("\n") if f]
     for f in files:
+        if f == SELF:
+            continue
         p = os.path.join(root, f)
         if not os.path.isfile(p):
             continue
@@ -172,6 +249,14 @@ def check_tree(root: str) -> tuple[int, list]:
                 continue
             problems.append(("email", f,
                              text[:m.start()].count("\n") + 1, m.group(0)))
+        for m in IP_SHAPE.finditer(text):
+            ip = m.group(1)
+            if ip in IP_OK or any(int(o) > 255 for o in ip.split(".")):
+                continue          # not an address; a version or a dotted number
+            if ip_is_documentation(ip):
+                continue
+            problems.append(("third-party-ip", f,
+                             text[:m.start()].count("\n") + 1, ip))
     return len(files), problems
 
 
@@ -196,6 +281,25 @@ def check_history(root: str) -> tuple[int, list]:
         data = git("cat-file", "blob", oid, cwd=root, binary=True)
         paths = ", ".join(sorted(named.get(oid, {"<unreachable>"})))[:100]
         scan_bytes(data, f"blob {oid[:10]} ({paths})", problems)
+
+    # COMMIT MESSAGES, which are not blobs and which a blob scan cannot see.
+    #
+    # Not a hypothetical gap. In this repository the commit that REMOVED the key
+    # fragment from `broker/remote.py` quotes the fragment in its own message to
+    # explain what it was removing:
+    #
+    #     d056d4b  "...carried the first 8 characters of the LIVE account key in
+    #               the comment explaining why redact() exists — `api_key=<8 hex>...`"
+    #
+    # So the cleanup commit is itself a seventh copy, and a scanner that reads
+    # only file contents reports the repository clean while `git log` prints the
+    # secret. A rewrite must therefore rewrite MESSAGES too, not just trees.
+    for entry in git("log", "--all", "--format=%H%x00%B%x01", cwd=root).split("\x01"):
+        if "\x00" not in entry:
+            continue
+        sha, body = entry.split("\x00", 1)
+        scan_bytes(body.encode("utf-8", "replace"),
+                   f"commit message {sha.strip()[:10]}", problems)
     return len(blobs), problems
 
 
@@ -210,11 +314,20 @@ def check_env_example(root: str) -> list:
     --dry-run` is the behaviour that actually matters.
     """
     bad = []
-    r = subprocess.run(["git", "-C", root, "add", "--dry-run", "--", ".env.example"],
-                       capture_output=True, text=True)
-    if r.returncode != 0 or "add '.env.example'" not in r.stdout:
-        bad.append(("env-example-ignored", ".env.example", 0,
-                    "git refuses to add it; the `!.env.example` negation is gone"))
+    # ALREADY-TRACKED COUNTS AS A PASS. `git add --dry-run` prints "add '<path>'"
+    # only when the path is not already in the index, so once `.env.example` is
+    # committed this check reported it as ignored — a false alarm that would have
+    # made the gate cry wolf on every run after the very first. Ask whether git
+    # is willing to have the file, not whether it would be a new addition.
+    tracked = subprocess.run(
+        ["git", "-C", root, "ls-files", "--error-unmatch", "--", ".env.example"],
+        capture_output=True, text=True).returncode == 0
+    if not tracked:
+        r = subprocess.run(["git", "-C", root, "add", "--dry-run", "--", ".env.example"],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or "add '.env.example'" not in r.stdout:
+            bad.append(("env-example-ignored", ".env.example", 0,
+                        "git refuses to add it; the `!.env.example` negation is gone"))
     if not os.path.exists(os.path.join(root, ".env.example")):
         bad.append(("env-example-missing", ".env.example", 0, "file does not exist"))
 
