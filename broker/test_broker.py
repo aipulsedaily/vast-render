@@ -558,8 +558,8 @@ def test_a_black_frame_on_a_scene_that_used_to_work_gets_one_retry() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         db = DB(root / "t.db")
-        worked = "/home/zany/f1-round2/render/has_worked.blend"
-        never = "/home/zany/f1-round2/render/never_worked.blend"
+        worked = "/home/user/f1-round2/render/has_worked.blend"
+        never = "/home/user/f1-round2/render/never_worked.blend"
 
         # A scene with a good frame behind it, and one that has only ever been black.
         good_id = db.submit(spec(), agent="t", scene=worked)
@@ -3573,9 +3573,9 @@ def test_bundled_essentials_are_not_refused() -> None:
         check(f"bundled: {path[:46]}", scenes.is_bundled_essentials(ref(path)))
 
     for path in (
-        "/home/zany/f1-round2/render/world/assembly/r2/assembly9.blend",
-        "/home/zany/f1-round2/datafiles/assets/grandstand.blend",
-        "/home/zany/project/assets/datafiles/assets/thing.blend",
+        "/home/user/f1-round2/render/world/assembly/r2/assembly9.blend",
+        "/home/user/f1-round2/datafiles/assets/grandstand.blend",
+        "/home/user/project/assets/datafiles/assets/thing.blend",
     ):
         check(f"NOT bundled: {path[:46]}", not scenes.is_bundled_essentials(ref(path)))
 
@@ -6311,14 +6311,35 @@ def test_the_api_key_never_survives_a_logged_failure() -> None:
     check("redact() leaves prose about the key FILE alone",
           remote.redact(benign) == benign, remote.redact(benign))
 
-    # 6. The bound, stated as a test so it is a decision rather than a gap
-    #    somebody discovers in a log. If a future SDK moves the key into a
-    #    header, THIS is the check that will still be passing while the key
-    #    leaks — so it is written to say so out loud.
-    bare = f"Authorization: Bearer {fake}"
-    check("KNOWN BOUND: a key NOT written as `api_key=` is not redacted — if "
-          "the SDK ever moves it, _SECRET_RE must move too",
-          fake in remote.redact(bare), "documented limitation, not a pass")
+    # 6. THE BOUND THAT USED TO BE HERE IS NOW CLOSED, and these are the shapes
+    #    that close it. This test previously ASSERTED that a bare
+    #    `Authorization: Bearer <key>` went through unredacted — a real,
+    #    deliberately-documented limitation. It stopped being acceptable once
+    #    the audit found that `docs/operations.md` tells a human to type exactly
+    #    that shape by hand with curl, and that `fleetctl` and `vastctl` print
+    #    raw SDK exceptions with no redaction at all.
+    for what, text in (
+        ("as a bearer header", f"Authorization: Bearer {fake}"),
+        ("as an X-Api-Key header", f"X-Api-Key: {fake}"),
+        ("serialised into JSON", json.dumps({"api_key": fake})),
+        ("under a RENAMED query parameter on a vast.ai URL",
+         f"https://console.vast.ai/api/v0/instances/?auth_token={fake}"),
+    ):
+        out = remote.redact(text)
+        check(f"redact() catches the key {what}", fake not in out, out[-70:])
+
+    # 7. THE REMAINING BOUND, and it is a deliberate trade, not an oversight.
+    #    A bare 64-hex token with no key-ish context is NOT redacted, because
+    #    that is also the shape of a sha256 — and `frames.sha256`, the frame
+    #    integrity check and `write_manifest` are all built on full digests.
+    #    Redacting every 64-hex run would corrupt the manifests and break every
+    #    "does this frame match" diagnostic: a security control that becomes a
+    #    data-integrity bug. Asserted so the trade stays visible.
+    digest = "a" * 64
+    prose = f"frame 1841 sha256 {digest} matches the worker"
+    check("BOUND, chosen: a bare 64-hex digest in prose is left alone, because "
+          "it is far more often a sha256 than a key",
+          remote.redact(prose) == prose, remote.redact(prose))
 
 
 OFFLINE_TESTS = (
@@ -6424,7 +6445,7 @@ def _target_broker_safety(url: str) -> Optional[dict]:
     documentation. The docstring's definition of a safe target — "a broker
     pointed at a scene that does not exist, so dispatch fails before it can
     rent" — describes a *runtime state*, and broker 1 happened to be in it:
-    `instance_id: null`, scene `/home/zany/vast-render/scene.blend` absent. The
+    `instance_id: null`, scene `~/vast-render/scene.blend` absent. The
     gate read production as a throwaway and allowed the run. (No harm: the
     broker refused the submit for the same missing-scene reason. It was correct
     by luck, which is not a guard.)

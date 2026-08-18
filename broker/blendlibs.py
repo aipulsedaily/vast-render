@@ -9,7 +9,7 @@ instance, in under a second, and the job is reported `done`. Probe job
 `blank: OK`. Nothing in the broker looked at libraries: `push_scene` sends the
 .blend, `push_scene_siblings` sends a name-matched list of directories beside
 it, and a `Library` datablock pointing at
-`/home/zany/f1-round2/render/world/assembly/r2/assembly9.blend` resolves to
+`~/f1-round2/render/world/assembly/r2/assembly9.blend` resolves to
 nothing on the far side. Blender does not fail on an unresolved library. It
 drops the objects and renders the empty world.
 

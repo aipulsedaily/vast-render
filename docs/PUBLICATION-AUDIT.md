@@ -282,7 +282,7 @@ anywhere to the private `f1-site-part2` website** (`git grep -l "f1-site-part2"`
 
 ```
 $ git log master --pretty='%ae' | sort | uniq -c | sort -rn
-     40 alec200500600@gmail.com
+     40 <owner-personal-address>@gmail.com       [redacted in this document]
      20 agent@local
       1 r2-3001@f1round2
       1 noreply@users.noreply.github.com
@@ -290,6 +290,15 @@ $ git log master --pretty='%ae' | sort | uniq -c | sort -rn
 
 **40 of 62 commits on `master` carry a personal Gmail address** in the author or
 committer field. One personal address, not two (unlike `f1-round2`).
+
+> **Disclosure — this audit briefly made that worse.** The first draft of this
+> document pasted the `git log` output above with the address unredacted, and
+> committed it. It is redacted in the working tree now, but the earlier version
+> is already a blob in this repository's history, in commit
+> `78e349d4a05344ce2b1c02744d9d381a33dcd570`. History was **not** rewritten to
+> remove it, because rewriting is the owner's decision and this round was scoped
+> not to. Under **Option B or C, scrub blob content as well as author metadata**
+> or this one blob will survive the rewrite that was meant to remove the address.
 
 In tracked file *content* the address count is effectively zero: the single
 `git grep` hit is `scripts/make_fresh_init.sh` line 24, which is a code comment

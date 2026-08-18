@@ -3,8 +3,10 @@
 # compared against the real thing instead of imagined.
 #
 # WHAT THIS IS FOR
-#   40 of this repository's 61 commits carry a personal email address in their
-#   author and committer fields. Publishing the repository publishes it. There
+#   40 of this repository's 62 commits carry a personal email address in their
+#   author and committer fields. Re-measure before quoting this, it drifts:
+#     git log --all --format='%an <%ae>' | sort | uniq -c | sort -rn
+#   Publishing the repository publishes it. There
 #   are three ways out here:
 #
 #     (a) publish WITH history, accepting the address is public;

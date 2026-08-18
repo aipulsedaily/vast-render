@@ -85,10 +85,15 @@ CALLER_REQUIRED = WORKER_FIELDS - {"job_id", "bundle"}
 # `config.SCENE_ROOTS`: this string arrives from a client and becomes a
 # filesystem path here and a directory on the instance, so it is resolved FIRST
 # and then required to sit inside one of these. A prefix compare would be
-# defeated by `/home/zany/f1-round2-evil`; containment after resolution is not.
+# defeated by `~/f1-round2-evil`; containment after resolution is not.
+#
+# `~`-relative, and `bundle_roots()` below expands before it tests, so a clone
+# on a machine without those trees gets an EMPTY allowlist and every bundle
+# submission is refused until `VASTRENDER_BUNDLE_ROOTS` says otherwise.
+# Refusing by default is the correct posture for a path allowlist.
 DEFAULT_BUNDLE_ROOTS = (
-    "/home/zany/f1-round2",
-    "/home/zany/opus5-car-render",
+    "~/f1-round2",
+    "~/opus5-car-render",
 )
 
 

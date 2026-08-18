@@ -10,6 +10,107 @@ thing it first looked like. Newest first.
 
 ---
 
+## 2026-08-18 — the redactor guarded one of six credential paths
+
+**Found during the pre-publication audit, not by a failure.** Nothing leaked
+this time. The point of the entry is that the previous entry about this — the
+2026-07-28 fix — recorded the problem as solved, and it was solved at one call
+site out of six.
+
+### What was believed
+
+`broker/remote.py` defines `redact()`, and `diagnose()` funnels logged
+exceptions through it. The README said so. `test_broker.py` had a thorough test
+for it, written against the exact string that leaked. All of that was true.
+
+The belief that did not survive contact was **"the broker logs through
+`diagnose()`, therefore the key cannot reach a log."**
+
+### What the evidence actually said
+
+The vast.ai SDK puts the API key in the **query string** of every request, so any
+`HTTPError` it raises carries a live billing credential in `str(exc)`. So the
+question is not "is `diagnose()` correct" — it is "how many ways can an SDK
+exception become text?" There are six, and `diagnose()` was one:
+
+```
+broker/remote.py    diagnose()                     REDACTED
+broker/diagnostics.py  _excepthook / _threadhook /
+                       _unraisablehook /
+                       loop_exception_handler      NOT REDACTED
+broker/db.py        jobs.err, frames.err           NOT REDACTED at the column
+broker/seq.py       write_manifest()               NOT REDACTED
+fleetctl            five raw `print(f"...{exc}")`  NOT REDACTED
+vastctl/vastctl.py  top-level `except VastError`   NOT REDACTED
+```
+
+Demonstrated rather than asserted — `traceback.format_exception` ends with
+`str(exc)`, so:
+
+```python
+>>> tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+>>> FAKE in tb
+True                     # ...?api_key=aaaa… straight into broker.log
+>>> FAKE in remote.diagnose(e)
+False                    # the guarded path, next door, working perfectly
+```
+
+The three worst of these are not the obvious one:
+
+- **`fleetctl`** is the CLI a human runs interactively and pastes the output of.
+  `api_credit()` and `api_instances()` both call the SDK; both were printed raw.
+- **`vastctl`** is the module *closest* to the key and had no redaction at all,
+  including in the handler that prints `create failed: {resp}`.
+- **`seq.write_manifest`** is the artefact that is **built to be handed to
+  somebody** along with the frames. That is precisely where the key went in
+  2026-07-28, via `jobs.err`, and the column was never closed — only the one
+  caller that wrote to it. `db.seq_summary` still selects `err`, and `extra` is
+  a caller-supplied dict merged in whole with no schema.
+
+### Root cause
+
+`redact()` lived in the module that needed it first. Everything else either
+could not import it (`vastctl` is loaded two different ways, `diagnostics` is
+deliberately dependency-free and also runs on the worker) or nobody checked.
+A fix placed at a call site protects that call site.
+
+### Fixes
+
+- `redaction.py` at the repository root: **no project imports**, so every layer
+  can reach it. `broker/remote.py` re-exports `redact` and `_SECRET_RE` from it
+  so existing callers and tests are untouched.
+- All six paths above routed through it, including `db._safe_err()`, which
+  redacts on the way **into** the database — so the credential is not in the
+  store to be copied out of, whatever a caller did. The `err[:2000]` truncation
+  moved in there with it: truncating *then* redacting can leave a half-key that
+  the patterns no longer match.
+- The coverage widened past `api_key=` to `Authorization: Bearer`, `X-Api-Key:`,
+  `"api_key": "…"` in JSON, and a renamed query parameter carrying a key-shaped
+  value on a `console.vast.ai` URL. `docs/operations.md` tells a human to type
+  the bearer form by hand with curl, so that shape was reachable by design.
+
+### The bound that was kept, deliberately
+
+A bare 64-hex token with no key-ish context is **still not redacted**, and that
+is a choice. A sha256 is the same shape, and `frames.sha256`, the frame
+integrity check and `write_manifest` are all built on full digests.
+Blanket-redacting 64 hex characters would corrupt the manifests and silently
+break every "does this frame match" diagnostic — a security control turning
+itself into a data-integrity bug. Asserted as a test so the trade stays visible.
+
+### The lesson worth keeping
+
+The old test ended with an assertion that the `Authorization: Bearer` form went
+through **unredacted**, labelled `KNOWN BOUND` — an honest, deliberately
+documented limitation, and the right way to write it down. It still sat there
+for three weeks while `docs/operations.md`, four files away, instructed a human
+to construct exactly that string against the live account.
+
+Writing a limitation down is not the same as bounding it. A documented gap needs
+a second question: *who else is already standing in it?*
+
+---
+
 ## #169 — a per-broker blacklist with a 6 h TTL burned a job's last retry attempt
 
 **2026-08-12. This is the instance that moves #169 from "worth doing" to "do it

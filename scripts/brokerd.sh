@@ -112,7 +112,7 @@ supervise() {
     # remaining cwd dependency invisible and made the failure look like a
     # broken virtualenv rather than a wrong pwd:
     #
-    #   /home/zany/vast-render/.venv/bin/python: Error while finding module
+    #   ~/vast-render/.venv/bin/python: Error while finding module
     #   specification for 'broker.app' (ModuleNotFoundError: No module named
     #   'broker')
     #

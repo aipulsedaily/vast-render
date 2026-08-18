@@ -86,17 +86,26 @@ SCENE_ROOT = Path(_env("SCENE_ROOT", str(SCENE.parent))).resolve()
 # vector — it becomes a filesystem path on this machine AND on the rented
 # instance — so `scenes.resolve_scene` still resolves symlinks and `..` FIRST
 # and then requires the real path to sit inside one of these. A prefix-string
-# compare would be defeated by `/home/zany/f1-round2-evil`; containment after
+# compare would be defeated by `~/f1-round2-evil`; containment after
 # resolution is not.
 #
 # Override wholesale with `VASTRENDER_SCENE_ROOTS` (colon-separated). Anything
 # listed there is trusted whether or not it exists yet; the defaults below are
 # included only when the directory is actually present, so this file does not
 # grow stale entries as projects come and go.
+#
+# THE DEFAULTS ARE `~`-RELATIVE, and a stranger gets none of them. They name the
+# two sibling project trees this broker was built to render, as they sit beside
+# it in a checkout; on a machine that has no such directories every one of them
+# fails the `is_dir()` test below and the only surviving root is the broker's
+# own `scenes/`. That is the intended out-of-the-box behaviour — an empty
+# allowlist is a refusal, not a hole — and it is also why these are safe to
+# ship: they are a statement about this project's layout, not about anybody's
+# home directory.
 DEFAULT_SCENE_ROOTS = (
-    "/home/zany/opus5-car-render/work",     # round 1 — the F1 showroom stills
-    "/home/zany/f1-round2/world",           # round 2 — the one-shot cinematic
-    "/home/zany/f1-round2/render",          # round 2 — render-side variants
+    "~/opus5-car-render/work",     # round 1 — the F1 showroom stills
+    "~/f1-round2/world",           # round 2 — the one-shot cinematic
+    "~/f1-round2/render",          # round 2 — render-side variants
 )
 
 
@@ -116,7 +125,13 @@ def _scene_roots() -> list[Path]:
                 add(Path(part))
     else:
         for part in DEFAULT_SCENE_ROOTS:
-            if Path(part).is_dir():
+            # `expanduser()` BEFORE `is_dir()`, not after. `Path("~/x").is_dir()`
+            # is False on every machine including one where `~/x` exists — it
+            # looks for a literal directory named "~". The defaults became
+            # `~`-relative when the author's absolute home path was taken out of
+            # this file for publication, and testing them the old way would have
+            # silently emptied the default allowlist rather than failing.
+            if Path(part).expanduser().is_dir():
                 add(Path(part))
     # Scenes shipped with the broker itself (animation tests, previews).
     local = ROOT / "scenes"
@@ -573,7 +588,7 @@ def _asset_dirs() -> list[Path]:
     A .blend that was not packed stores external references — HDRIs, textures,
     caches — as absolute paths, and the broker ships only the .blend itself.
     Observed on a live instance: every remote frame rendered with
-    `WARNING Image file /home/zany/opus5-car-render/assets/city.exr does not
+    `WARNING Image file /home/user/opus5-car-render/assets/city.exr does not
     exist` followed by `ERROR Failed to load 1 image files`, so the returned
     image was lit differently from the one the artist sees locally — and
     nothing in the broker log said a word about it.

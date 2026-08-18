@@ -74,7 +74,7 @@ because these were live path-traversal vectors in the render path already:
   * every `outputs` element resolves inside the job's `out/`.
   * every token of `argv` and `blender_args` that looks like a path (contains a
     `/`) resolves inside the job directory. So `--save out/x.blend` is fine and
-    `--save /home/zany/f1-round2/world/items/x.py` is refused. A script can of
+    `--save /home/user/f1-round2/world/items/x.py` is refused. A script can of
     course still build a path in code; cwd, TMPDIR and HOME all point into the
     job directory so that the *accidental* case — a module writing beside itself
     or into `~` — lands where it should.
@@ -651,7 +651,7 @@ def check_tokens(tokens: list, root: str, what: str) -> None:
 
     Heuristic by design and documented as one: a token is treated as a path when
     it contains a separator. That catches every realistic accident — an absolute
-    `--save /home/zany/...`, a `../../` escape — while leaving plain values and
+    `--save /home/user/...`, a `../../` escape — while leaving plain values and
     flags alone.
     """
     for tok in tokens:

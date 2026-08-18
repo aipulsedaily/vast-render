@@ -76,7 +76,7 @@ AGENT = os.environ.get("VASTRENDER_AGENT", os.environ.get("USER", "anon"))
 # Where a `get` with no -o puts the file. It used to be a bare "<job>.png",
 # which is relative, so the frame landed in whatever directory the calling
 # shell happened to be sitting in. On 2026-08-04 that was the read-only
-# reference tree /home/zany/opus5-car-render, twice — the agent never named a
+# reference tree ~/opus5-car-render, twice — the agent never named a
 # path and had no reason to think it was choosing one. An absolute default
 # next to the broker's own copies makes the destination a property of the
 # tool instead of a property of the caller's cwd; -o still overrides, and a

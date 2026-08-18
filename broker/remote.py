@@ -43,6 +43,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -392,11 +393,21 @@ class DiskFull(RemoteError):
 # That key IS the account: it can rent, destroy and spend. `diagnose` is the one
 # function every logged failure passes through, so it is the one place this can
 # be fixed once rather than at fifty call sites.
-_SECRET_RE = re.compile(r"(api_key=)[^&\s\"'&]+", re.I)
+#
+# ...for the BROKER. It was not the one place for the project: `fleetctl` and
+# `vastctl` print raw exceptions from the same SDK and had no redaction at all,
+# and `diagnostics.py` formatted whole tracebacks past this function. The
+# patterns now live in the top-level `redaction` module so that all four reach
+# the same definition; `redact` and `_SECRET_RE` are kept here as re-exports
+# because call sites and tests already name them.
+if str(config.ROOT) not in sys.path:
+    sys.path.insert(0, str(config.ROOT))
+from redaction import redact  # noqa: E402
+from redaction import _PATTERNS as _SECRET_PATTERNS  # noqa: E402
 
-
-def redact(text: str) -> str:
-    return _SECRET_RE.sub(r"\1<redacted>", text)
+# Back-compat alias: the old single-pattern name. The api_key= form is first in
+# the tuple, so anything that reached for `_SECRET_RE` still gets that pattern.
+_SECRET_RE = _SECRET_PATTERNS[0]
 
 
 def diagnose(exc: BaseException) -> str:

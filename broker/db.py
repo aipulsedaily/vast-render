@@ -24,6 +24,34 @@ from typing import Any, Iterable, Optional
 
 from . import config
 
+import sys
+if str(config.ROOT) not in sys.path:
+    sys.path.insert(0, str(config.ROOT))
+from redaction import redact as _redact                          # noqa: E402
+
+
+def _safe_err(err: str) -> str:
+    """Every `err` string stored on a job or a frame, redacted and capped.
+
+    THE POINT OF DOING IT HERE rather than at the callers. On 2026-07-28 a vast
+    SDK `HTTPError` — whose message is the request URL, and the SDK puts the API
+    key in the query string — reached `jobs.err`, and from there
+    `seq.write_manifest` copied it into a manifest.json that is BUILT to be
+    handed to somebody. `broker/app.py` was fixed to pass `diagnose(exc)`, which
+    redacts, and that closed the one path anybody had traced.
+
+    It did not close the column. `err` is written from four methods here, and
+    their callers include worker replies, HTTP error bodies and subprocess
+    output — none of which go anywhere near `diagnose()`. Redacting on the way
+    INTO the database means the credential is not in the database to be copied
+    out of, whatever the caller did.
+
+    The truncation moved in here with it: it was `err[:2000]` at all four sites,
+    and redacting after a truncation can leave a half-key that the patterns no
+    longer match.
+    """
+    return _redact(err or "")[:2000]
+
 # How long a job has EFFECTIVELY been waiting: its real age plus the head start
 # its priority buys, clamped both ways. Shared by the two queries that choose
 # which scene runs next, so the switch target and the starvation signal can
@@ -659,7 +687,7 @@ class DB:
         state = "failed" if attempts >= max_attempts else "queued"
         self.conn.execute(
             "UPDATE jobs SET state=?, err=?, finished=? WHERE id=? AND state='running'",
-            (state, err[:2000], time.time() if state == "failed" else None, job_id),
+            (state, _safe_err(err), time.time() if state == "failed" else None, job_id),
         )
         self.conn.commit()
         return state
@@ -676,7 +704,7 @@ class DB:
         self.conn.execute(
             "UPDATE jobs SET state='failed', err=?, finished=? "
             "WHERE id=? AND state='running'",
-            (err[:2000], time.time(), job_id),
+            (_safe_err(err), time.time(), job_id),
         )
         self.conn.commit()
         return "failed"
@@ -697,7 +725,7 @@ class DB:
         cur = self.conn.execute(
             "UPDATE jobs SET state='queued', lease=0, err=?, "
             "attempts=MAX(0, attempts-1) WHERE id=? AND state='running'",
-            (err[:2000], job_id),
+            (_safe_err(err), job_id),
         )
         self.conn.commit()
         return cur.rowcount > 0
@@ -1036,7 +1064,7 @@ class DB:
             "ON CONFLICT(seq, frame) DO UPDATE SET state='failed', "
             "job_id=excluded.job_id, spec_hash=excluded.spec_hash, "
             "finished=excluded.finished, err=excluded.err",
-            (seq, frame, job_id, spec_hash, time.time(), err[:2000]),
+            (seq, frame, job_id, spec_hash, time.time(), _safe_err(err)),
         )
         self.conn.execute(
             "UPDATE jobs SET frames_failed=COALESCE(frames_failed,0)+1 WHERE id=?",

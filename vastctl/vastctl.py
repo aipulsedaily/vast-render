@@ -38,6 +38,17 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
+# Resolved off `__file__`, not off a package-relative import, because this file
+# is loaded BOTH ways: `from vastctl import vastctl` (as a package, from
+# `fleetctl` and `farm/procure.py`) and `sys.path.insert(ROOT/"vastctl");
+# import vastctl` (as a top-level module, from `broker/fleet.py`). A
+# `from . import redaction` would work in the first case and raise in the
+# second, and the second is the one the broker uses.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from redaction import redact_exc as _redact_exc          # noqa: E402
+
 try:
     from vastai import VastAI
 except ModuleNotFoundError:
@@ -1591,7 +1602,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         return args.func(args)
     except VastError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        # `VastError` is raised with the SDK's own response text in several
+        # places in this file (`create failed: {resp}`), and the SDK's errors
+        # name the request URL, which is where the API key lives. This is the
+        # last line before the account's credential reaches a terminal.
+        print(f"error: {_redact_exc(exc)}", file=sys.stderr)
         return 1
 
 

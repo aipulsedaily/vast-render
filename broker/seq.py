@@ -50,6 +50,11 @@ from typing import Iterable, Optional
 
 from . import config, imgstat
 
+import sys
+if str(config.ROOT) not in sys.path:
+    sys.path.insert(0, str(config.ROOT))
+from redaction import redact as _redact                          # noqa: E402
+
 # Narrow on purpose: this string becomes a directory name here and a filename
 # prefix, and job ids are broker-minted precisely because a client-supplied one
 # was a traversal vector. No dots, no slashes, so `..` is unrepresentable.
@@ -618,6 +623,20 @@ def write_manifest(name: str, db, extra: Optional[dict] = None) -> Path:
         doc.update(extra)
     path = directory / "manifest.json"
     tmp = path.with_suffix(".json.part")
-    tmp.write_text(json.dumps(doc, indent=1, sort_keys=True))
+    # REDACTED ON THE WAY OUT, and this is the second lock on the same door.
+    #
+    # This file is the one credential leak this project has actually had: a vast
+    # SDK error carrying the API key in its URL reached `jobs.err` and was
+    # copied here, into the artefact whose entire purpose is to be handed to
+    # somebody along with the frames. `db._safe_err` now redacts on the way into
+    # the database, which is the better fix because it keeps the key out of the
+    # store entirely.
+    #
+    # This stays anyway, because that fix protects `err` and this document is
+    # not only `err`: `db.seq_summary` selects the jobs' error text, and `extra`
+    # is a caller-supplied dict merged in whole with no schema at all. Serialise
+    # first and redact the finished JSON, so anything a future caller adds is
+    # covered by default rather than by remembering.
+    tmp.write_text(_redact(json.dumps(doc, indent=1, sort_keys=True)))
     tmp.replace(path)
     return path

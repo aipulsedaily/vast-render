@@ -98,6 +98,13 @@ __pycache__/
 # a rule that silently hides a tracked source file is its own incident.
 .env
 .env.*
+# ...but the EXAMPLE must be committable, and `.env.*` above swallows it.
+# Verified with `git check-ignore -v .env.example`, which named `.gitignore:100`
+# as the rule that was hiding it. A stranger cannot configure this tool safely
+# from a template that silently refuses to be added; the negation is the whole
+# point of shipping one. `git check-ignore` still reports `.env` and
+# `.env.local` as ignored — checked, not assumed.
+!.env.example
 .envrc
 .netrc
 *.pem

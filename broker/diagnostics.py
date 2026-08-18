@@ -48,8 +48,24 @@ import os
 import signal
 import sys
 import threading
-import traceback
 from typing import Optional
+
+# The redactor, resolved WITHOUT importing anything else in this project.
+#
+# This module is deliberately dependency-free — it is installed before the
+# broker has finished starting and it is also imported by the worker-side
+# process, which has no `config`, no SDK and no FastAPI. So the repository root
+# is put on the path directly rather than by asking `config` where it is.
+#
+# Imported at module level on purpose. If the redactor is missing, this must
+# fail at import time, loudly, in the ordinary way — NOT inside an exception
+# hook, where a second exception would bury the first one it was called to
+# report and the process would die with no explanation at all.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from redaction import redact as _redact          # noqa: E402
+from redaction import redact_tb as _redact_tb    # noqa: E402
 
 log = logging.getLogger("broker")
 
@@ -78,8 +94,7 @@ def _excepthook(exc_type, exc, tb) -> None:
         log.warning("KeyboardInterrupt on the main thread")
         return
     log.critical("FATAL: unhandled exception on the main thread — %s: %s\n%s",
-                 exc_type.__name__, exc,
-                 "".join(traceback.format_exception(exc_type, exc, tb)))
+                 exc_type.__name__, _redact(exc), _redact_tb(exc_type, exc, tb))
 
 
 def _threadhook(args) -> None:
@@ -91,15 +106,16 @@ def _threadhook(args) -> None:
         return
     log.critical(
         "FATAL: unhandled exception in thread %r — %s: %s\n%s",
-        getattr(args.thread, "name", "?"), args.exc_type.__name__, args.exc_value,
-        "".join(traceback.format_exception(args.exc_type, args.exc_value,
-                                           args.exc_traceback)),
+        getattr(args.thread, "name", "?"), args.exc_type.__name__,
+        _redact(args.exc_value),
+        _redact_tb(args.exc_type, args.exc_value, args.exc_traceback),
     )
 
 
 def _unraisablehook(args) -> None:
     log.error("unraisable exception in %r: %s: %s", args.object,
-              getattr(args.exc_type, "__name__", args.exc_type), args.exc_value)
+              getattr(args.exc_type, "__name__", args.exc_type),
+              _redact(args.exc_value))
 
 
 def loop_exception_handler(loop, context: dict) -> None:
@@ -111,10 +127,10 @@ def loop_exception_handler(loop, context: dict) -> None:
     shutdown.
     """
     exc = context.get("exception")
-    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) \
+    detail = _redact_tb(type(exc), exc, exc.__traceback__) \
         if exc is not None else ""
     log.critical("FATAL: unhandled exception on the event loop — %s\n%s",
-                 context.get("message", ""), detail or context)
+                 context.get("message", ""), detail or _redact(context))
 
 
 def _on_exit() -> None:

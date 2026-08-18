@@ -261,7 +261,7 @@ def library_status(scene: Path) -> tuple[list["blendlibs.LibRef"],
         those at IDENTICAL ABSOLUTE PATHS on the instance.
 
     Everything else is unresolved. In particular a bare absolute path into
-    `/home/zany/...` cannot resolve: nothing creates that tree on a rented box.
+    `/home/<user>/...` cannot resolve: nothing creates that tree on a rented box.
     A `//`-relative path that climbs out of the scene directory cannot either —
     the instance's directory layout above the scene is not this machine's.
     """

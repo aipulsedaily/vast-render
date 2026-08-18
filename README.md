@@ -82,13 +82,45 @@ Put those in a shell profile or a secrets manager outside the repository. If
 you use the SDK's config file instead, keep it at mode `0600` and outside this
 tree; nothing here reads it directly and nothing here should.
 
+`.env.example` in the repository root lists every variable with placeholder
+values. Copy it, fill it in, and keep the copy out of git:
+
+```bash
+cp .env.example .env      # .env is gitignored; .env.example is not
+$EDITOR .env
+set -a && . ./.env && set +a
+```
+
+**`.env` is ignored, `.env.example` is tracked, and that pair is asserted by a
+test** (`tools/publication/check_publication.py`) — because the ignore rule
+that covers `.env` is `.env.*`, which silently swallowed `.env.example` too
+until it was given an explicit negation. An example file that cannot be
+committed is not an example file.
+
 **If a key is ever exposed — pasted into a log, a transcript, a screenshot, or
 a commit — rotate it at once in the vast.ai console.** Rotation is the only
-remedy; an exposed key is a live billing credential.
+remedy; an exposed key is a live billing credential. Scrubbing a repository
+does **not** un-expose a key that has already existed somewhere readable.
 
-`broker/remote.py` scrubs `api_key=` out of URLs before logging them, because
-the SDK puts the key in the query string of every request. That reduces
-accidental disclosure through logs; it is not a reason to relax anything above.
+### What redacts, and what it does not
+
+`redaction.py` at the repository root is the single definition of what a secret
+looks like, and everything that can print or store text goes through it:
+`broker/remote.py` (`diagnose`), `broker/diagnostics.py` (the traceback hooks),
+`broker/db.py` (every `err` written to the database), `broker/seq.py` (the
+sequence manifest, which is built to be handed to somebody), `fleetctl` and
+`vastctl`. It covers `api_key=…`, a renamed query parameter carrying a
+key-shaped value on a `console.vast.ai` URL, `Authorization: Bearer …`,
+`X-Api-Key: …`, and `"api_key": "…"` in JSON.
+
+It deliberately does **not** redact a bare 64-hex token with no key-ish context
+around it, because that is also the shape of a sha256 and this project's frame
+integrity checks and manifests are built on full digests. Blanket-redacting
+would turn a security control into a data-integrity bug. This is a chosen
+bound, asserted by a test, not an oversight.
+
+None of that is a reason to relax anything above. Redaction is a backstop for
+the moment something goes wrong; the environment variable is the control.
 
 ## Configuration
 
@@ -109,9 +141,13 @@ both. A few that matter on day one:
 `SCENE_ROOTS` is a containment check, not a convenience: a client-supplied
 scene path becomes a filesystem path on **both** machines, so it is resolved
 through symlinks and `..` first and then required to sit inside a permitted
-root. Note that the built-in defaults are absolute paths on the original
-author's machine (`/home/zany/…`); they are only used when those directories
-happen to exist, so on any other machine you must set `VASTRENDER_SCENE_ROOTS`.
+root. The built-in defaults name the two sibling project trees this broker was
+written for (`~/f1-round2/…`, `~/opus5-car-render/…`) and each is used only if
+that directory actually exists — so **on a fresh clone the default allowlist is
+empty apart from the broker's own `scenes/`, and every other scene path is
+refused until you set `VASTRENDER_SCENE_ROOTS`.** That refusal is the intended
+behaviour: an allowlist that fails open is not an allowlist.
+`VASTRENDER_BUNDLE_ROOTS` behaves the same way for `rq exec` bundles.
 
 ## Running it
 
