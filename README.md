@@ -28,6 +28,11 @@ Not a feature list — this is what the repository learned the expensive way, an
 it is the honest argument for using something like this rather than a shell
 script and a browser tab. Each one is expanded further down or in `docs/`.
 
+**For the money itself — what the 2,978-frame 4K master actually cost, and the
+arithmetic to price your own job — read [`docs/RENDER-ECONOMICS.md`](docs/RENDER-ECONOMICS.md).**
+$229.76 and 393.5 GPU-hours, with the method that gets that right and the one
+that got it wrong by 2.4×.
+
 - **A failed schedule leaves a *stopped* instance that still bills for storage.**
   `--cancel-unavail` on every create is the fix; without it you have built an
   orphan generator. Storage bills while an instance *exists*, so **destroy,
@@ -366,6 +371,10 @@ to cost you real money or real time. Read `docs/incidents.md` before a long run.
 - **`docs/agents.md`** — for clients that just want renders.
 - **`docs/operations.md`** — the runbook for whoever owns the money: safety
   commands, host selection, tuning, and the measured A/B results.
+- **`docs/RENDER-ECONOMICS.md`** — what a 124-second 4K film cost on rented
+  hardware: $229.76, 393.5 GPU-hours, $0.58/GPU-hour, and how to estimate your
+  own. Also the anatomy of a published GPU figure that was wrong by 2.4×,
+  because the two tables in `broker.db` do not record the same thing.
 - **`docs/protocol.md`** — job spec reference and wire format.
 - **`docs/incidents.md`** — what has gone wrong, and what each fix actually was.
   The most useful document here once something is misbehaving.
