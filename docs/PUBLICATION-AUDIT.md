@@ -572,8 +572,39 @@ trusting this document.)*
 
 ## 6. What remains exposed under each of the three publishing options
 
-The choice is the owner's; this audit does not make it, and **no history was
-rewritten in producing this document.**
+The choice is the owner's; this audit did not make it, and **no history was
+rewritten in producing this document** — but history *has* been rewritten since,
+and the update below records it.
+
+> ### UPDATE, 2026-08-18 — OPTION B WAS CHOSEN AND EXECUTED, for identity only.
+>
+> Every commit's **author and committer** were rewritten to
+> `SuperComboGamer <36320904+SuperComboGamer@users.noreply.github.com>` with
+> `git filter-repo` 2.47.0. `%ae` and `%ce` were identical throughout, so
+> rewriting only the author would have left the address in all 40 commits.
+>
+> **`git log --all --format='%an <%ae>%n%cn <%ce>' | sort -u` now returns exactly
+> one line.** Commit count unchanged at 74, no `refs/original`, no remote,
+> nothing pushed. A verified `git bundle` was taken first. This repository has no
+> notes ref, so the `refs/notes` trap that caught the sibling repository — a
+> default filter-repo run passes notes commits through *before* the name/email
+> callbacks, by design — did not apply here. It is documented in f1-round2's
+> audit §6, and it is worth reading before anyone runs a similar job.
+>
+> **Citations were repointed**: 20 occurrences across five files, matched on
+> unique old-commit prefix with abbreviation length preserved — `d056d4b…` alone
+> is cited in four different lengths across three files, one of them a hardcoded
+> string in `check_publication.py`. The six key-bearing **blob** ids in §3 were
+> deliberately untouched: a commit-map contains no blob ids, so they cannot
+> match, and rewriting one would have destroyed the evidence this section is.
+> Verified against the pre-rewrite object database restored from the bundle:
+> **zero stale citations.**
+>
+> **The rewrite was identity-only. It did not remove the eight-hex key fragment
+> from the eight blobs and one commit message in §3, and it did not remove the
+> thirteen third-party IP addresses from history.** Those need
+> `--replace-text` / `--message-callback` and remain an open decision — a much
+> less urgent one now that §0 records the key as revoked.
 
 ### Option A — publish as-is, with full history
 
