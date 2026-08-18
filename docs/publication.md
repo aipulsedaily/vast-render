@@ -369,9 +369,9 @@ GitHub decides the "Apache-2.0" badge by similarity to a known licence text, and
 a preamble of that size is likely to push it below the threshold, so the sidebar
 may read "View license" instead. **Nothing about the licence grant is affected** —
 the full text and the SPDX identifier are both present. If the badge matters,
-move the preamble into `docs/licensing.md` and leave `LICENSE` as the copyright
-line plus the plain Apache text. That is a presentation decision, and it is the
-owner's.
+move the preamble into a new `docs/licensing.md` (it does not exist yet) and
+leave `LICENSE` as the copyright line plus the plain Apache text. That is a
+presentation decision, and it is the owner's.
 
 ## Before you publish — the list
 
