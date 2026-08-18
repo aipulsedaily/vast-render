@@ -80,7 +80,7 @@ in history, and it is real.*
 |---|---|
 | vast.ai API key — full 64 hex | **0 occurrences** in history or tree |
 | vast.ai API key — first 16 hex | **0 occurrences** |
-| vast.ai API key — **first 8 hex** | **6 blobs + 1 commit message** — see §3 |
+| vast.ai API key — **first 8 hex** | ~~6 blobs + 1 commit message~~ **8 blobs + 1 commit message** — see §3 |
 | Private-key headers (RSA/EC/OPENSSH/PGP) | 0 |
 | AWS / GCP / Azure credentials | 0 |
 | GitHub / Slack / Stripe / OpenAI / Anthropic / npm / PyPI / HF tokens | 0 |
@@ -263,6 +263,48 @@ A commit message is not a blob and is not scrubbed by a blob-content filter. Any
 remediation that only rewrites file contents will leave this behind. It is
 included here because it is precisely the kind of thing an audit that stops at
 `git grep` does not see.
+
+### The eighth and ninth locations — and the pattern is now unmistakable
+
+> **Correction, 2026-08-18.** "Six blobs and one commit message" was true when
+> written and is **no longer the count**. It is **eight blobs and one commit
+> message.** Two more blobs carry the fragment, and — this is the part worth
+> reading twice — **both were created by the cleanups that were removing it.**
+>
+> ```
+> $ python3 tools/publication/check_publication.py --history | grep api_key-fragment
+> ...
+> [api_key-fragment] blob 1211342fee (tools/publication/check_publication.py):82
+> [api_key-fragment] blob 7fce026a88 (docs/publication.md):91   ← ×6, lines 91-96
+> ```
+>
+> - **`7fce026a88` — an earlier `docs/publication.md`**, which pasted the
+>   scanner's own output as worked-example evidence. The output contained the
+>   real fragment six times, once per hit. Fixed in `b0c19f1`, whose subject is
+>   literally *"stop the publication guide from tripping its own gate"*.
+> - **`1211342fee` — an earlier `check_publication.py`**, which quoted the real
+>   fragment in the comment explaining why the `api_key-fragment` rule exists.
+>   Fixed in `18e673b`; that file now says `<8 hex>` and carries a standing rule
+>   that nothing in it may quote a real secret, precisely so its self-exclusion
+>   from the tree scan cannot be covering a genuine leak.
+>
+> **So the fragment has now been re-leaked three times by documents whose
+> subject is the leak**: the commit message that removed it, the guide that
+> demonstrated finding it, and the scanner that defines the rule for catching
+> it. This is not carelessness three times over — it is structural. *Explaining
+> a secret requires quoting it,* and every explanation is a new copy in a new
+> object that the previous cleanup did not touch. §4 of this document did the
+> same thing with thirteen IP addresses.
+>
+> The lesson is a rule, and it is now written into `CONTRIBUTING.md` and the
+> scanner: **the artefact that documents a redaction must itself be redacted,
+> and it must be run through the gate before it is committed.** A `--history`
+> run is not optional after a "cleanup" commit; it is how you find out whether
+> the cleanup added a copy.
+>
+> None of this changes the risk, because §0 records the key as revoked. It
+> changes the *count*, and a secrets audit that quietly keeps a stale count is
+> not one.
 
 ### How bad is it, honestly
 
