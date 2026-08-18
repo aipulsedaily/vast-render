@@ -174,12 +174,12 @@ document's argument depends on naming what it found.
 …plus a seventh location that a blob scan cannot reach:
 
 ```
-[api_key-fragment] commit message 3ffea4c441:6  api_key=<8 hex of the live key>
+[api_key-fragment] commit message 04648a3817:6  api_key=<8 hex of the live key>
 ```
 
 A code comment in `broker/remote.py` quoted the leaked log line **verbatim**,
 including the first 8 hex characters of the live key, to explain why `redact()`
-exists. Commit `3ffea4c` replaced it with `<64 hex chars>`; `git grep` on `HEAD`
+exists. Commit `04648a3` replaced it with `<64 hex chars>`; `git grep` on `HEAD`
 finds nothing, and the working tree is clean. The blobs remain — **and so does
 the message of the very commit that removed it**, which quotes the fragment to
 explain what it was deleting. Any rewrite must therefore rewrite commit

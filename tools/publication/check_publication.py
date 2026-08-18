@@ -335,7 +335,7 @@ def check_history(root: str) -> tuple[int, list]:
     # fragment from `broker/remote.py` quotes the fragment in its own message to
     # explain what it was removing:
     #
-    #     3ffea4c  "...carried the first 8 characters of the LIVE account key in
+    #     04648a3  "...carried the first 8 characters of the LIVE account key in
     #               the comment explaining why redact() exists — `api_key=<8 hex>...`"
     #
     # So the cleanup commit is itself a seventh copy, and a scanner that reads
@@ -432,9 +432,30 @@ def canary() -> int:
         # scanner that was working correctly, because `PERSONAL_PATH` stops at
         # the second `/` by design and the email rule had swallowed the adjacent
         # chunk tag. Match on containment, assert on the kind.
+        #
+        # THE IP NEEDLE HAS TWO CONSTRAINTS THAT PULL AGAINST EACH OTHER, and
+        # getting one of them wrong is how this needle was written twice.
+        #
+        #   1. It must be an address `ip_is_documentation()` does NOT exclude.
+        #      Otherwise the rule cannot fire on it and the needle proves
+        #      nothing — which is exactly what happened on 2026-08-18, when the
+        #      history rewrite that removed real addresses replaced this needle
+        #      with `192.0.2.11` and silently switched the check off. The gate
+        #      still said PASS, because `--canary` is not part of the default
+        #      run. So: never "fix" this line by reaching for TEST-NET.
+        #   2. It must not be somebody's machine. Until that rewrite this was a
+        #      REAL rented host's address, pasted in to be realistic — a scanner
+        #      whose job is finding third-party addresses, carrying one.
+        #
+        # `100.64.0.77` satisfies both. RFC 6598 shared address space is
+        # reserved for carrier-grade NAT and is never assigned to a public host,
+        # so it can name no one; and `ip_is_documentation()` lists the RFC 5737
+        # ranges and the RFC 1918 ranges only, so the rule still fires on it.
+        # If anyone ever adds 100.64.0.0/10 to that function, this needle dies
+        # with it — change the needle in the same commit.
         binary_needles = (("binary/personal-path", "/home/zany/secret-project"),
                           ("binary/email", "someone@personal-example.net"),
-                          ("binary/third-party-ip", "192.0.2.11"))
+                          ("binary/third-party-ip", "100.64.0.77"))
         with open(os.path.join(d, "c.png"), "wb") as fh:
             fh.write(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01")
             for _, n in binary_needles:

@@ -169,7 +169,7 @@ Not free of friction, just free of code:
 * **"Peak host RSS during a scene load ... never measured"** — measured:
   **41.4-41.6 GB per process** for a 7.97 GB scene, n=9, load peak and steady
   state alike. `num_gpus=1` was hardcoded in `vastctl.build_query` until
-  2026-08-07 (`c3cf38c`), which is why this doc had to source its offers by
+  2026-08-07 (`9533751`), which is why this doc had to source its offers by
   hand.
 
 
