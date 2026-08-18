@@ -432,7 +432,7 @@ frames at which the dispatcher can reconsider. Every frame is an independent
 74 s unit of work; nothing about the job requires them to be contiguous.
 
 Note the interaction with the scene-switch veto: `cheaper_to_finish` was fixed
-in `1fe0de4` to price a sequence at its real remaining work, which correctly
+in `8281a69` to price a sequence at its real remaining work, which correctly
 stops the veto from rubber-stamping a 21-hour job as "nearly done". But that
 governs which scene is chosen NEXT — it cannot preempt a sequence already
 running, because there is no point at which control returns.

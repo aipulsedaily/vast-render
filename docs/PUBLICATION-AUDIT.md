@@ -89,7 +89,7 @@ in history, and it is real.*
 | High-entropy strings not explained as a path, hash or identifier | **0** |
 | 64-hex strings of any kind | ~~**0** (none at all in this repo)~~ — **WRONG WHEN WRITTEN, see below** |
 | SSH private-key or public-key material (added to the scan set 2026-08-18) | **0** — six pattern-shaped hits across both repos, all six the scanner quoting its own regex; §4 |
-| Real routable IP addresses | **13** — ~~5 in the current tree~~ **0 in the current tree since `18e673b`**, 13 in history; §4 |
+| Real routable IP addresses | **13** — ~~5 in the current tree~~ **0 in the current tree since `3935e48`**, 13 in history; §4 |
 | Personal email in commit author/committer fields | **40 of 69** commits — see §5 |
 
 > **Correction, 2026-08-18 — "64-hex strings of any kind: 0 (none at all in
@@ -250,11 +250,11 @@ removes it locally either way and is worth running before any hand-off.
 The commit that *removed* the fragment quotes it in its own message:
 
 ```
-$ git log --all --pretty='%H %s' | grep d056d4ba
-d056d4bae081dc2b0fd08ce5ba61497951cd26d8 secrets: drop the key fragment, cover
+$ git log --all --pretty='%H %s' | grep 3ffea4c4
+3ffea4c4411a6e4364297d272656c9cdbdb5d0d0 secrets: drop the key fragment, cover
 redact(), untrack the table that de-aliases the docs
 
-$ git log -1 --pretty=%B d056d4ba | grep -n 'api_key'
+$ git log -1 --pretty=%B 3ffea4c4 | grep -n 'api_key'
 45: comment explaining why redact() exists — `api_key=<8 real hex chars>...`,
     verified against
 ```
@@ -280,11 +280,11 @@ included here because it is precisely the kind of thing an audit that stops at
 >
 > - **`7fce026a88` — an earlier `docs/publication.md`**, which pasted the
 >   scanner's own output as worked-example evidence. The output contained the
->   real fragment six times, once per hit. Fixed in `b0c19f1`, whose subject is
+>   real fragment six times, once per hit. Fixed in `7ce714a`, whose subject is
 >   literally *"stop the publication guide from tripping its own gate"*.
 > - **`1211342fee` — an earlier `check_publication.py`**, which quoted the real
 >   fragment in the comment explaining why the `api_key-fragment` rule exists.
->   Fixed in `18e673b`; that file now says `<8 hex>` and carries a standing rule
+>   Fixed in `3935e48`; that file now says `<8 hex>` and carries a standing rule
 >   that nothing in it may quote a real secret, precisely so its self-exclusion
 >   from the tree scan cannot be covering a genuine leak.
 >
@@ -332,7 +332,7 @@ So: **not directly exploitable, and not nothing.** Two things follow.
 > Until today §4 enumerated all thirteen addresses **in the clear**, in prose,
 > as the evidence for its own argument. That is the single most obvious failure
 > a document like this can make: the broker *source* was correctly aliased by
-> [`18e673b`](#the-correction-log), and the document explaining that cleanup
+> [`3935e48`](#the-correction-log), and the document explaining that cleanup
 > then republished every value the cleanup had removed. `check_publication.py`
 > found it — 13 `third-party-ip` findings, every one of them in this file — and
 > the gate was red on this document alone.
@@ -364,7 +364,7 @@ The aliases, in allocation order:
 
 | alias | where it was seen |
 |---|---|
-| `ip-01` … `ip-05` | the five that were in the tracked tree until `18e673b` |
+| `ip-01` … `ip-05` | the five that were in the tracked tree until `3935e48` |
 | `ip-06` … `ip-13` | eight that appear in **history only** |
 
 ### The five that were in the tracked tree
@@ -396,7 +396,7 @@ records exactly as informative while naming no real machine — the addresses ar
 shape-valid, so a reader still sees "an SSH failure against a host", and they
 are reserved, so they can never be anybody's.
 
-**This has now been done.** See the correction log below: `18e673b` mapped
+**This has now been done.** See the correction log below: `3935e48` mapped
 `ip-01`…`ip-05` onto `192.0.2.11`…`192.0.2.15` on a stable map, so the same host
 still reads as the same host in every file, and changed the `test_broker.py`
 fixtures and the assertions that read them **together** — which was the reason
@@ -425,9 +425,9 @@ subject is "what a scan missed" cannot credibly edit its own history.
 
 | date | claim as it stood | correction |
 |---|---|---|
-| 2026-08-18 | "Five survive in the **current tracked tree**", listing them | **Stale.** `18e673b` ("secrets: alias third-party host IPs in source, and close two scanner blind spots") replaced all five with `192.0.2.11`–`.15` across `broker/remote.py`, `broker/config.py` and `broker/test_broker.py`, fixture and assertion together, with 508/508 broker tests, 118/118 exec-server tests and the GPU guard all still passing. **Zero real IPs remain in tracked source.** They remain in history, which is what §6 is about. |
+| 2026-08-18 | "Five survive in the **current tracked tree**", listing them | **Stale.** `3935e48` ("secrets: alias third-party host IPs in source, and close two scanner blind spots") replaced all five with `192.0.2.11`–`.15` across `broker/remote.py`, `broker/config.py` and `broker/test_broker.py`, fixture and assertion together, with 508/508 broker tests, 118/118 exec-server tests and the GPU guard all still passing. **Zero real IPs remain in tracked source.** They remain in history, which is what §6 is about. |
 | 2026-08-18 | all thirteen addresses written out in prose | **Fixed.** Aliased to `ip-01`…`ip-13`; the real values are recorded nowhere in this repository. |
-| 2026-08-18 | "this audit did not make that change, because it touches tested code" | Superseded — the change was made in `18e673b` and the tests were updated with it. |
+| 2026-08-18 | "this audit did not make that change, because it touches tested code" | Superseded — the change was made in `3935e48` and the tests were updated with it. |
 
 Real vast.ai **machine and instance identifiers** also appear in tracked source
 and docs (`machine_id = 42763`, `53217`, `55313`, `96679`, `138180`; instances
@@ -517,7 +517,7 @@ committer field. One personal address, not two (unlike `f1-round2`).
 > document pasted the `git log` output above with the address unredacted, and
 > committed it. It is redacted in the working tree now, but the earlier version
 > is already a blob in this repository's history, in commit
-> `78e349d4a05344ce2b1c02744d9d381a33dcd570`. History was **not** rewritten to
+> `11f8a429205e232c2c2520b395548309cdd31d9b`. History was **not** rewritten to
 > remove it, because rewriting is the owner's decision and this round was scoped
 > not to. Under **Option B or C, scrub blob content as well as author metadata**
 > or this one blob will survive the rewrite that was meant to remove the address.
@@ -585,7 +585,7 @@ Still exposed:
   Harmless *after* revocation, which has happened (§0); embarrassing and
   unnecessary before it.
 - One personal Gmail address in 40 of 69 commits, shown on every commit page.
-- 13 real third-party host IPs — **none in the current tree since `18e673b`**,
+- 13 real third-party host IPs — **none in the current tree since `3935e48`**,
   all 13 history-only — plus machine and instance ids, which are in the tree by
   design (§4).
 - ~~The home-directory literal in 9 tracked files.~~ Fixed; one tracked file still contains
@@ -600,7 +600,7 @@ and neither of those is fixed by revoking anything.
 ### Option B — `git filter-repo` rewrite
 
 Fixes: the key fragment in all six blobs **and** — if `--message-callback` is
-used, which it must be — the commit message in `d056d4ba`; the Gmail address via
+used, which it must be — the commit message in `3ffea4c4`; the Gmail address via
 `--mailmap`; the historical IPs via `--replace-text`.
 
 It also drops the unreachable blob `430a14ba` — which a push would have dropped
@@ -632,7 +632,7 @@ the tree, not the history. Option C does not fix a present-tense leak. `git log
 
 Rotate the key (§0). Replace the five current-tree IPs with RFC 5737 addresses
 (§4), adjusting the tests that assert on them. Then **Option B**, with a
-message-callback so `d056d4ba`'s message is rewritten alongside the blobs. If
+message-callback so `3ffea4c4`'s message is rewritten alongside the blobs. If
 the owner prefers to skip the rewrite, Option A is still safe *after rotation* —
 the fragment protects nothing once the key is dead.
 

@@ -335,7 +335,7 @@ def check_history(root: str) -> tuple[int, list]:
     # fragment from `broker/remote.py` quotes the fragment in its own message to
     # explain what it was removing:
     #
-    #     d056d4b  "...carried the first 8 characters of the LIVE account key in
+    #     3ffea4c  "...carried the first 8 characters of the LIVE account key in
     #               the comment explaining why redact() exists — `api_key=<8 hex>...`"
     #
     # So the cleanup commit is itself a seventh copy, and a scanner that reads
