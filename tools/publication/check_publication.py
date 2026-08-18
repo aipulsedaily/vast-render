@@ -225,6 +225,36 @@ def scan_bytes(data: bytes, where: str, out: list) -> None:
 SELF = "tools/publication/check_publication.py"
 
 
+# -------------------------------------------------------- binary tracked files
+# A NUL in the first 8 KiB makes `scan_bytes` return immediately and makes the
+# text checks below `continue`, so a tracked binary file used to be scanned by
+# NOTHING while still being counted in "tracked files scanned". That is this
+# project's own failure family — a number that reads like coverage and is not —
+# and it stopped being hypothetical on 2026-08-18, when
+# `broker/fixtures/0908e534b1d3.png` became the first tracked binary in this
+# repository. The gate went green in the same session the file was added, and
+# the green was partly a file the gate could not see.
+#
+# A PNG is not opaque. That one carries eleven `tEXt` chunks, and Blender writes
+# the SOURCE PATH of the .blend into the first of them — here
+# `/workspace/scenes/<hash>/assembly_render.blend`, harmless because it is the
+# worker's container path, but it would just as readily have been a path under
+# the author's home directory. EXIF in a photograph carries GPS. "It is binary"
+# is not a statement about whether it contains text.
+#
+# So: pull printable ASCII runs out of any binary and run the same PII and
+# credential rules over them. This is `strings(1)`, deliberately — it is not a
+# format-aware parser, it makes no assumption about PNG or EXIF or anything
+# else, and it therefore does not go blind on a format nobody anticipated.
+# Findings are tagged `binary/` so nobody mistakes an offset for a line number.
+PRINTABLE_RUN = re.compile(rb"[\x20-\x7e]{4,}")
+
+
+def _strings(data: bytes) -> str:
+    """`strings(1)`: printable runs, newline-joined so line numbers mean 'run'."""
+    return "\n".join(m.group(0).decode("ascii") for m in PRINTABLE_RUN.finditer(data))
+
+
 def check_tree(root: str) -> tuple[int, list]:
     """Personal paths, PII and secrets in every TRACKED file."""
     problems = []
@@ -239,6 +269,23 @@ def check_tree(root: str) -> tuple[int, list]:
             data = fh.read()
         scan_bytes(data, f, problems)
         if b"\0" in data[:8192]:
+            # Binary: scan its printable runs rather than skipping it entirely.
+            text = _strings(data)
+            for kind, rx, pick in (("personal-path", PERSONAL_PATH, lambda m: m.group(0)),
+                                   ("email", EMAIL, lambda m: m.group(0)),
+                                   ("third-party-ip", IP_SHAPE, lambda m: m.group(1))):
+                for m in rx.finditer(text):
+                    val = pick(m)
+                    if kind == "email" and EMAIL_OK.search(val):
+                        continue
+                    if kind == "third-party-ip" and (
+                            val in IP_OK
+                            or any(int(o) > 255 for o in val.split("."))
+                            or ip_is_documentation(val)):
+                        continue
+                    problems.append((f"binary/{kind}", f,
+                                     text[:m.start()].count("\n") + 1, val))
+            scan_bytes(text.encode(), f"{f} (printable runs)", problems)
             continue
         text = data.decode("utf-8", "replace")
         for m in PERSONAL_PATH.finditer(text):
@@ -370,7 +417,48 @@ def canary() -> int:
         run("rm", "-q", *planted)
         run("commit", "-qm", "remove the secrets")
 
+        # A BINARY THAT IS KEPT, not deleted — the tree-scan half of the proof.
+        #
+        # Shaped like the real one this exists for: a PNG signature, a NUL
+        # inside the first 8 KiB so every "is this binary" test says yes, and
+        # PII sitting in printable runs exactly the way Blender's `tEXt` chunks
+        # put a source path into a rendered frame. Before the binary branch in
+        # check_tree, this file scanned as ZERO findings while being counted as
+        # a scanned file. The three needles are one of each rule, because a
+        # binary scanner that finds paths but not addresses is still blind.
+        # Each needle is paired with the KIND that must catch it, so "three
+        # findings appeared" cannot pass for "all three rules fired" — the first
+        # version of this check compared whole strings and failed against a
+        # scanner that was working correctly, because `PERSONAL_PATH` stops at
+        # the second `/` by design and the email rule had swallowed the adjacent
+        # chunk tag. Match on containment, assert on the kind.
+        binary_needles = (("binary/personal-path", "/home/zany/secret-project"),
+                          ("binary/email", "someone@personal-example.net"),
+                          ("binary/third-party-ip", "192.0.2.11"))
+        with open(os.path.join(d, "c.png"), "wb") as fh:
+            fh.write(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01")
+            for _, n in binary_needles:
+                fh.write(b"\x00tEXt\x00" + n.encode() + b"\x00")
+        run("add", "c.png")
+        run("commit", "-qm", "a binary that stays")
+
         n_tree, tree = check_tree(d)
+        binhits = [p for p in tree if p[0].startswith("binary/")]
+        missing_bin = [n for kind, n in binary_needles
+                       if not any(p[0] == kind and (n in p[3] or p[3] in n)
+                                  for p in binhits)]
+        print(f"canary: binary tracked file — planted {len(binary_needles)} "
+              f"needles in printable runs; scanner reported "
+              f"{sorted((p[0], p[3]) for p in binhits)}")
+        if missing_bin:
+            print(f"CANARY FAILED — the binary scan MISSED {missing_bin}. A "
+                  f"tracked binary is being counted as scanned and is not being "
+                  f"scanned.")
+            return 1
+        # Everything the tree scan reported must be one of those needles. If it
+        # reported anything else, the binary branch is inventing findings and
+        # the "no findings in the real tree" result cannot be trusted either.
+        tree = [p for p in tree if p not in binhits]
         n_hist, hist = check_history(d)
         kinds = {p[0] for p in hist}
         want = {"vast-key-64hex", "aws-akid", "github-pat", "bearer"}
@@ -432,8 +520,11 @@ def main() -> int:
     print("\nRESULT: PASS" if rc == 0 else "\nRESULT: FAIL")
     if rc == 0:
         print("Reminder: a clean scan does NOT un-expose a key that has already "
-              "existed in plaintext. Rotation is still required — see "
-              "docs/publication.md.")
+              "existed in plaintext. This repository's key was reported REVOKED "
+              "by its owner on 2026-08-18 — client-reported, not measured by "
+              "this tool, which cannot verify it without transmitting the key. "
+              "Confirm in the vast.ai console, and read docs/publication.md §0 "
+              "before believing this line.")
     return rc
 
 
