@@ -83,9 +83,9 @@ and was wrong:
   without a word. Found by a parallel audit, not by this tool.
 - **placeholder suppression, scoped.** `.env.example` exists to contain fake
   values, so the assignment rule ignores obvious placeholders. Applying that
-  filter to *every* rule was tried and the canary caught it in seconds: AWS's own
-  documentation key id is `AKIAIOSFODNN7EXAMPLE`, which contains the word
-  EXAMPLE, so a blanket filter switched off AWS detection entirely.
+  filter to *every* rule was tried and the canary caught it in seconds: AWS's
+  published sample key id ends in the literal word EXAMPLE, so a blanket
+  placeholder filter switched off AWS key detection entirely.
 
 ---
 
@@ -109,8 +109,8 @@ included.
 
 Every outstanding tree finding is inside `docs/PUBLICATION-AUDIT.md` — the
 parallel audit that *reported* the IP exposure and, in doing so, listed all
-thirteen addresses in the clear, along with four `/home/zany` paths inside
-`git clone` transcripts. Its 64-hex string is **not** a leak: it is the SHA-256
+thirteen addresses in the clear, along with four absolute home-directory paths
+inside `git clone` transcripts. Its 64-hex string is **not** a leak: it is the SHA-256
 *of* the API key, published deliberately so the owner can confirm which key was
 audited, and a digest of a 256-bit random secret is not reversible.
 
