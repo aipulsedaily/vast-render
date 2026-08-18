@@ -8,7 +8,42 @@ unreachable), plus the 4 uncommitted working-tree changes.
 
 ---
 
-## 0. THE BLOCKER THAT NO SCAN CAN CLEAR
+## 0. THE BLOCKER THAT NO SCAN CAN CLEAR — CLEARED 2026-08-18
+
+> ## RESOLVED: the account owner reports the vast.ai API key was **revoked** on 2026-08-18, together with an SSH key.
+>
+> **Revocation is stronger than the rotation this section demanded**, and it
+> closes the blocker. A rotated key leaves the old one alive until it is deleted
+> server-side; a revoked key cannot authenticate at all. The eight hex
+> characters that survive in this repository's history (§3) therefore describe a
+> credential that no longer exists, and the plaintext that sat on disk buys
+> nothing.
+>
+> **Two qualifications, and neither is a formality.**
+>
+> 1. **This is CLIENT-REPORTED, not measured.** Revocation was deliberately
+>    *not* verified by calling the vast.ai API with the key. There is no
+>    read-only way to ask "is this key dead" that does not involve presenting
+>    it — so a test would mean transmitting a possibly-live credential over the
+>    network in order to check whether it had stopped being a live credential.
+>    The safe confirmation is visual, in the console: Account → API keys, and the
+>    old key is **absent from the list**. Whoever publishes this should do that.
+> 2. **This does not mean the key was never exposed.** It sat in plaintext at
+>    `~/.config/vastai/vast_api_key` — 65 bytes, mode 0600, mtime 2026-07-26 —
+>    and its first eight characters reached a tracked source file and a commit
+>    message here. That happened, §3 records it, and §3 is not edited. What
+>    changed is the *consequence*, not the history. A key that has existed in
+>    plaintext outside a secret manager must still be treated as disclosed;
+>    revocation is what makes disclosure harmless, not what makes it untrue.
+>
+> The local key file was still on disk when this was written. It is the owner's
+> file, outside anything this repository controls, and deleting it is their call.
+>
+> **What follows is this section as it stood while the key was live.** It is
+> kept verbatim, because the argument for why plaintext means disclosed is the
+> argument that got the key revoked.
+
+### The blocker as written (2026-08-15 — 2026-08-18)
 
 > ## The vast.ai API key must be rotated by the account owner before this repository is published.
 >
@@ -31,7 +66,15 @@ unreachable), plus the 4 uncommitted working-tree changes.
 
 ## 1. Verdict for this repository
 
-**CONDITIONAL GO — one credential fragment in history, and it is real.**
+**~~CONDITIONAL GO~~ → GO on the credential question, as of 2026-08-18.** The
+condition was the key, the key is revoked (§0, client-reported), and the
+fragment in history is now eight characters of a dead secret. The fragment is
+still *there* — nothing below is retracted — it simply no longer protects
+anything. The remaining publication decision is history and identity, not
+credentials: see §5, §6, and `docs/publication.md`.
+
+**The verdict as originally written:** *CONDITIONAL GO — one credential fragment
+in history, and it is real.*
 
 | Class | Result |
 |---|---|
@@ -44,9 +87,33 @@ unreachable), plus the 4 uncommitted working-tree changes.
 | JWTs, `Authorization: Bearer` headers | 0 |
 | `.env`, `.netrc`, `*.pem`, `*.key`, `id_rsa`, credentials files — **ever committed** | 0 |
 | High-entropy strings not explained as a path, hash or identifier | **0** |
-| 64-hex strings of any kind | **0** (none at all in this repo) |
-| Real routable IP addresses | **13** — 5 in the current tree, see §4 |
-| Personal email in commit author/committer fields | **40 of 62** commits — see §5 |
+| 64-hex strings of any kind | ~~**0** (none at all in this repo)~~ — **WRONG WHEN WRITTEN, see below** |
+| SSH private-key or public-key material (added to the scan set 2026-08-18) | **0** — six pattern-shaped hits across both repos, all six the scanner quoting its own regex; §4 |
+| Real routable IP addresses | **13** — ~~5 in the current tree~~ **0 in the current tree since `18e673b`**, 13 in history; §4 |
+| Personal email in commit author/committer fields | **40 of 69** commits — see §5 |
+
+> **Correction, 2026-08-18 — "64-hex strings of any kind: 0 (none at all in
+> this repo)".** That row was false at the moment it was written, and it was
+> falsified *by the document it appears in*. Two lines below the table, §2
+> publishes the **SHA-256 of the vast.ai API key** — a 64-lowercase-hex string —
+> deliberately, so the owner can confirm which key was audited. The scanner
+> agrees: `check_publication.py` lists that exact digest in `BENIGN_64HEX`,
+> which is a maintained exception, and an exception only exists for something
+> that is *present*.
+>
+> **The true count is two occurrences of one value**, both the same digest:
+> `docs/PUBLICATION-AUDIT.md` (§2) and `tools/publication/check_publication.py`
+> (the `BENIGN_64HEX` entry that suppresses it). The number that row was
+> reaching for is the useful one and it is unchanged: **zero 64-hex strings that
+> are not accounted for.** A count of zero and a count of "two, both explained"
+> are very different claims, and a secrets audit that rounds the second down to
+> the first has given up the only thing it was for.
+>
+> Note what this digest now is. §0 records that the key was **revoked** by the
+> owner on 2026-08-18 (client-reported). So this is the SHA-256 of a *dead*
+> credential — no longer merely irreversible, but a fingerprint of something
+> that cannot authenticate. The reason for publishing it stands: it is how the
+> owner tells which key this document is about.
 
 The condition is §3. Whether it blocks publication is argued there, honestly, in
 both directions.
@@ -154,11 +221,11 @@ asserted that a clone drops unreachable objects. That is only half true, and the
 test caught it:
 
 ```
-$ git clone /home/zany/vast-render clone2          # local path
+$ git clone ~/vast-render clone2                    # local path
 $ git -C clone2 cat-file -t 430a14ba…
 blob                                                # STILL THERE
 
-$ git clone file:///home/zany/vast-render clone3    # real pack protocol
+$ git clone file://$HOME/vast-render clone3         # real pack protocol
 $ git -C clone3 cat-file -t 430a14ba…
 fatal: git cat-file: could not get object info      # gone
 ```
@@ -218,51 +285,107 @@ So: **not directly exploitable, and not nothing.** Two things follow.
 
 ## 4. Real host IP addresses — third-party infrastructure
 
+> ### CORRECTION, 2026-08-18 — this section used to leak what it audits.
+>
+> Until today §4 enumerated all thirteen addresses **in the clear**, in prose,
+> as the evidence for its own argument. That is the single most obvious failure
+> a document like this can make: the broker *source* was correctly aliased by
+> [`18e673b`](#the-correction-log), and the document explaining that cleanup
+> then republished every value the cleanup had removed. `check_publication.py`
+> found it — 13 `third-party-ip` findings, every one of them in this file — and
+> the gate was red on this document alone.
+>
+> **Every address below is now written as `ip-NN`.** The aliases are defined by
+> the numbered list in this section, they are allocation-ordered and
+> append-only, and **the real values are not recorded anywhere in this
+> repository.** They are not in a table here, not in a side file, not in
+> `.gitignore`. That is deliberate: an alias map that ships is not an alias map,
+> it is a decoder ring, which is the exact criticism this section makes of
+> `f1-round2`'s tracked `sanitise_docs.py` at the end.
+>
+> **Why `ip-NN` and not `host-A`.** The obvious scheme collides. `docs/
+> operations.md` and `docs/fleet.md` already use `host A`–`host D` as
+> **document-local** labels — `docs/incidents.md` opens by warning that "`host
+> A` in operations.md is a different host" — so a repo-wide `host-A` would mean
+> two things at once, in files that sit next to each other. `ip-NN` matches the
+> numbering convention the sibling repository's tooling already uses for exactly
+> this job (`mach-%02d` for machine ids, `id-%03d` in `alias_canon.txt` for
+> rented-host identifiers) and cannot be confused with either.
+
 Thirteen distinct real routable IPv4 addresses appear across full history (plus
 `1.2.3.4`, an obvious test placeholder). These are the addresses of **rented
-vast.ai GPU hosts** — third-party machines, not the owner's.
+vast.ai GPU hosts** — third-party machines, not the owner's. **They are the
+whole reason this section exists: nobody renting out a GPU agreed to have their
+address published in somebody else's repository.**
 
-Five survive in the **current tracked tree**:
+The aliases, in allocation order:
+
+| alias | where it was seen |
+|---|---|
+| `ip-01` … `ip-05` | the five that were in the tracked tree until `18e673b` |
+| `ip-06` … `ip-13` | eight that appear in **history only** |
+
+### The five that were in the tracked tree
+
+They were in `broker/remote.py`, `broker/config.py` and `broker/test_broker.py`:
 
 ```
-$ git grep -l -F <each>
-192.0.2.11    broker/remote.py, broker/test_broker.py
-192.0.2.12    broker/config.py,  broker/test_broker.py
-192.0.2.13    broker/remote.py,  broker/test_broker.py
-192.0.2.14   broker/test_broker.py
-192.0.2.15   broker/remote.py
+ip-01   broker/remote.py, broker/test_broker.py
+ip-02   broker/config.py,  broker/test_broker.py
+ip-03   broker/remote.py,  broker/test_broker.py
+ip-04   broker/test_broker.py
+ip-05   broker/remote.py
 ```
 
-They are there for a good reason: they are inside docstrings and test fixtures
+They were there for a good reason: they were inside docstrings and test fixtures
 recording *observed* failures, and the observation is the point —
 
 ```python
-err="root@192.0.2.11: Permission denied (publickey).",
-# Measured 2026-08-03 on instance 46695656 (192.0.2.12), three independent
-#     exit 1 after 0.6s on 192.0.2.13:23972 [stat -c %Y ...]: 1785254527
+err="root@<ip-01>: Permission denied (publickey).",
+# Measured 2026-08-03 on instance 46695656 (<ip-02>), three independent
+#     exit 1 after 0.6s on <ip-03>:23972 [stat -c %Y ...]: 1785254527
 ```
 
 This is the documentation style the project is being published *for*: a real
 recorded failure beats a sanitised paraphrase. **Preserve the meaning; replace
 the identifier.** Substituting RFC 5737 documentation addresses
 (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) keeps every one of these
-records exactly as informative while naming no real machine. Note that
-`broker/test_broker.py` asserts on some of these strings, so a replacement must
-change fixture and assertion together — this audit did not make that change,
-because it touches tested code and that is a change the owner should review.
+records exactly as informative while naming no real machine — the addresses are
+shape-valid, so a reader still sees "an SSH failure against a host", and they
+are reserved, so they can never be anybody's.
 
-A further eight addresses appear only in **history**, in earlier un-aliased
-versions of `docs/operations.md`, `docs/incidents.md` and `docs/fleet.md`
-(`192.0.2.16`, `192.0.2.17`, `192.0.2.18`, `192.0.2.19`,
-`192.0.2.20`, `192.0.2.21`, `192.0.2.22`, `192.0.2.23`). The docs
+**This has now been done.** See the correction log below: `18e673b` mapped
+`ip-01`…`ip-05` onto `192.0.2.11`…`192.0.2.15` on a stable map, so the same host
+still reads as the same host in every file, and changed the `test_broker.py`
+fixtures and the assertions that read them **together** — which was the reason
+this audit originally declined to make the change itself.
+
+### The eight that are in history only
+
+`ip-06` … `ip-13` appear only in **history**, in earlier un-aliased versions of
+`docs/operations.md`, `docs/incidents.md` and `docs/fleet.md`. The docs
 themselves were correctly aliased to `host A-D` at some point; the rewrite did
-not reach the history.
+not reach the history, and editing a file has never removed anything from a
+commit.
 
-**`192.0.2.23` appears in both this repository and `f1-round2`**, where it
-is mapped to `host-A` in that repo's `tools/publication/sanitise_docs.py`. That
-file is tracked. If both repositories are published, that alias table is the key
-that de-anonymises this repository's history as well. See §4 of the f1-round2
-audit; the fix belongs over there.
+**`ip-13` appears in both this repository and `f1-round2`**, where its real
+value is mapped to `host-A` by that repo's `tools/publication/sanitise_docs.py`.
+That file is **tracked**. If both repositories are published, that alias table
+is the key that de-anonymises this repository's history as well — the aliasing
+here is only as good as the weakest table anywhere in the pair. See §4 of the
+f1-round2 audit; the fix belongs over there, and it is the reason this section
+does not keep a table of its own.
+
+### The correction log
+
+Corrections are recorded rather than silently applied, because a document whose
+subject is "what a scan missed" cannot credibly edit its own history.
+
+| date | claim as it stood | correction |
+|---|---|---|
+| 2026-08-18 | "Five survive in the **current tracked tree**", listing them | **Stale.** `18e673b` ("secrets: alias third-party host IPs in source, and close two scanner blind spots") replaced all five with `192.0.2.11`–`.15` across `broker/remote.py`, `broker/config.py` and `broker/test_broker.py`, fixture and assertion together, with 508/508 broker tests, 118/118 exec-server tests and the GPU guard all still passing. **Zero real IPs remain in tracked source.** They remain in history, which is what §6 is about. |
+| 2026-08-18 | all thirteen addresses written out in prose | **Fixed.** Aliased to `ip-01`…`ip-13`; the real values are recorded nowhere in this repository. |
+| 2026-08-18 | "this audit did not make that change, because it touches tested code" | Superseded — the change was made in `18e673b` and the tests were updated with it. |
 
 Real vast.ai **machine and instance identifiers** also appear in tracked source
 and docs (`machine_id = 42763`, `53217`, `55313`, `96679`, `138180`; instances
@@ -271,10 +394,67 @@ the IPs — they name third-party hardware. This repository's own `.gitignore`
 already reasons about exactly this risk for `farm/hostrates.json`, and untracked
 that file for it; the same reasoning applies, more weakly, to these.
 
+**These were deliberately NOT aliased, and the reason is worth stating rather
+than leaving as an inconsistency.** An IP address is *reachable*: it names a
+machine you can send packets to, today, and it is often enough to locate the
+person hosting it. A vast.ai machine id is an opaque integer in one vendor's
+database — it identifies hardware to vast.ai and to nobody else, it routes
+nothing, and it is not resolvable by anyone outside that account. Aliasing them
+here would also be theatre: the same integers are load-bearing in tracked
+source — `broker/fleet.py`, `broker/test_broker.py`, `farm/procure.py` — where
+they are the keys real code looks things up by, and a document that hid what the
+code beside it prints in the clear would be documenting a cleanup that had not
+happened. If the owner wants them gone, the change is a source change and
+`f1-round2`'s `MACHINES` / `mach-NN` map is the pattern for it.
+
 Nothing else IP-shaped is a concern: 60 occurrences of `127.0.0.1`, and
-`1.2.3.4` as a placeholder. **No LAN/private-range addresses. No references
-anywhere to the private `f1-site-part2` website** (`git grep -l "f1-site-part2"`
-→ 0 files).
+`1.2.3.4` as a placeholder.
+
+> **Read that as a statement about *routable* addresses, not private ones.** An
+> earlier version of this sentence ended "**No LAN/private-range addresses**",
+> and that phrasing is precisely the trap this audit exists to document: it is
+> the sentence a scan writes when it has checked `10./172.16./192.168.` and
+> nothing else. A check like that returns a clean, confident zero while walking
+> straight past thirteen globally routable addresses, because none of them is in
+> a private range — the absence of private addresses is *not evidence of
+> anything*. `check_publication.py` matches **every** dotted quad and then
+> excludes loopback, the private ranges and the RFC 5737 documentation ranges by
+> name, so what it reports is what is left: real addresses belonging to real
+> people. That is the only shape of this check worth running.
+
+**No references anywhere to the private `f1-site-part2` website**
+(`git grep -l "f1-site-part2"` → 0 files).
+
+**No SSH key material, anywhere, in either tree or history** — added to the scan
+set on 2026-08-18 when the owner reported deleting an SSH key alongside the API
+key. Every object in the database (258 blobs here, 2,312 in `f1-round2`) plus
+every commit message was searched for **eight forms**: the PEM armour that opens
+an RSA, EC, generic or OpenSSH private key, the PGP private-key block header,
+the fixed base64 prefix that begins an OpenSSH-v1 private key body, and the
+`ssh-rsa` / `ssh-ed25519` / `ecdsa-sha2-nistp*` **public**-key encodings.
+
+The needle set was proved before any zero from it was believed: a scratch file
+carrying all eight forms was written outside both repositories and the same
+expression was required to find all eight — it did — and only then was it run
+for real. Six blobs matched across the two repositories, and **all six are a
+scanner describing itself**: `check_publication.py`'s own `openssh-privkey`
+pattern (2 blobs, one per revision of that file), and a one-line `printf`
+in `f1-round2`'s audit demonstrating the fake key its `.gitignore` refuses to
+add (4 blobs). Zero commit messages matched in either repository.
+
+**This paragraph deliberately does not spell those eight strings out**, which is
+why it describes them instead of listing them. An earlier draft quoted them
+verbatim as evidence, and `check_publication.py` immediately reported
+`private-key-block` and `openssh-privkey` findings against **this file** — the
+document leaking what it audits, for the second time in one section. The gate
+was right both times, and it is more useful than a document that reads slightly
+better.
+
+No key-shaped *filename* (`id_*`, `*.pem`, `*.key`, `*.pub`, `known_hosts`,
+`authorized_keys`) was ever committed to either repository — checked against
+every path in every tree, not just the current one. The only SSH-key references
+in tracked source are the **path** `~/.ssh/id_vast_render` and log excerpts
+naming `authorized_keys`. A filename is not a key.
 
 ---
 
@@ -326,7 +506,25 @@ still carried the generic `noreply@users.noreply.github.com`. Verify with
 `git config --show-origin --get user.email` before publishing rather than
 trusting this document.)*
 
-**9 tracked files contain the literal `/home/zany`.**
+~~**9 tracked files contain the owner's home-directory literal** (`/home/` + the login).~~
+
+> **Correction, 2026-08-18.** Stale, and then briefly self-inflicted. The nine
+> were fixed by hand — six of them were *code*, including two live
+> path-allowlist defaults (`config.DEFAULT_SCENE_ROOTS`,
+> `execservice.DEFAULT_BUNDLE_ROOTS`) where a blind regex would have emptied a
+> security allowlist without touching the `is_dir()` test beneath it. But **this
+> document then re-introduced four**, in two `git clone` transcripts and two
+> exposure summaries, and `check_publication.py` reported all four. They are
+> written `~/vast-render` and `file://$HOME/vast-render` now, which is the same
+> path dialect `PATH_RULES` applies everywhere else, and the transcripts still
+> run.
+>
+> **Current count: one tracked file contains the literal, and it is
+> `tools/publication/check_publication.py`** — the gate itself, which must
+> contain the literal because that string is the *pattern it matches on*. It
+> excludes itself from its own tree scan for exactly this reason, and that
+> exclusion is paired with a standing rule: nothing in that file may quote a
+> real secret. Every other tracked file is clean.
 
 ---
 
@@ -337,19 +535,25 @@ rewritten in producing this document.**
 
 ### Option A — publish as-is, with full history
 
-Ships 62 commits, all SHAs stable.
+Ships 69 commits, all SHAs stable.
 
 Still exposed:
 - **The 8-character key fragment: 5 blobs on a pushed repository, 6 if the
   directory is copied rather than pushed, plus 1 commit message.**
-  Harmless *after* rotation; embarrassing and unnecessary before it.
-- One personal Gmail address in 40 of 62 commits, shown on every commit page.
-- 13 real third-party host IPs (5 in the current tree, 8 history-only), plus
-  machine and instance ids.
-- `/home/zany` in 9 tracked files.
+  Harmless *after* revocation, which has happened (§0); embarrassing and
+  unnecessary before it.
+- One personal Gmail address in 40 of 69 commits, shown on every commit page.
+- 13 real third-party host IPs — **none in the current tree since `18e673b`**,
+  all 13 history-only — plus machine and instance ids, which are in the tree by
+  design (§4).
+- ~~The home-directory literal in 9 tracked files.~~ Fixed; one tracked file still contains
+  the literal and it is the gate that matches on it. See §5.
 
-**Option A is acceptable only if the key is rotated first.** With rotation, the
-fragment is a dead string and this option is defensible.
+**~~Option A is acceptable only if the key is rotated first.~~ The key is
+revoked, so Option A is now defensible on the credential question** — the
+fragment is a dead string. What Option A still ships is the personal Gmail
+address on every commit page and thirteen strangers' IP addresses in history,
+and neither of those is fixed by revoking anything.
 
 ### Option B — `git filter-repo` rewrite
 
