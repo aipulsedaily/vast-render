@@ -297,13 +297,48 @@ def test_imgstat_classifies_what_is_in_the_image() -> None:
               st["verdict"] == imgstat.UNREADABLE and not imgstat.is_blank(st["verdict"]),
               st["detail"][:50])
 
-        # The actual artefact, when it is still on disk. Not a synthetic
-        # reconstruction of the bug — the bug.
-        real = Path(__file__).resolve().parent.parent / "out" / "0908e534b1d3.png"
-        if real.exists():
-            st = imgstat.measure(real)
-            check("the real frame that started this is caught",
-                  st["verdict"] == imgstat.BLACK, imgstat.summary(st))
+        # The actual artefact. Not a synthetic reconstruction of the bug — the
+        # bug: the 8,734-byte 640x480 PNG job 0908e534b1d3 really returned.
+        #
+        # 2026-08-18 — THIS CHECK WAS THE FAILURE IT GUARDS AGAINST. It read:
+        #
+        #     real = Path(__file__).resolve().parent.parent / "out" / "0908e534b1d3.png"
+        #     if real.exists():
+        #         ...
+        #
+        # and `out/` is the first rule in .gitignore. So the fixture existed on
+        # exactly one machine in the world, and NO CLONE COULD EVER HAVE IT. On
+        # a clean checkout the guard was false, the check did not run, nothing
+        # was reported as skipped, and the suite printed `507/507 passed` — a
+        # total that reads as total success. Here, where the file happens to
+        # survive in a gitignored directory, it printed 508/508, and three
+        # documents plus a release checkbox in docs/publication.md asserted
+        # 508/508 as the number a reader should expect. The checkbox was
+        # therefore unpassable on any clone, and nobody could tell.
+        #
+        # That is this project's own catalogued failure family — "it passed on
+        # an empty set, or it never executed at all" — living inside the release
+        # gate, guarding the one property the README leads with: a returned
+        # frame can be a perfectly valid, correctly sized, sha256-matching PNG
+        # with nothing in it.
+        #
+        # THE FIXTURE IS NOW TRACKED, at broker/fixtures/0908e534b1d3.png, with
+        # an explicit `!` negation in .gitignore because `*.png` hid it. 8,734
+        # bytes is a rounding error against a repository that already ships
+        # 500 KB of docs, and it buys the check the one thing it could not have:
+        # it runs for everybody.
+        #
+        # AND IT IS UNCONDITIONAL. No `if exists()`. If the fixture goes
+        # missing, imgstat.measure returns UNREADABLE, this check FAILS, and the
+        # total drops to 507/508 — visibly, with a reason. A check that can
+        # vanish without changing the score is not a check.
+        real = Path(__file__).resolve().parent / "fixtures" / "0908e534b1d3.png"
+        st = imgstat.measure(real)
+        check("the real frame that started this is caught",
+              st["verdict"] == imgstat.BLACK,
+              imgstat.summary(st) if real.exists() else
+              f"FIXTURE MISSING at {real} — it is TRACKED; restore it with "
+              f"`git checkout -- broker/fixtures/0908e534b1d3.png`")
 
 
 def test_imgstat_decoders_agree() -> None:

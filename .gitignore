@@ -68,6 +68,28 @@ scenes/
 *.blend
 *.blend1
 *.png
+# ...WITH ONE EXCEPTION, AND THE EXCEPTION IS A BUG THIS FILE CAUSED.
+#
+# `broker/test_broker.py` ends its imgstat section on "the real frame that
+# started this is caught" — job 0908e534b1d3's 8,734-byte 640x480 all-black
+# PNG, the artefact the whole blank-frame feature exists because of. It was
+# guarded `if real.exists():` against `out/0908e534b1d3.png`, and `out/` is the
+# FIRST RULE IN THIS FILE. So the fixture lived on one machine, no clone could
+# have it, the check silently did not run, and the suite still printed a total
+# that read as complete success (507/507 on a clone; 508/508 here, which is the
+# number three documents and a release checkbox quote).
+#
+# The fixture is tracked now. `*.png` above was hiding it, so it is named here.
+# Git can re-include it with a plain negation because no PARENT DIRECTORY is
+# excluded — only the glob is — unlike the `render/*` cases in f1-round2's
+# .gitignore, which have to be opened one level at a time. Verified with
+# `git check-ignore -v broker/fixtures/0908e534b1d3.png`, which now reports
+# this negation rather than the `*.png` above it.
+#
+# Nothing else under `broker/fixtures/` is unignored by this line: it names one
+# path, not a directory. A second fixture needs a second line, deliberately, so
+# that "we track a PNG here" stays a decision rather than a habit.
+!broker/fixtures/0908e534b1d3.png
 *.jpg
 *.exr
 
