@@ -51,6 +51,18 @@ rents nothing, contacts nothing, and takes a couple of minutes:
 .venv/bin/python -m broker.test_broker      # expect: 508/508 passed
 ```
 
+**508 is now the number on a clean clone too, and until 2026-08-18 it was not.**
+The last check in the imgstat section — the one that measures the real all-black
+frame job `0908e534b1d3` returned — was guarded `if real.exists():` against
+`out/0908e534b1d3.png`, and `out/` is the first rule in `.gitignore`. On any
+clone the file was absent, the check silently did not run, nothing was reported
+as skipped, and the suite printed **507/507 passed**, which reads as complete
+success. This line said 508. If you cloned this repository before that date and
+saw 507, nothing was broken and nothing was wrong with your machine: the fixture
+could not reach you. It is tracked now, at `broker/fixtures/0908e534b1d3.png`,
+and the check is unconditional — delete the fixture and you get a loud
+`507/508` with the reason printed, not a quiet 507/507.
+
 ---
 
 ## 2. Credentials — environment, never a file in this tree

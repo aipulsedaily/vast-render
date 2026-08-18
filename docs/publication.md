@@ -8,7 +8,41 @@ was *not* verified, it says so.
 
 ---
 
-## THE HARD BLOCKER: rotate the vast.ai API key
+## THE CREDENTIAL BLOCKER — CLEARED 2026-08-18, client-reported
+
+> ### Status: the vast.ai API key was **REVOKED** by the account owner on 2026-08-18, along with an SSH key. This section is kept in full because the reasoning is still the reasoning; the blocker it describes is closed.
+>
+> **Revocation is stronger than the rotation this section demanded.** A rotated
+> key leaves the old one alive until it is deleted server-side; a revoked key
+> cannot authenticate at all, so the eight hex characters in this repository's
+> history now describe a dead credential and the plaintext that sat on disk
+> buys an attacker nothing.
+>
+> **Two honest qualifications, and neither is a formality.**
+>
+> 1. **This is CLIENT-REPORTED, not measured.** Revocation was deliberately
+>    *not* verified by calling the vast.ai API with the key, because a key that
+>    turned out to still be live would have been transmitted over the network in
+>    order to test a guess — which is the exposure, performed on purpose, to
+>    check whether the exposure had been closed. There is no read-only way to
+>    ask "is this key dead" that does not involve presenting it. If the owner
+>    wants this measured rather than asserted, the safe form is to check the
+>    **console's** API-keys page and confirm the key is absent from the list.
+> 2. **This does not mean the key was never exposed.** It sat in plaintext at
+>    `~/.config/vastai/vast_api_key`, and its first eight characters reached a
+>    tracked source file and a commit message here. That happened. The record of
+>    it below stands, unedited, and `docs/PUBLICATION-AUDIT.md` §3 stands too.
+>    What changed is the consequence, not the history.
+>
+> The local key file was still present on disk at 65 bytes, mode 0600, mtime
+> 2026-07-26, when this was written. It is the owner's file and outside the
+> scope of anything in this repository; deleting it is their call.
+>
+> **What follows is the blocker as it was written while the key was live.** It
+> is not deleted, because the argument for why a plaintext key must be treated
+> as disclosed is the argument that got it revoked.
+
+### The blocker as written (2026-08-15 — 2026-08-18)
 
 **The key must be rotated in the vast.ai console before this repository is
 published, and rotation is the only remedy.** Nobody but the account owner can
@@ -375,12 +409,31 @@ presentation decision, and it is the owner's.
 
 ## Before you publish — the list
 
-- [ ] **Rotate the vast.ai API key.** Hard blocker. Only the account owner can.
+- [x] **The vast.ai API key.** ~~Rotate it. Hard blocker.~~ **REVOKED by the
+      account owner on 2026-08-18, together with an SSH key — client-reported,
+      not measured.** This was the hard blocker and it is closed. If you are the
+      owner and you are reading this before publishing, the one thing worth
+      spending thirty seconds on is *confirming it*: open
+      <https://console.vast.ai/> → Account → API keys and check the old key is
+      **absent from the list**. Do not test the key by calling the API — if it
+      is somehow still live, that call is the exposure. See the top of this
+      document for why revocation closes the eight-hex fragment in history, and
+      why it does not mean the key was never exposed.
 - [ ] Decide (a), (b) or (c) above and record the decision.
 - [ ] `check_publication.py --canary` passes.
 - [ ] `check_publication.py --history` passes, or its only finding is the key
       fragment and you have chosen (a) knowingly.
-- [ ] `.venv/bin/python -m broker.test_broker` passes (508/508 offline).
+- [ ] `.venv/bin/python -m broker.test_broker` passes **508/508 offline, on a
+      clean clone** — and the clean clone is the point. Until 2026-08-18 this
+      line was unpassable as written: the suite's last imgstat check was guarded
+      `if real.exists():` against `out/0908e534b1d3.png`, `out/` is gitignored,
+      so on any clone the check silently did not run and the suite printed
+      `507/507 passed`. Not "507/508 with one skipped" — 507 of 507, which reads
+      as complete success. The fixture is tracked now
+      (`broker/fixtures/0908e534b1d3.png`) and the check is unconditional, so
+      508 is the number everywhere and a missing fixture is a loud 507/508.
+      **Run it from a fresh `git clone`, not from this working tree** — the
+      working tree is exactly where the old bug was invisible.
 - [ ] `LICENSE` (Apache-2.0) and `NOTICE` are the licence you actually want —
       they landed as a *recommendation* and are still yours to change.
 - [ ] Fill in the GitHub **description** and **topics** above. An unlabelled

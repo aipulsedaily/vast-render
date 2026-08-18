@@ -66,7 +66,7 @@ a test in `broker/test_broker.py` will not be believed.**
 Fully offline — rents nothing, contacts nothing, safe to run anywhere:
 
 ```bash
-.venv/bin/python -m broker.test_broker            # 508/508 at time of writing
+.venv/bin/python -m broker.test_broker            # 508/508, and 508 on a clean clone (see below)
 .venv/bin/python worker/test_exec_server.py       # 118/118
 .venv/bin/python farm/test_claim_crossproc.py     # 8 processes against one queue
 .venv/bin/python farm/test_gpu_guard.py           # multi-GPU refusal and pinning
@@ -87,6 +87,20 @@ checked was broken:
   has never seen the race is not evidence that the race is fixed.
 - **Report the number, not just the verdict.** "PASS" carries much less than
   "400 claims by 8 processes, zero double-handed, zero SQLITE_BUSY, 64 claims/s".
+- **Never guard a check with `if <fixture>.exists():`.** 2026-08-18: the imgstat
+  section's last check measured `out/0908e534b1d3.png` — the real black frame
+  the whole feature exists because of — behind exactly that guard, and `out/` is
+  the first rule in `.gitignore`. So the fixture existed on one machine, the
+  check never ran anywhere else, it was not reported as skipped, and the suite
+  printed `507/507 passed` while this file, `docs/quickstart.md` and a release
+  checkbox in `docs/publication.md` all said 508. A conditional check is a check
+  that can disappear without changing the score, which is the same failure as a
+  test that asserts over an empty list. **Commit the fixture** (it is 8,734
+  bytes, at `broker/fixtures/`, with a `!` negation in `.gitignore` because
+  `*.png` hid it) **and make the check unconditional**, so a missing fixture is
+  a visible `507/508` with a printed reason. If a check genuinely cannot run
+  everywhere, it must report itself as skipped and the total must say so —
+  silence is not an option the score can represent.
 
 ---
 
